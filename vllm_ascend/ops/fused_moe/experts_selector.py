@@ -28,6 +28,21 @@ from vllm_ascend.distributed.utils import split_tensor_along_first_dim
 from vllm_ascend.utils import get_weight_prefetch_method
 
 
+def _inspect_custom_routing_accepts_num_experts(custom_routing_function: Callable) -> bool:
+    try:
+        signature = inspect.signature(custom_routing_function)
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD or parameter.name == "num_experts"
+        for parameter in signature.parameters.values()
+    )
+
+
+def _custom_routing_accepts_num_experts(custom_routing_function: Callable) -> bool:
+    return _inspect_custom_routing_accepts_num_experts(custom_routing_function)
+
+
 def select_experts(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
@@ -375,23 +390,15 @@ def _native_select_experts(
         topk_weights = topk_weights + e_score_correction_bias
 
     if custom_routing_function is not None:
-        # Check if the function accepts num_experts parameter for API compatibility
-        sig = inspect.signature(custom_routing_function)
-        if 'num_experts' in sig.parameters:
-            topk_weights, topk_ids = custom_routing_function(
-                hidden_states=hidden_states,
-                gating_output=router_logits,
-                topk=top_k,
-                renormalize=renormalize,
-                num_experts=num_experts,
-            )
-        else:
-            topk_weights, topk_ids = custom_routing_function(
-                hidden_states=hidden_states,
-                gating_output=router_logits,
-                topk=top_k,
-                renormalize=renormalize,
-            )
+        routing_kwargs = {
+            "hidden_states": hidden_states,
+            "gating_output": router_logits,
+            "topk": top_k,
+            "renormalize": renormalize,
+        }
+        if _custom_routing_accepts_num_experts(custom_routing_function):
+            routing_kwargs["num_experts"] = num_experts
+        topk_weights, topk_ids = custom_routing_function(**routing_kwargs)
         # Required by npu_moe_init_routing
         topk_ids = topk_ids.to(torch.int32)
         return topk_weights, topk_ids

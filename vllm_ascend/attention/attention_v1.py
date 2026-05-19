@@ -17,7 +17,6 @@
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Literal, NamedTuple
 
 import torch
 import torch_npu
@@ -68,49 +67,44 @@ from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
 
 # default max value of sliding window size
 SWA_INT_MAX = 2147483647
-
-# Global counter for assigning unique per-layer indices to
-# AscendAttentionBackendImpl instances during graph construction.
-_next_impl_index = 0
-
-# Diagnostic: track whether we've logged the first graph replay stats
-_graph_replay_diag_logged: set[int] = set()
+_ATTN_KEYS_BUFFER = None
 
 # Ascend FIA TND currently supports these head dimensions on the vLLM-Ascend
 # path. Larger heterogeneous-head models need a prefill fallback to avoid
 # unsupported-kernel behavior.
 FIA_TND_SUPPORTED_HEAD_SIZES = {64, 128, 192, 256}
 
-GraphParamKind = Literal["paged_attention", "fia"]
+# Full graph attention params are currently stored as tuples. Keep the layout
+# lengths named here so capture/replay compatibility is explicit while avoiding
+# magic-number checks in the update path.
+PAGED_ATTENTION_GRAPH_PARAM_LEN = 9
+PAGED_ATTENTION_GRAPH_PARAM_WITH_LAYER_LEN = PAGED_ATTENTION_GRAPH_PARAM_LEN + 1
+FIA_GRAPH_PARAM_LEN = 20
+FIA_GRAPH_PARAM_WITH_LAYER_LEN = FIA_GRAPH_PARAM_LEN + 1
 
 
-class AttentionGraphParam(NamedTuple):
-    """Captured attention graph metadata.
-
-    ``kind`` records which attention op was captured, and ``layer_name`` binds
-    the captured params to the real attention layer during graph replay, which
-    avoids inferring op type from tuple length or relying on metadata dict order.
-    """
-
-    kind: GraphParamKind
-    params: tuple
-    layer_name: str | None
+def _is_paged_attention_graph_param(param: tuple) -> bool:
+    return len(param) in (
+        PAGED_ATTENTION_GRAPH_PARAM_LEN,
+        PAGED_ATTENTION_GRAPH_PARAM_WITH_LAYER_LEN,
+    )
 
 
-def _normalize_graph_param(
-    param: AttentionGraphParam,
-    fallback_layer_name: str,
-) -> tuple[GraphParamKind, tuple, str]:
-    if not isinstance(param, AttentionGraphParam):
-        raise TypeError(
-            f"Expected AttentionGraphParam, got {type(param).__name__}"
-        )
-    return param.kind, param.params, param.layer_name or fallback_layer_name
+def _graph_param_has_layer_name(param: tuple) -> bool:
+    return len(param) in (
+        PAGED_ATTENTION_GRAPH_PARAM_WITH_LAYER_LEN,
+        FIA_GRAPH_PARAM_WITH_LAYER_LEN,
+    )
 
 
-def _get_graph_param_kind(param: AttentionGraphParam) -> GraphParamKind:
-    kind, _, _ = _normalize_graph_param(param, "")
-    return kind
+def _split_graph_param_layer_name(param: tuple, fallback_layer_name: str) -> tuple[tuple, str]:
+    if _graph_param_has_layer_name(param):
+        return param[:-1], param[-1]
+    return param, fallback_layer_name
+
+
+def _uses_sliding_window_attention(vllm_config: VllmConfig) -> bool:
+    return getattr(vllm_config.model_config.hf_text_config, "sliding_window", None) is not None
 
 
 @register_backend(AttentionBackendEnum.CUSTOM, "ASCEND")
@@ -349,7 +343,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         attn_state = common_attn_metadata.attn_state
 
         # Get attn_mask from singleton AttentionMaskBuilder
-        attn_mask = self.attn_mask_builder.get_attention_mask(common_attn_metadata.causal, self.model_config)
+        attn_mask = self.attn_mask_builder.get_attention_mask(self.model_config)
 
         # TODO: Yet another unnecessary H2D while we already have a query_start_loc on device
         query_start_loc = query_start_loc_cpu.pin_memory().to(self.device, non_blocking=True)
@@ -399,10 +393,6 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
 
 
 class AscendAttentionBackendImpl(AttentionImpl):
-
-    # Periodic counter for diagnostic logging (shared across instances)
-    _diag_step_counter: int = 0
-    _DIAG_LOG_INTERVAL: int = 100
     def __init__(
         self,
         num_heads: int,
@@ -430,6 +420,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32, device="npu")
         self.alibi_slopes = alibi_slopes
         self.attn_type = attn_type
+        self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
 
         assert self.num_heads % self.num_kv_heads == 0
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
@@ -444,9 +435,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         self.sinks = sinks
         self.layerIndex = 0
         self.enable_hamming_sparse = is_enable_hamming_sparse()
-        global _next_impl_index
-        self._impl_idx = _next_impl_index
-        _next_impl_index += 1
+        self._layer_name: str | None = None
 
     @staticmethod
     def update_graph_params(
@@ -465,84 +454,21 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 graph_params = get_draft_graph_params()
         else:
             graph_params = get_graph_params()
-        params_by_key = graph_params.attn_params_by_key.get(num_tokens, {})
+        attn_params = graph_params.attn_params.get(num_tokens, [])
+        uses_paged_attention_params = len(attn_params) > 0 and all(
+            _is_paged_attention_graph_param(param) for param in attn_params
+        )
 
-        if _EXTRA_CTX.is_draft_model:
-            attn_metadata = draft_attn_metadatas
-            attn_keys = list(attn_metadata[0].keys())
-        else:
-            attn_metadata = forward_context.attn_metadata
-            attn_keys = list(attn_metadata.keys())
-
-        num_layers = len(attn_keys)
-        if num_layers == 0:
-            return
-        if _EXTRA_CTX.is_draft_model:
-            attn_keys = attn_keys * (
-                len(graph_params.attn_params[num_tokens]) // num_layers
-            )
-
-        # Diagnostic: count PA vs FIA params and report any missing keys
-        _pa_count = 0
-        _fia_count = 0
-        _miss_count = 0
-        _first_miss = None
-        for key in attn_keys:
-            if key not in params_by_key:
-                _miss_count += 1
-                if _first_miss is None:
-                    _first_miss = key
-            else:
-                p = params_by_key[key]['params']
-                if isinstance(p, tuple) and len(p) == 9:
-                    _pa_count += 1
-                else:
-                    _fia_count += 1
-        global _graph_replay_diag_logged
-        if _miss_count > 0 or num_tokens not in _graph_replay_diag_logged:
-            _graph_replay_diag_logged.add(num_tokens)
-            from vllm.logger import init_logger
-            _logger = init_logger(__name__)
-            if _miss_count > 0:
-                _logger.warning(
-                    "update_graph_params: %d/%d keys NOT in params_by_key "
-                    "(size=%d). First miss: %s. Stored keys[0:3]: %s",
-                    _miss_count, len(attn_keys), num_tokens,
-                    _first_miss,
-                    list(params_by_key.keys())[:3] if params_by_key else 'EMPTY',
-                )
-            _logger.info(
-                "update_graph_params[bs=%d]: %d keys, PA=%d, FIA=%d, missed=%d. "
-                "stored_keys=%d, first_stored=%s, first_attn_key=%s",
-                num_tokens, len(attn_keys), _pa_count, _fia_count, _miss_count,
-                len(params_by_key),
-                list(params_by_key.keys())[:2] if params_by_key else 'N/A',
-                attn_keys[0] if attn_keys else 'N/A',
-            )
-
-        attn_count = 0
-        with torch.npu.stream(update_stream):
-            for key in attn_keys:
-                if key not in params_by_key:
-                    continue
-
-                param_info = params_by_key[key]
-                param_tuple = param_info['params']
-                handle = param_info['handle']
-                event = param_info['event']
-
-                # Check whether this param is PA or FIA
-                if isinstance(param_tuple, AttentionGraphParam):
-                    param_kind = param_tuple.kind
-                else:
-                    # Fallback: infer from tuple length (PA=9, FIA=17)
-                    param_kind = "paged_attention" if len(param_tuple) == 9 else "fia"
-
-                if param_kind == "paged_attention":
-                    if isinstance(param_tuple, AttentionGraphParam):
-                        _, pa_params, _ = _normalize_graph_param(param_tuple, key)
-                    else:
-                        pa_params = param_tuple
+        if uses_paged_attention_params or (using_paged_attention(num_tokens, vllm_config) and len(attn_params) == 0):
+            # Paged Attention update logic
+            with torch.npu.stream(update_stream):
+                for key, param, handle, event in zip(
+                    forward_context.attn_metadata,
+                    graph_params.attn_params[num_tokens],
+                    graph_params.handles[num_tokens],
+                    graph_params.events[num_tokens],
+                ):
+                    param, layer_name = _split_graph_param_layer_name(param, key)
                     (
                         query,
                         key_cache,
@@ -553,16 +479,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         block_table,
                         seq_lens,
                         output,
-                    ) = pa_params
-
-                    if _EXTRA_CTX.is_draft_model:
-                        draft_step = attn_count // num_layers
-                        block_table = attn_metadata[draft_step][key].block_tables
-                        seq_lens = attn_metadata[draft_step][key].seq_lens
-                        attn_count = attn_count + 1
-                    else:
-                        block_table = attn_metadata[key].block_tables
-                        seq_lens = attn_metadata[key].seq_lens
+                    ) = param
+                    metadata_key = layer_name if layer_name in forward_context.attn_metadata else key
+                    current_attn_metadata = forward_context.attn_metadata[metadata_key]
+                    block_table = current_attn_metadata.block_tables
+                    seq_lens = current_attn_metadata.seq_lens
 
                     workspace = torch_npu._npu_paged_attention_get_workspace(
                         query=query,
@@ -590,84 +511,265 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     )
                     torch.npu.graph_task_update_end(update_stream)
                     event.record(update_stream)
-                    continue
+        elif _EXTRA_CTX.sinks:
+            # FIA update logic
+            if _EXTRA_CTX.is_draft_model:
+                graph_params = get_draft_graph_params()
+                attn_metadata = draft_attn_metadatas
+                attn_keys = list(attn_metadata[0].keys())
+            else:
+                graph_params = get_graph_params()
+                attn_metadata = forward_context.attn_metadata
+                attn_keys = list(attn_metadata.keys())
+            # For Qwen3-next, since the kv_cache_config has already categorized
+            # linear_attn and self_attn, the attn_metadata is first arranged with
+            # self_attn followed by linear_attn. Therefore, using zip directly
+            # filters out the update operations for linear_attn.
+            # TODO: We use a new variable `attn_keys` to ensure the loop count is
+            # correct after get by `zip` because of the new structure of the attn_metadata
+            # when running with the merged full eagle-graph. Should check it with Qwen3-next.
+            num_layers = len(attn_keys)
+            if num_layers == 0:
+                return
+            if _EXTRA_CTX.is_draft_model:
+                attn_keys = attn_keys * (len(graph_params.attn_params[num_tokens]) // num_layers)
+            attn_count = 0
+            with torch.npu.stream(update_stream):
+                for key, param, handle, event in zip(
+                    attn_keys,
+                    graph_params.attn_params[num_tokens],
+                    graph_params.handles[num_tokens],
+                    graph_params.events[num_tokens],
+                ):
+                    (
+                        query,
+                        key_cache,
+                        value,
+                        block_tables,
+                        attn_mask,
+                        block_size,
+                        seq_lens,
+                        num_kv_heads,
+                        num_heads,
+                        scale,
+                        sliding_window,
+                        sinks,
+                        attn_output,
+                        softmax_lse,
+                    ) = param
 
-                # FIA path
-                if isinstance(param_tuple, AttentionGraphParam):
-                    _, fia_params, _ = _normalize_graph_param(param_tuple, key)
+                    if _EXTRA_CTX.is_draft_model:
+                        draft_step = attn_count // num_layers
+                        seq_lens = attn_metadata[draft_step][key].seq_lens_list
+                        actual_seq_lengths_q = attn_metadata[draft_step][key].actual_seq_lengths_q
+                        attn_count = attn_count + 1
+                    else:
+                        seq_lens = attn_metadata[key].seq_lens_list
+                        actual_seq_lengths_q = attn_metadata[key].actual_seq_lengths_q
+
+                    torch.npu.graph_task_update_begin(update_stream, handle)
+                    torch_npu.npu_fused_infer_attention_score_v2.out(
+                        query=query,
+                        key=key_cache,
+                        value=value,
+                        block_table=block_tables,
+                        atten_mask=attn_mask,
+                        input_layout="TND",
+                        block_size=block_size,
+                        actual_seq_qlen=actual_seq_lengths_q,
+                        actual_seq_kvlen=seq_lens,
+                        num_key_value_heads=num_kv_heads,
+                        num_query_heads=num_heads,
+                        sparse_mode=4 if sliding_window is not None else 3,
+                        pre_tokens=sliding_window if sliding_window is not None else SWA_INT_MAX,
+                        next_tokens=0,
+                        softmax_scale=scale,
+                        learnable_sink=sinks,
+                        workspace=graph_params.workspaces.get(num_tokens),
+                        out=[attn_output, softmax_lse],
+                    )
+                    torch.npu.graph_task_update_end(update_stream)
+                    event.record(update_stream)
+        else:
+            # FIA update logic
+            if _EXTRA_CTX.is_draft_model:
+                if _EXTRA_CTX.is_draft_model_prefill:
+                    graph_params = get_draft_graph_prefill_params()
                 else:
-                    fia_params = param_tuple
-                (
-                    query,
-                    key_cache,
-                    value,
-                    block_tables,
-                    attn_mask,
-                    block_size,
-                    seq_lens,
-                    query_start_loc,
-                    num_kv_heads,
-                    num_heads,
-                    scale,
-                    attn_output,
-                    softmax_lse,
-                    c8_k_aq_scale,
-                    c8_k_aq_offset,
-                    c8_v_aq_scale,
-                    c8_v_aq_offset,
-                ) = fia_params
+                    graph_params = get_draft_graph_params()
+                attn_metadata = draft_attn_metadatas
+                attn_keys = list(attn_metadata[0].keys())
+            else:
+                attn_metadata = forward_context.attn_metadata
+                attn_keys = list(attn_metadata.keys())
+                # In some speculative methods (such as DFlash), the order of attn_keys in the Target model
+                # will be disrupted instead of increasing by layer index, so need regular expressions to
+                # reorder the attn_keys and stor the results in _ATTN_KEYS_BUFFER.
+                attn_keys_length = len(graph_params.attn_params[num_tokens])
+                global _ATTN_KEYS_BUFFER
+                if _ATTN_KEYS_BUFFER is None:
+                    import regex as re
 
-                sparse_mode = 3
-                if _EXTRA_CTX.is_draft_model:
-                    draft_step = attn_count // num_layers
-                    seq_lens = attn_metadata[draft_step][key].seq_lens_list
-                    actual_seq_lengths_q = attn_metadata[draft_step][key].actual_seq_lengths_q
-                    block_tables = attn_metadata[draft_step][key].block_tables
-                    attn_count = attn_count + 1
-                    if not attn_metadata[draft_step][key].causal:
+                    def extract_layer_index(key: str) -> int:
+                        match = re.search(r"(\d+)", key)
+                        return int(match.group(1)) if match else 0
+
+                    attn_keys_tmp = attn_keys[:attn_keys_length]
+                    attn_keys_tmp.sort(key=extract_layer_index)
+                    _ATTN_KEYS_BUFFER = attn_keys_tmp
+                attn_keys[:attn_keys_length] = _ATTN_KEYS_BUFFER
+            # For Qwen3-next, since the kv_cache_config has already categorized
+            # linear_attn and self_attn, the attn_metadata is first arranged with
+            # self_attn followed by linear_attn. Therefore, using zip directly
+            # filters out the update operations for linear_attn.
+            # TODO: We use a new variable `attn_keys` to ensure the loop count is
+            # correct after get by `zip` because of the new structure of the attn_metadata
+            # when running with the merged full eagle-graph. Should check it with Qwen3-next.
+            num_layers = len(attn_keys)
+            if num_layers == 0:
+                return
+            if _EXTRA_CTX.is_draft_model:
+                attn_keys = attn_keys * (len(graph_params.attn_params[num_tokens]) // num_layers)
+            attn_count = 0
+            with torch.npu.stream(update_stream):
+                for key, param, handle, event in zip(
+                    attn_keys,
+                    graph_params.attn_params[num_tokens],
+                    graph_params.handles[num_tokens],
+                    graph_params.events[num_tokens],
+                ):
+                    if _is_paged_attention_graph_param(param):
+                        param, layer_name = _split_graph_param_layer_name(param, key)
+                        (
+                            query,
+                            key_cache,
+                            value_cache,
+                            num_kv_heads,
+                            num_heads,
+                            scale,
+                            block_table,
+                            seq_lens,
+                            output,
+                        ) = param
+                        if _EXTRA_CTX.is_draft_model:
+                            draft_step = attn_count // num_layers
+                            block_table = attn_metadata[draft_step][key].block_tables
+                            seq_lens = attn_metadata[draft_step][key].seq_lens
+                            attn_count = attn_count + 1
+                        else:
+                            metadata_key = layer_name if layer_name in attn_metadata else key
+                            block_table = attn_metadata[metadata_key].block_tables
+                            seq_lens = attn_metadata[metadata_key].seq_lens
+                        workspace = torch_npu._npu_paged_attention_get_workspace(
+                            query=query,
+                            key_cache=key_cache,
+                            value_cache=value_cache,
+                            num_kv_heads=num_kv_heads,
+                            num_heads=num_heads,
+                            scale_value=scale,
+                            block_table=block_table,
+                            context_lens=seq_lens,
+                            out=output,
+                        )
+                        torch.npu.graph_task_update_begin(update_stream, handle)
+                        torch_npu._npu_paged_attention(
+                            query=query,
+                            key_cache=key_cache,
+                            value_cache=value_cache,
+                            num_kv_heads=num_kv_heads,
+                            num_heads=num_heads,
+                            scale_value=scale,
+                            block_table=block_table,
+                            context_lens=seq_lens,
+                            out=output,
+                            workspace=workspace,
+                        )
+                        torch.npu.graph_task_update_end(update_stream)
+                        event.record(update_stream)
+                        continue
+
+                    param, layer_name = _split_graph_param_layer_name(param, key)
+
+                    (
+                        query,
+                        key_cache,
+                        value,
+                        block_tables,
+                        attn_mask,
+                        block_size,
+                        seq_lens,
+                        query_start_loc,
+                        num_kv_heads,
+                        num_heads,
+                        scale,
+                        attn_output,
+                        softmax_lse,
+                        sparse_mode,
+                        pre_tokens,
+                        next_tokens,
+                        c8_k_aq_scale,
+                        c8_k_aq_offset,
+                        c8_v_aq_scale,
+                        c8_v_aq_offset,
+                    ) = param
+
+                    if _EXTRA_CTX.is_draft_model:
+                        draft_step = attn_count // num_layers
+                        seq_lens = attn_metadata[draft_step][key].seq_lens_list
+                        actual_seq_lengths_q = attn_metadata[draft_step][key].actual_seq_lengths_q
+                        block_tables = attn_metadata[draft_step][key].block_tables
+                        attn_count = attn_count + 1
+                        if not attn_metadata[draft_step][key].causal:
+                            sparse_mode = 0
+                    else:
+                        metadata_key = layer_name if layer_name in attn_metadata else key
+                        seq_lens = attn_metadata[metadata_key].seq_lens_list
+                        actual_seq_lengths_q = attn_metadata[metadata_key].actual_seq_lengths_q
+                        # SWA full-graph replay keeps the captured block table
+                        # tensor. Rebinding it from per-step metadata has been
+                        # observed to corrupt SWA decode replay on NPU.
+                        # Non-SWA models preserve the previous behavior and
+                        # refresh block tables from current metadata.
+                        if not _uses_sliding_window_attention(vllm_config):
+                            block_tables = attn_metadata[metadata_key].block_tables
+
+                    torch.npu.graph_task_update_begin(update_stream, handle)
+                    input_layout = "TND"
+                    extra_args = {}
+                    if c8_k_aq_scale is not None:
+                        extra_args = {
+                            "key_antiquant_scale": c8_k_aq_scale,
+                            "key_antiquant_offset": c8_k_aq_offset,
+                            "value_antiquant_scale": c8_v_aq_scale,
+                            "value_antiquant_offset": c8_v_aq_offset,
+                            "key_antiquant_mode": 0,
+                            "value_antiquant_mode": 0,
+                        }
+                        input_layout = "BNSD"
                         sparse_mode = 0
-                else:
-                    seq_lens = attn_metadata[key].seq_lens_list
-                    actual_seq_lengths_q = attn_metadata[key].actual_seq_lengths_q
-                    block_tables = attn_metadata[key].block_tables
+                    torch_npu.npu_fused_infer_attention_score.out(
+                        query=query,
+                        key=key_cache,
+                        value=value,
+                        block_table=block_tables,
+                        atten_mask=attn_mask,
+                        input_layout=input_layout,
+                        block_size=block_size,
+                        actual_seq_lengths=actual_seq_lengths_q,
+                        actual_seq_lengths_kv=seq_lens,
+                        num_key_value_heads=num_kv_heads,
+                        num_heads=num_heads,
+                        scale=scale,
+                        sparse_mode=sparse_mode,
+                        pre_tokens=pre_tokens,
+                        next_tokens=next_tokens,
+                        **extra_args,
+                        workspace=graph_params.workspaces.get(num_tokens),
+                        out=[attn_output, softmax_lse],
+                    )
+                    torch.npu.graph_task_update_end(update_stream)
 
-                torch.npu.graph_task_update_begin(update_stream, handle)
-                input_layout = "TND"
-                extra_args = {}
-                if c8_k_aq_scale is not None:
-                    extra_args = {
-                        "key_antiquant_scale": c8_k_aq_scale,
-                        "key_antiquant_offset": c8_k_aq_offset,
-                        "value_antiquant_scale": c8_v_aq_scale,
-                        "value_antiquant_offset": c8_v_aq_offset,
-                        "key_antiquant_mode": 0,
-                        "value_antiquant_mode": 0,
-                    }
-                    input_layout = "BNSD"
-                    sparse_mode = 0
-                elif query.dim() == 4:
-                    input_layout = "BNSD"
-                    sparse_mode = 0
-                torch_npu.npu_fused_infer_attention_score.out(
-                    query=query,
-                    key=key_cache,
-                    value=value,
-                    block_table=block_tables,
-                    atten_mask=attn_mask,
-                    input_layout=input_layout,
-                    block_size=block_size,
-                    actual_seq_lengths=actual_seq_lengths_q,
-                    actual_seq_lengths_kv=seq_lens,
-                    num_key_value_heads=num_kv_heads,
-                    num_heads=num_heads,
-                    scale=scale,
-                    sparse_mode=sparse_mode,
-                    **extra_args,
-                    workspace=graph_params.workspaces.get(num_tokens),
-                    out=[attn_output, softmax_lse],
-                )
-                torch.npu.graph_task_update_end(update_stream)
-                event.record(update_stream)
+                    event.record(update_stream)
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         super().process_weights_after_loading(act_dtype)
@@ -683,17 +785,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
         output: torch.Tensor,
         layer=None,
     ) -> torch.Tensor:
-        # Extract layer index from layer_name for building the correct key
-        # layer_name format could be "language_model.model.layers.X.self_attn" or "layer_X"
-        layer_name_raw = getattr(layer, "layer_name", f"layer_{self.layerIndex}")
-
-        # Try to extract layer index from layer_name
-        if "layers." in str(layer_name_raw):
-            try:
-                self.layerIndex = int(str(layer_name_raw).split("layers.")[1].split(".")[0])
-            except (ValueError, IndexError):
-                pass
-
         passed_key = key
         key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(key, value, attn_metadata)
         if self.enable_hamming_sparse and attn_metadata.attn_state != AscendAttentionState.DecodeOnly:
@@ -720,9 +811,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
         softmax_lse = torch.empty(1, dtype=query.dtype, device=query.device)
         input_layout = "TND"
         attn_mask = attn_metadata.attn_mask
-        sparse_mode = 3 if attn_metadata.causal else 0
-        extra_args = {}
+        sparse_mode = 4 if self.sliding_window else 3 if attn_metadata.causal else 0
+        pre_tokens = self.sliding_window or SWA_INT_MAX
+        next_tokens = 0 if self.sliding_window else SWA_INT_MAX
 
+        extra_args = {}
         if self.enable_c8_quant:
             extra_args = {
                 "key_antiquant_scale": layer._c8_k_aq_scale,
@@ -752,6 +845,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 num_key_value_heads=self.num_kv_heads,
                 num_heads=self.num_heads,
                 sparse_mode=sparse_mode,
+                pre_tokens=pre_tokens,
+                next_tokens=next_tokens,
                 scale=self.scale,
                 **extra_args,
             )
@@ -767,6 +862,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
         event.wait(stream)
         event.reset(stream)
         graph_params.events[num_tokens].append(event)
+        # Record the owning layer so graph replay can refresh metadata by the
+        # real attention layer instead of relying on dict iteration order.
+        layer_name = layer.layer_name if layer is not None else self._layer_name
         attn_params = (
             weak_ref_tensors(query),
             weak_ref_tensors(key),
@@ -781,6 +879,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
             self.scale,
             weak_ref_tensors(output),
             weak_ref_tensors(softmax_lse),
+            sparse_mode,
+            pre_tokens,
+            next_tokens,
         )
         if self.enable_c8_quant:
             attn_params = attn_params + (
@@ -788,19 +889,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 weak_ref_tensors(layer._c8_k_aq_offset),
                 weak_ref_tensors(layer._c8_v_aq_scale),
                 weak_ref_tensors(layer._c8_v_aq_offset),
+                layer_name,
             )  # type: ignore
         else:
-            attn_params = attn_params + (None, None, None, None)  # type: ignore
-
-        attn_key = f"language_model.model.layers.{self._impl_idx}.self_attn.attn"
-        graph_params.attn_params[num_tokens].append(
-            AttentionGraphParam("fia", attn_params, attn_key)
-        )
-        graph_params.attn_params_by_key[num_tokens][attn_key] = {
-            'params': attn_params,
-            'handle': None,
-            'event': event,
-        }
+            attn_params = attn_params + (None, None, None, None, layer_name)  # type: ignore
+        graph_params.attn_params[num_tokens].append(attn_params)
 
         torch.npu.graph_task_group_begin(stream)
         torch_npu.npu_fused_infer_attention_score.out(
@@ -817,6 +910,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
             num_heads=self.num_heads,
             scale=self.scale,
             sparse_mode=sparse_mode,
+            pre_tokens=pre_tokens,
+            next_tokens=next_tokens,
             workspace=workspace,
             out=[output, softmax_lse],
             **extra_args,
@@ -826,11 +921,100 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
         handle = torch.npu.graph_task_group_end(stream)
         graph_params.handles[num_tokens].append(handle)
+        return output, num_tokens
 
-        # Update handle in attn_params_by_key for replay lookup
-        if attn_key in graph_params.attn_params_by_key[num_tokens]:
-            graph_params.attn_params_by_key[num_tokens][attn_key]['handle'] = handle
+    def full_graph_fia_v2(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(key, value, attn_metadata)
+        actual_seq_lengths_kv = attn_metadata.seq_lens
+        num_tokens = attn_metadata.actual_seq_lengths_q[-1]
+        if _EXTRA_CTX.is_draft_model:
+            graph_params = get_draft_graph_params()
+        else:
+            graph_params = get_graph_params()
 
+        actual_seq_lengths_q = attn_metadata.actual_seq_lengths_q
+        workspace = graph_params.workspaces.get(num_tokens)
+        softmax_lse = torch.empty(1, dtype=query.dtype, device=query.device)
+        if workspace is None:
+            workspace = torch_npu._npu_fused_infer_attention_score_v2_get_max_workspace(
+                query=query,
+                key=key,
+                value=value,
+                atten_mask=attn_metadata.attn_mask,
+                block_table=block_table,
+                input_layout="TND",
+                block_size=block_size,
+                actual_seq_qlen=actual_seq_lengths_q,
+                actual_seq_kvlen=actual_seq_lengths_kv,
+                num_key_value_heads=self.num_kv_heads,
+                softmax_scale=self.scale,
+                num_query_heads=self.num_heads,
+                sparse_mode=4 if self.sliding_window is not None else 3,
+                pre_tokens=self.sliding_window if self.sliding_window is not None else SWA_INT_MAX,
+                next_tokens=0,
+                learnable_sink=self.sinks,
+            )
+
+            if _EXTRA_CTX.is_draft_model:
+                update_draft_graph_params_workspaces(num_tokens, workspace)
+            else:
+                update_graph_params_workspaces(num_tokens, workspace)
+
+        # Handle graph capturing mode
+        stream = torch_npu.npu.current_stream()
+
+        event = torch.npu.ExternalEvent()
+        event.wait(stream)
+        event.reset(stream)
+        graph_params.events[num_tokens].append(event)
+        graph_params.attn_params[num_tokens].append(
+            (
+                weak_ref_tensors(query),
+                weak_ref_tensors(key),
+                weak_ref_tensors(value),
+                weak_ref_tensors(block_table),
+                weak_ref_tensors(attn_metadata.attn_mask),
+                block_size,
+                actual_seq_lengths_kv,
+                self.num_kv_heads,
+                self.num_heads,
+                self.scale,
+                self.sliding_window,
+                self.sinks,
+                weak_ref_tensors(output),
+                weak_ref_tensors(softmax_lse),
+            )
+        )
+        torch.npu.graph_task_group_begin(stream)
+        torch_npu.npu_fused_infer_attention_score_v2.out(
+            query=query,
+            key=key,
+            value=value,
+            atten_mask=attn_metadata.attn_mask,
+            block_table=block_table,
+            input_layout="TND",
+            block_size=block_size,
+            actual_seq_qlen=actual_seq_lengths_q,
+            actual_seq_kvlen=actual_seq_lengths_kv,
+            num_key_value_heads=self.num_kv_heads,
+            num_query_heads=self.num_heads,
+            sparse_mode=4 if self.sliding_window is not None else 3,
+            pre_tokens=self.sliding_window if self.sliding_window is not None else SWA_INT_MAX,
+            next_tokens=0,
+            softmax_scale=self.scale,
+            learnable_sink=self.sinks,
+            workspace=workspace,
+            out=[output, softmax_lse],
+        )
+        handle = torch.npu.graph_task_group_end(stream)
+        graph_params.handles[num_tokens].append(handle)
         return output, num_tokens
 
     def full_graph_pa(
@@ -865,27 +1049,20 @@ class AscendAttentionBackendImpl(AttentionImpl):
             event.wait(stream)
             event.reset(stream)
             graph_params.events[num_tokens].append(event)
-
-            attn_key = f"language_model.model.layers.{self._impl_idx}.self_attn.attn"
-            pa_params = (
-                weak_ref_tensors(query),
-                weak_ref_tensors(self.key_cache),
-                weak_ref_tensors(self.value_cache),
-                self.num_kv_heads,
-                self.num_heads,
-                self.scale,
-                attn_metadata.block_tables,
-                attn_metadata.seq_lens,
-                weak_ref_tensors(output),
-            )
             graph_params.attn_params[num_tokens].append(
-                AttentionGraphParam("paged_attention", pa_params, attn_key)
+                (
+                    weak_ref_tensors(query),
+                    weak_ref_tensors(self.key_cache),
+                    weak_ref_tensors(self.value_cache),
+                    self.num_kv_heads,
+                    self.num_heads,
+                    self.scale,
+                    attn_metadata.block_tables,
+                    attn_metadata.seq_lens,
+                    weak_ref_tensors(output),
+                    self._layer_name,
+                )
             )
-            graph_params.attn_params_by_key[num_tokens][attn_key] = {
-                'params': pa_params,
-                'handle': None,
-                'event': event,
-            }
 
             torch.npu.graph_task_group_begin(stream)
             torch_npu._npu_paged_attention(
@@ -902,10 +1079,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
             )
             handle = torch.npu.graph_task_group_end(stream)
             graph_params.handles[num_tokens].append(handle)
-
-            if attn_key in graph_params.attn_params_by_key[num_tokens]:
-                graph_params.attn_params_by_key[num_tokens][attn_key]['handle'] = handle
-
             return output
 
     def _get_fia_params(self, key: torch.Tensor, value: torch.Tensor, attn_metadata: AscendMetadata, kv_cache=None):
@@ -968,36 +1141,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
             actual_seq_lengths_kv = attn_metadata.seq_lens_list
         return key, value, block_size, block_table, actual_seq_lengths_kv
 
-    def _forward_fia_slidingwindow(self, query: torch.Tensor, attn_metadata: AscendMetadata, output: torch.Tensor):
-        batch_size = attn_metadata.seq_lens.shape[0]
-        block_size = 128
-        query = query.view(batch_size, 1, self.num_heads * self.head_size)
-        key = self.key_cache
-        value = self.value_cache
-        if self.key_cache is not None and self.value_cache is not None:
-            block_size = self.key_cache.shape[1]
-            key = self.key_cache.flatten(2, 3).contiguous()
-            value = self.value_cache.flatten(2, 3).contiguous()
-
-        attn_output, _ = torch_npu.npu_fused_infer_attention_score(
-            query,
-            key,
-            value,
-            num_heads=self.num_heads,
-            num_key_value_heads=self.num_kv_heads,
-            input_layout="BSH",
-            block_size=block_size,
-            pre_tokens=self.sliding_window,
-            scale=self.scale,
-            block_table=attn_metadata.block_tables,
-            actual_seq_lengths=[1] * len(attn_metadata.seq_lens),
-            actual_seq_lengths_kv=attn_metadata.seq_lens,
-        )
-
-        attn_output = attn_output.view(batch_size, self.num_heads, self.head_size)
-        output[:batch_size] = attn_output[:batch_size]
-        return output
-
     def forward_fused_infer_attention(
         self,
         query: torch.Tensor,
@@ -1006,22 +1149,19 @@ class AscendAttentionBackendImpl(AttentionImpl):
         attn_metadata: AscendMetadata,
         output: torch.Tensor,
         kv_cache=None,
-        layer: AttentionLayer | None = None,
     ):
         # we inherit ForwardContext in model runner v2, when enable model
         # runner v2, there is not capturing attribute in forward_context,
         # just use getattr to avoid attribute error.
         if _EXTRA_CTX.capturing:
-            attn_output, num_tokens = self.full_graph_fia(query, key, value, attn_metadata, output, layer)
-            output[:num_tokens] = attn_output[:num_tokens]
-            return output
-        if (
-            attn_metadata.attn_state == AscendAttentionState.DecodeOnly
-            and self.sliding_window is not None
-            and attn_metadata.seq_lens.shape[0] == query.size(0)
-            and self.sinks is None
-        ):
-            return self._forward_fia_slidingwindow(query, attn_metadata, output)
+            if self.sinks is not None:
+                attn_output, num_tokens = self.full_graph_fia_v2(query, key, value, attn_metadata, output)
+                output[:num_tokens] = attn_output[:num_tokens]
+                return output
+            else:
+                attn_output, num_tokens = self.full_graph_fia(query, key, value, attn_metadata, output)
+                output[:num_tokens] = attn_output[:num_tokens]
+                return output
         passed_key = key
         key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(
             key, value, attn_metadata, kv_cache
@@ -1083,6 +1223,24 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     scale=self.scale,
                     sparse_mode=0,
                 )
+            elif self.sliding_window is not None:
+                attn_output, _ = torch_npu.npu_fused_infer_attention_score(
+                    query=query,
+                    key=key,
+                    value=value,
+                    atten_mask=attn_metadata.attn_mask,
+                    block_table=block_table,
+                    input_layout="TND",
+                    block_size=block_size,
+                    actual_seq_lengths=attn_metadata.actual_seq_lengths_q,
+                    actual_seq_lengths_kv=actual_seq_lengths_kv,
+                    num_key_value_heads=self.num_kv_heads,
+                    num_heads=self.num_heads,
+                    scale=self.scale,
+                    pre_tokens=self.sliding_window,
+                    next_tokens=0,
+                    sparse_mode=4,
+                )
             else:
                 attn_output, _ = torch_npu.npu_fused_infer_attention_score(
                     query=query,
@@ -1101,7 +1259,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 )
 
             attn_output = attn_output.view(num_tokens, self.num_heads, self.head_size)
-
         output[:num_tokens] = attn_output[:num_tokens]
         return output
 
@@ -1113,7 +1270,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
     ) -> torch.Tensor:
         if _EXTRA_CTX.capturing:
             return self.full_graph_pa(query, attn_metadata, output)
-
         torch_npu._npu_paged_attention(
             query=query,
             key_cache=self.key_cache,
@@ -1146,6 +1302,121 @@ class AscendAttentionBackendImpl(AttentionImpl):
             actual_seq_qlen=attn_metadata.actual_seq_lengths_q,
             actual_seq_kvlen=attn_metadata.actual_seq_lengths_q,
         )[0]
+
+    def _forward_large_head_prefill_attention(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        num_tokens = attn_metadata.actual_seq_lengths_q[-1]
+        query = query[:num_tokens]
+        key, value, actual_seq_lengths_kv = self._get_large_head_prefill_kv(
+            key,
+            value,
+            attn_metadata,
+            num_tokens,
+        )
+        sparse_mode = 4 if self.sliding_window is not None else 3 if attn_metadata.causal else 0
+        pre_tokens = self.sliding_window if self.sliding_window is not None else SWA_INT_MAX
+        next_tokens = 0 if attn_metadata.causal or self.sliding_window is not None else SWA_INT_MAX
+        attn_mask = attn_metadata.attn_mask
+        if attn_mask is not None and attn_mask.dtype not in (torch.bool, torch.uint8):
+            attn_mask = attn_mask.bool()
+        attn_output = torch_npu.npu_fusion_attention(
+            query=query,
+            key=key,
+            value=value,
+            head_num=self.num_heads,
+            input_layout="TND",
+            atten_mask=attn_mask,
+            scale=self.scale,
+            pre_tockens=pre_tokens,
+            next_tockens=next_tokens,
+            actual_seq_qlen=attn_metadata.actual_seq_lengths_q,
+            actual_seq_kvlen=actual_seq_lengths_kv,
+            sparse_mode=sparse_mode,
+        )[0]
+        output[:num_tokens] = attn_output[:num_tokens]
+        return output
+
+    def _get_large_head_prefill_kv(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AscendMetadata,
+        num_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+        if (
+            attn_metadata.attn_state == AscendAttentionState.PrefillNoCache
+            or self.key_cache is None
+            or self.value_cache is None
+        ):
+            return key[:num_tokens], value[:num_tokens], attn_metadata.actual_seq_lengths_q
+
+        seq_lens = attn_metadata.seq_lens_list
+        if not seq_lens:
+            return key[:num_tokens], value[:num_tokens], attn_metadata.actual_seq_lengths_q
+
+        # Chunked prefill can have historical KV already resident in the paged
+        # cache. The large-head fallback uses dense TND attention, so gather the
+        # paged KV blocks into sequence-major dense tensors first.
+        dense_key, dense_value = self._gather_paged_kv_to_dense(
+            self.key_cache,
+            self.value_cache,
+            attn_metadata.block_tables,
+            seq_lens,
+        )
+        actual_seq_lengths_kv = torch.tensor(seq_lens, dtype=torch.int32).cumsum(0).tolist()
+        return dense_key, dense_value, actual_seq_lengths_kv
+
+    def _gather_paged_kv_to_dense(
+        self,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: list[int],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        block_size = key_cache.shape[1]
+        seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.long, device=key_cache.device)
+        max_seq_len = int(seq_lens_tensor.max().item())
+        num_blocks = cdiv(max_seq_len, block_size)
+        block_table = block_table[: len(seq_lens), :num_blocks].long()
+
+        flat_block_ids = block_table.reshape(-1)
+        max_tokens_padded = num_blocks * block_size
+        dense_shape = (
+            len(seq_lens),
+            max_tokens_padded,
+            self.num_kv_heads,
+            self.head_size,
+        )
+        gathered_key = key_cache.index_select(0, flat_block_ids).reshape(dense_shape)
+        gathered_value = value_cache.index_select(0, flat_block_ids).reshape(dense_shape)
+
+        positions = torch.arange(max_tokens_padded, dtype=torch.long, device=key_cache.device)
+        valid_mask = positions.unsqueeze(0) < seq_lens_tensor.unsqueeze(1)
+        return gathered_key[valid_mask].contiguous(), gathered_value[valid_mask].contiguous()
+
+    def _should_use_large_head_attention_fallback(self) -> bool:
+        unsupported_fia_tnd_head_size = self.head_size not in FIA_TND_SUPPORTED_HEAD_SIZES
+        return self.sinks is None and unsupported_fia_tnd_head_size
+
+    def _get_current_token_shared_kv(
+        self,
+        attn_metadata: AscendMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[None, None]:
+        if self.key_cache is None or self.value_cache is None:
+            return None, None
+        num_tokens = attn_metadata.actual_seq_lengths_q[-1]
+        if attn_metadata.slot_mapping is None or attn_metadata.slot_mapping.numel() < num_tokens:
+            return None, None
+        slots = attn_metadata.slot_mapping[:num_tokens].long()
+        key = self.key_cache.reshape(-1, self.num_kv_heads, self.head_size).index_select(0, slots)
+        value = self.value_cache.reshape(-1, self.num_kv_heads, self.head_size).index_select(0, slots)
+        return key, value
 
     def do_kv_cache_update(
         self,
@@ -1183,6 +1454,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 attn_metadata.reshape_cache_event = torch.npu.Event()
             if self.key_cache is None:
                 self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
+            if self.kv_sharing_target_layer_name is not None:
+                # KV-sharing target layers consume the producer layer's cache.
+                # Re-caching here would overwrite the shared KV slots.
+                if self.is_kv_producer:
+                    attn_metadata.reshape_cache_event.record()
+                return query, key, value, output
             slots = attn_metadata.slot_mapping
             encoder_decoder = self.attn_type == AttentionType.ENCODER_DECODER
             DeviceOperator.reshape_and_cache(
@@ -1198,33 +1475,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 attn_metadata.reshape_cache_event.record()
         return query, key, value, output
 
-    def _should_use_large_head_fallback(self) -> bool:
-        return self.head_size not in FIA_TND_SUPPORTED_HEAD_SIZES and self.sinks is None
-
-    def _forward_large_head_prefill_attention(
-        self, query, key, value, attn_metadata, output,
-    ) -> torch.Tensor:
-        num_tokens = attn_metadata.actual_seq_lengths_q[-1]
-        query = query[:num_tokens]
-        k, v = key[:num_tokens], value[:num_tokens]
-        sparse_mode = 4 if self.sliding_window else 3
-        pre_tokens = self.sliding_window or SWA_INT_MAX
-        next_tokens = 0 if (attn_metadata.causal or self.sliding_window) else SWA_INT_MAX
-        attn_mask = attn_metadata.attn_mask
-        if attn_mask is not None and attn_mask.dtype not in (torch.bool, torch.uint8):
-            attn_mask = attn_mask.bool()
-        attn_out = torch_npu.npu_fusion_attention(
-            query=query, key=k, value=v, head_num=self.num_heads,
-            input_layout="TND", scale=self.scale,
-            atten_mask=attn_mask,
-            pre_tockens=pre_tokens, next_tockens=next_tokens,
-            actual_seq_qlen=attn_metadata.actual_seq_lengths_q,
-            actual_seq_kvlen=attn_metadata.actual_seq_lengths_q,
-            sparse_mode=sparse_mode,
-        )[0]
-        output[:num_tokens] = attn_out[:num_tokens]
-        return output
-
     def forward_impl(
         self,
         query: torch.Tensor,
@@ -1233,28 +1483,47 @@ class AscendAttentionBackendImpl(AttentionImpl):
         kv_cache: tuple[torch.Tensor],
         attn_metadata: AscendMetadata,
         output: torch.Tensor,
-        layer: AttentionLayer | None = None,
     ):
         num_tokens = query.shape[0]
-        is_large_head = self._should_use_large_head_fallback()
-
-        # Decode: route to paged attention (supports large heads via TND)
-        is_decode = attn_metadata.attn_state == AscendAttentionState.DecodeOnly
-        use_pa = is_decode and (using_paged_attention(num_tokens, self.vllm_config) or is_large_head) and self.sliding_window is None
-
-        if use_pa:
-            return self.forward_paged_attention(query, attn_metadata, output)
-
-        # Prefill: route large heads to npu_fusion_attention (TND) instead of FIA
         if (
-            is_large_head
-            and key is not None and value is not None
+            self.kv_sharing_target_layer_name is not None
+            and key is not None
+            and value is not None
             and query.shape[0] == key.shape[0]
             and attn_metadata.attn_state in (AscendAttentionState.PrefillNoCache, AscendAttentionState.ChunkedPrefill)
         ):
-            return self._forward_large_head_prefill_attention(query, key, value, attn_metadata, output)
+            shared_key, shared_value = self._get_current_token_shared_kv(attn_metadata)
+            if shared_key is not None and shared_value is not None:
+                return self._forward_large_head_prefill_attention(
+                    query,
+                    shared_key,
+                    shared_value,
+                    attn_metadata,
+                    output,
+                )
 
-        return self.forward_fused_infer_attention(query, key, value, attn_metadata, output, kv_cache, layer)
+        if (
+            attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+            and self.sliding_window is None
+            and (
+                using_paged_attention(num_tokens, self.vllm_config) or self._should_use_large_head_attention_fallback()
+            )
+        ):
+            output = self.forward_paged_attention(query, attn_metadata, output)
+        elif (
+            not _EXTRA_CTX.capturing
+            and self._should_use_large_head_attention_fallback()
+            and self.kv_sharing_target_layer_name is None
+            and key is not None
+            and value is not None
+            and query.shape[0] == key.shape[0]
+            and attn_metadata.attn_state in (AscendAttentionState.PrefillNoCache, AscendAttentionState.ChunkedPrefill)
+        ):
+            output = self._forward_large_head_prefill_attention(query, key, value, attn_metadata, output)
+        else:
+            output = self.forward_fused_infer_attention(query, key, value, attn_metadata, output, kv_cache)
+
+        return output
 
     def forward(
         self,
@@ -1280,15 +1549,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
             shape = [num_tokens, num_heads * head_size]
         """
         assert output is not None, "Output tensor must be provided."
-
-        # Try to extract layer index from layer_name
-        if hasattr(layer, 'layer_name'):
-            layer_name_str = str(layer.layer_name)
-            if "layers." in layer_name_str:
-                try:
-                    self.layerIndex = int(layer_name_str.split("layers.")[1].split(".")[0])
-                except (ValueError, IndexError):
-                    pass
+        if self.enable_hamming_sparse:
+            self.layerIndex = int(layer.layer_name.split(".")[2])
+        self._layer_name = layer.layer_name
 
         if output_scale is not None or output_block_scale is not None:
             raise NotImplementedError("fused output quantization is not yet supported for AscendAttentionBackendImpl")
@@ -1323,28 +1586,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
             output[:num_tokens] = attn_output[:num_tokens]
             return output
         if output_padded is not None:
-            attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output_padded, layer)
+            attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output_padded)
         else:
-            attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output, layer)
-
-        # Periodic diagnostic: log attention output stats per layer.
-        # Skip during graph capture because .item() triggers stream sync.
-        AscendAttentionBackendImpl._diag_step_counter += 1
-        if (not _EXTRA_CTX.capturing
-                and AscendAttentionBackendImpl._diag_step_counter % AscendAttentionBackendImpl._DIAG_LOG_INTERVAL == 0):
-            _step = AscendAttentionBackendImpl._diag_step_counter
-            _mean = attn_output.float().mean().item()
-            _std = attn_output.float().std().item()
-            _kind = "PA" if self._should_use_large_head_fallback() else "FIA"
-            from vllm.logger import init_logger as _init_logger
-            _init_logger(__name__).info(
-                "attn_out[L%d][%s][step=%d]: mean=%.6f std=%.6f "
-                "head_size=%d sliding=%s",
-                self._impl_idx, _kind, _step, _mean, _std,
-                self.head_size,
-                self.sliding_window is not None,
-            )
-
+            attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output)
         output[:num_tokens] = attn_output[:num_tokens]
         return output
 
@@ -1732,4 +1976,3 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
         attn_output = attn_output.view(num_tokens, self.num_heads, self.head_size)
         output[:num_tokens] = attn_output
         return output
-
