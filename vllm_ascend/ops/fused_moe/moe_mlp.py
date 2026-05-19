@@ -20,6 +20,7 @@ import torch_npu
 from torch.nn.functional import pad
 from vllm.triton_utils import HAS_TRITON
 
+import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.mxfp_compat import (
@@ -32,6 +33,25 @@ from vllm_ascend.utils import (
     enable_custom_op,
     get_weight_prefetch_method,
 )
+
+# MoE debug logging - controlled by VLLM_ASCEND_MOE_DEBUG environment variable
+_moe_debug_enabled = False
+_moe_debug_counter = 0
+
+
+def _moe_debug_log(msg: str, *args):
+    """Print debug log if VLLM_ASCEND_MOE_DEBUG=1 is set."""
+    global _moe_debug_enabled, _moe_debug_counter
+    if _moe_debug_enabled:
+        print(f"[MOE_DEBUG] {msg}", *args)
+
+
+def _moe_debug_init():
+    """Initialize MoE debug logging."""
+    global _moe_debug_enabled
+    _moe_debug_enabled = envs_ascend.VLLM_ASCEND_MOE_DEBUG
+    if _moe_debug_enabled:
+        print("[MOE_DEBUG] MoE debug logging enabled (VLLM_ASCEND_MOE_DEBUG=1)")
 
 
 def _custom_gmm_swiglu_enabled(fusion, dynamic_eplb):
@@ -332,11 +352,18 @@ def unquant_apply_mlp(
     topk_scales: torch.Tensor | None = None,
     need_trans: bool = True,
 ) -> torch.Tensor:
+    global _moe_debug_counter
+    _moe_debug_init()
+    _moe_debug_counter += 1
+
     if need_trans:
         w1 = w1.transpose(1, 2)
         w2 = w2.transpose(1, 2)
 
     act_name = getattr(activation, "value", activation)
+    # Debug: log activation type (avoid .item() calls that trigger synchronization)
+    _moe_debug_log(f"[{_moe_debug_counter}] unquant_apply_mlp: activation={act_name}, "
+                   f"input_shape={hidden_states.shape}, w1_shape={w1.shape}")
 
     gate_up_out = torch_npu.npu_grouped_matmul(
         x=[hidden_states],
@@ -351,8 +378,15 @@ def unquant_apply_mlp(
     if act_name == "swigluoai":
         num_experts, _, hidden_size = w1.shape
         gate_up_out = AscendSwigluOAIAndMul.swiglu_oai_forward(gate_up_out.view(-1, hidden_size))
+        _moe_debug_log(f"  activation: swigluoai")
+    elif act_name == "gelu":
+        # Gemma4 MoE uses GeGLU activation: GELU(gate) * up
+        # Use tanh approximation for GELU as Gemma4 uses gelu_pytorch_tanh
+        gate_up_out = torch_npu.npu_gelu_mul(gate_up_out, approximate="tanh")
+        _moe_debug_log(f"  activation: gelu (GeGLU with tanh approximation) *** FIX APPLIED ***")
     else:
         gate_up_out = torch_npu.npu_swiglu(gate_up_out)
+        _moe_debug_log(f"  activation: swiglu (default)")
 
     if topk_scales is not None:
         gate_up_out *= topk_scales
