@@ -19,28 +19,8 @@ from collections.abc import Callable
 
 import torch
 
-import vllm_ascend.envs as envs_ascend
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.utils import get_weight_prefetch_method
-
-# MoE debug logging - controlled by VLLM_ASCEND_MOE_DEBUG environment variable
-_selector_debug_enabled = False
-_selector_debug_counter = 0
-
-
-def _selector_debug_log(msg: str, *args):
-    """Print debug log if VLLM_ASCEND_MOE_DEBUG=1 is set."""
-    global _selector_debug_enabled
-    if _selector_debug_enabled:
-        print(f"[MOE_SELECTOR_DEBUG] {msg}", *args)
-
-
-def _selector_debug_init():
-    """Initialize selector debug logging."""
-    global _selector_debug_enabled
-    _selector_debug_enabled = envs_ascend.VLLM_ASCEND_MOE_DEBUG
-    if _selector_debug_enabled:
-        print("[MOE_SELECTOR_DEBUG] MoE selector debug logging enabled (VLLM_ASCEND_MOE_DEBUG=1)")
 
 
 def select_experts(
@@ -82,14 +62,6 @@ def select_experts(
         topk_weights: router weights of shape (num_tokens, top_k).
         topk_ids: selected expert IDs of shape (num_tokens, top_k).
     """
-    global _selector_debug_counter
-    _selector_debug_init()
-    _selector_debug_counter += 1
-
-    # Debug: log routing info (avoid .item() calls that trigger synchronization)
-    _selector_debug_log(f"[{_selector_debug_counter}] select_experts: num_experts={num_experts}, top_k={top_k}, "
-                        f"use_grouped_topk={use_grouped_topk}, custom_routing={'Yes' if custom_routing_function is not None else 'No'}")
-
     # prefetch w1_w3_proj.weight preprocess
     weight_prefetch_method = get_weight_prefetch_method()
     if weight_prefetch_method:
@@ -147,9 +119,6 @@ def select_experts(
 
         topk_ids = torch.cat([topk_ids, pad_shared_expert_ids], dim=1)
         topk_weights = torch.cat([topk_weights, pad_shared_expert_weights], dim=1)
-
-    # Debug: log output info (avoid .item() calls that trigger synchronization)
-    _selector_debug_log(f"  topk_ids shape={topk_ids.shape}, topk_weights shape={topk_weights.shape}")
 
     return topk_weights, topk_ids
 

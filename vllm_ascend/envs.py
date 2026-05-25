@@ -112,9 +112,7 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
-    # Enable debug logging for MoE layer (Gemma4 MoE precision debugging).
-    # Set to 1 to enable, 0 or unset to disable.
-    "VLLM_ASCEND_MOE_DEBUG": lambda: bool(int(os.getenv("VLLM_ASCEND_MOE_DEBUG", "0"))),
+
 }
 
 # end-env-vars-definition

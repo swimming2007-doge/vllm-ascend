@@ -22,6 +22,8 @@ from vllm.utils.math_utils import cdiv
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
+    
+
 
 class AscendConfig:
     """
