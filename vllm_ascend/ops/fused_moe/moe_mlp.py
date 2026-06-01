@@ -100,6 +100,8 @@ def quant_apply_mlp(
     scale_type: torch.dtype | None = None,
     per_token_scale_type: torch.dtype | None = None,
     use_bf16: bool = True,
+    swiglu_limit: int = 0,
+    use_w4a8_per_channel_gmm_swiglu: bool = False,
 ) -> torch.Tensor:
     input_hidden_dtype = hidden_states.dtype
     use_gmm_swiglu_quant_fusion = use_mxfp_quant or (fusion and not dynamic_eplb)
@@ -148,6 +150,7 @@ def quant_apply_mlp(
                 weight_scale=w1_scale,
                 x_scale=pertoken_scale,
                 group_list=cumsum_group_list(group_list, group_list_type, 0),
+                swiglu_limit=swiglu_limit,
             )
         elif use_gmm_swiglu_quant_fusion:
             # gmm1: gate_up_proj & act_fn: swiglu
@@ -161,6 +164,7 @@ def quant_apply_mlp(
                 use_mxfp_quant=use_mxfp_quant,
                 act_quant_type=act_quant_type,
                 weight_quant_type=weight_quant_type,
+                swiglu_limit=swiglu_limit,
             )
             if quantized_hidden_states is not None:
                 dispose_tensor(quantized_hidden_states)
@@ -180,7 +184,7 @@ def quant_apply_mlp(
             if quantized_hidden_states is not None:
                 dispose_tensor(quantized_hidden_states)
             # act_fn: swiglu
-            hidden_states, swiglu_out_scale = torch_npu.npu_dequant_swiglu_quant(
+            hidden_states, swiglu_out_scale = torch.ops._C_ascend.npu_dequant_swiglu_quant(
                 x=hidden_states,
                 weight_scale=w1_scale[0],
                 activation_scale=pertoken_scale,
@@ -191,6 +195,7 @@ def quant_apply_mlp(
                 activate_left=True,
                 quant_mode=1,
             )
+        before_gmm2_evt = torch.npu.current_stream().record_event()
         # gmm2: down_proj
         hidden_states = DeviceOperator.npu_grouped_matmul_gmm2(
             hidden_states=hidden_states,
@@ -225,6 +230,7 @@ def quant_apply_mlp(
         dispose_tensor(unquantized_hidden_states)
         # act_fn: swiglu
         hidden_states = torch_npu.npu_swiglu(hidden_states)
+        before_gmm2_evt = torch.npu.current_stream().record_event()
         # gmm2: down_proj
         hidden_states = torch_npu.npu_grouped_matmul(
             x=[hidden_states],
@@ -242,12 +248,24 @@ def quant_apply_mlp(
             if group_list_type == 0:
                 group_list = torch.cat([group_list[:1], torch.diff(group_list, dim=0)])
                 group_list_type = 1
-            bias1 = [w1_scale_bias] if not fusion else w1_scale_bias
-            bias2 = [w2_scale_bias]
+            bias1 = w1_scale_bias
+            bias2 = w2_scale_bias
             # TODO w4a8 scene: dynamic acquisition of dtype in the future
             _output_dtype = torch.bfloat16
 
-        if _custom_gmm_swiglu_enabled(fusion, dynamic_eplb) and not use_mxfp_quant:
+        if use_w4a8_per_channel_gmm_swiglu and enable_custom_op():
+            hidden_states, swiglu_out_scale = torch.ops._C_ascend.grouped_matmul_swiglu_quant_v2(
+                x=hidden_states,
+                weight=w1,
+                weight_scale=w1_scale if isinstance(w1_scale, list) else [w1_scale],
+                x_scale=pertoken_scale,
+                group_list=group_list,
+                weight_assist_matrix=bias1,
+                dequant_mode=0,
+                group_list_type=group_list_type,
+                swiglu_limit=swiglu_limit,
+            )
+        elif _custom_gmm_swiglu_enabled(fusion, dynamic_eplb) and not use_mxfp_quant:
             # gmm1: gate_up_proj & act_fn: swiglu
             hidden_states, swiglu_out_scale, _ = torch.ops._C_ascend.grouped_matmul_swiglu_quant_weight_nz_tensor_list(
                 x=hidden_states,
@@ -256,6 +274,7 @@ def quant_apply_mlp(
                 x_scale=pertoken_scale,
                 group_list=cumsum_group_list(group_list, group_list_type, 0),
                 bias=bias1,
+                swiglu_limit=swiglu_limit,
             )
         elif use_gmm_swiglu_quant_fusion:
             hidden_states, swiglu_out_scale, _ = DeviceOperator.npu_grouped_matmul_swiglu_quant(
@@ -268,6 +287,7 @@ def quant_apply_mlp(
                 use_mxfp_quant=use_mxfp_quant,
                 act_quant_type=act_quant_type,
                 weight_quant_type=weight_quant_type,
+                swiglu_limit=swiglu_limit,
             )
             if quantized_hidden_states is not None:
                 dispose_tensor(quantized_hidden_states)
@@ -298,6 +318,7 @@ def quant_apply_mlp(
             else:
                 hidden_states = torch_npu.npu_swiglu(hidden_states)
                 hidden_states, swiglu_out_scale = torch_npu.npu_dynamic_quant(hidden_states)
+        before_gmm2_evt = torch.npu.current_stream().record_event()
         # gmm2: down_proj
         hidden_states = DeviceOperator.npu_grouped_matmul_gmm2(
             hidden_states=hidden_states,
@@ -316,7 +337,7 @@ def quant_apply_mlp(
             bias=bias2,
             fallback_output_dtype=_output_dtype,
         )
-    return hidden_states
+    return hidden_states, before_gmm2_evt
 
 
 def unquant_apply_mlp(
@@ -371,7 +392,7 @@ def unquant_apply_mlp(
         group_type=0,
         group_list=group_list,
     )[0]
-    return hidden_states
+    return hidden_states, None
 
 
 def unified_apply_mlp(*, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
@@ -398,6 +419,7 @@ def unified_apply_mlp(*, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
     need_trans = mlp_compute_input.need_trans
     dynamic_eplb = mlp_compute_input.dynamic_eplb
     fusion = mlp_compute_input.fusion
+    swiglu_limit = mlp_compute_input.swiglu_limit
 
     if not mlp_compute_input.quant.is_quant:
         return unquant_apply_mlp(
@@ -451,4 +473,6 @@ def unified_apply_mlp(*, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
         scale_type=scale_type,
         per_token_scale_type=per_token_scale_type,
         use_bf16=use_bf16,
+        swiglu_limit=swiglu_limit,
+        use_w4a8_per_channel_gmm_swiglu=mlp_compute_input.quant.use_w4a8_per_channel_gmm_swiglu,
     )

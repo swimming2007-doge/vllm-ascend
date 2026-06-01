@@ -3,9 +3,49 @@ import torch
 from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.kv_cache_interface import KVCacheGroupSpec
 from vllm.v1.utils import CpuGpuBuffer
-from vllm.v1.worker.block_table import _compute_slot_mapping_kernel
 from vllm.v1.worker.cp_utils import get_total_cp_world_size
+
+
+def _compute_slot_mapping_torch(
+    num_tokens: int,
+    max_num_tokens: int,
+    query_start_loc: torch.Tensor,
+    positions: torch.Tensor,
+    block_table: torch.Tensor,
+    block_table_stride: int,
+    block_size: int,
+    slot_mapping: torch.Tensor,
+    total_cp_world_size: int,
+    total_cp_rank: int,
+    cp_kv_cache_interleave_size: int,
+    pad_id: int,
+) -> None:
+    """Pure-PyTorch slot mapping that replaces the Triton kernel on Ascend."""
+    num_reqs = query_start_loc.shape[0] - 1
+    virtual_block_size = block_size * total_cp_world_size
+
+    for req_idx in range(num_reqs):
+        start_idx = int(query_start_loc[req_idx])
+        end_idx = int(query_start_loc[req_idx + 1])
+        if start_idx >= end_idx:
+            continue
+        pos = positions[start_idx:end_idx]
+        block_indices = (pos // virtual_block_size).to(torch.int64)
+        block_numbers = block_table[req_idx, block_indices]
+        virtual_block_offsets = pos - block_indices * virtual_block_size
+        is_local = ((virtual_block_offsets // cp_kv_cache_interleave_size) % total_cp_world_size) == total_cp_rank
+        local_block_offsets = (
+            virtual_block_offsets // (total_cp_world_size * cp_kv_cache_interleave_size)
+        ) * cp_kv_cache_interleave_size + (virtual_block_offsets % cp_kv_cache_interleave_size)
+        slot_numbers = block_numbers * block_size + local_block_offsets
+        slot_mapping[start_idx:end_idx] = torch.where(
+            is_local, slot_numbers, torch.full_like(slot_numbers, pad_id))
+
+    # Pad remaining slots for graph compatibility
+    if num_tokens < max_num_tokens:
+        slot_mapping[num_tokens:max_num_tokens] = pad_id
 
 
 class BlockTable:
@@ -20,8 +60,17 @@ class BlockTable:
         kernel_sizes: list[int] | None = None,
         cp_kv_cache_interleave_size: int = 1,
         num_speculative_tokens: int = 0,
+        kv_cache_group: KVCacheGroupSpec = None,
     ):
         self.max_num_reqs = max_num_reqs
+        compress_ratio = 1
+        if (
+            kv_cache_group is not None
+            and hasattr(kv_cache_group, "kv_cache_spec")
+            and hasattr(kv_cache_group.kv_cache_spec, "compress_ratio")
+        ):
+            compress_ratio = kv_cache_group.kv_cache_spec.compress_ratio
+        max_num_blocks_per_req = max(cdiv(max_num_blocks_per_req, compress_ratio), 1)
         self.max_num_blocks_per_req = max_num_blocks_per_req
         self.max_num_batched_tokens = max_num_batched_tokens
         self.pin_memory = pin_memory
@@ -134,7 +183,7 @@ class BlockTable:
         num_tokens = positions.shape[0]
         total_cp_world_size = self.pcp_world_size * self.dcp_world_size
         total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
-        _compute_slot_mapping_kernel[(num_reqs + 1,)](
+        _compute_slot_mapping_torch(
             num_tokens,
             self.max_num_batched_tokens,
             query_start_loc,
@@ -143,11 +192,10 @@ class BlockTable:
             self.block_table.gpu.stride(0),
             self.block_size,
             self.slot_mapping.gpu,
-            TOTAL_CP_WORLD_SIZE=total_cp_world_size,
-            TOTAL_CP_RANK=total_cp_rank,
-            CP_KV_CACHE_INTERLEAVE_SIZE=self.cp_kv_cache_interleave_size,
-            PAD_ID=PAD_SLOT_ID,
-            BLOCK_SIZE=1024,
+            total_cp_world_size,
+            total_cp_rank,
+            self.cp_kv_cache_interleave_size,
+            PAD_SLOT_ID,
         )
 
     def compute_slot_mapping_draft(self, req_indices: np.ndarray, positions: np.ndarray) -> None:
@@ -201,22 +249,23 @@ class BlockTable:
             self.slot_mapping.np[: req_indices.shape[0]] = np.where(mask, slot_mapping, -1)
         else:
             assert self.kernel_sizes is not None
-            if self.block_size == self.kernel_sizes[0]:
-                # IMPORTANT: In hybrid mode, positions are in logical block space,
-                # but we need to map them to the correct logical block table indices
-                logical_block_idx = positions // self.block_size
+            assert self.block_size == self.kernel_sizes[0]
+            # IMPORTANT: In hybrid mode, positions are in logical block space,
+            # but we need to map them to the correct logical block table indices
+            logical_block_idx = positions // self.block_size
 
-                # Account for the expanded logical table
-                # (always needed with unified tensor)
-                # Each physical block is split into multiple logical blocks
-                # The logical table has been expanded to accommodate this
-                block_table_indices = (
-                    req_indices * self.max_num_blocks_per_req * self.blocks_per_phys_block + logical_block_idx
-                )
+            # Account for the expanded logical table
+            # (always needed with unified tensor)
+            # Each physical block is split into multiple logical blocks
+            # The logical table has been expanded to accommodate this
+            block_table_indices = (
+                req_indices * self.max_num_blocks_per_req * self.blocks_per_phys_block + logical_block_idx
+            )
 
-                block_numbers = self.block_table.np.ravel()[block_table_indices]
-                block_offsets = positions % self.block_size
-                np.add(block_numbers * self.block_size, block_offsets, out=self.slot_mapping.np[: req_indices.shape[0]])
+            block_numbers = self.block_table.np.ravel()[block_table_indices]
+            block_offsets = positions % self.block_size
+            np.add(block_numbers * self.block_size, block_offsets, out=self.slot_mapping.np[: req_indices.shape[0]])
+            self.slot_mapping.copy_to_gpu(req_indices.shape[0])
 
     def commit_block_table(self, num_reqs: int) -> None:
         self.block_table.copy_to_gpu(num_reqs)
@@ -273,6 +322,7 @@ class MultiGroupBlockTable:
         max_num_blocks: list[int] | None = None,
         kernel_sizes: list[list[int]] | None = None,
         cp_kv_cache_interleave_size: int = 1,
+        kv_cache_groups: KVCacheGroupSpec = None,
     ) -> None:
         if kernel_sizes is None:
             kernel_sizes = [[0]] * len(block_sizes)
@@ -298,20 +348,41 @@ class MultiGroupBlockTable:
             )
 
         # Use zip to pair block_sizes with kernel_sizes one-to-one
-        self.block_tables = [
-            BlockTable(
-                block_size,
-                max_num_reqs,
-                max_num_blocks_per_req,
-                max_num_batched_tokens,
-                pin_memory,
-                device,
-                kernel_size_list,
-                cp_kv_cache_interleave_size,
-                num_speculative_tokens,
-            )
-            for block_size, kernel_size_list, max_num_blocks_per_req in zip(block_sizes, kernel_sizes, max_num_blocks)
-        ]
+        if kv_cache_groups is not None:
+            self.block_tables = [
+                BlockTable(
+                    block_size,
+                    max_num_reqs,
+                    max_num_blocks_per_req,
+                    max_num_batched_tokens,
+                    pin_memory,
+                    device,
+                    kernel_size_list,
+                    cp_kv_cache_interleave_size,
+                    num_speculative_tokens,
+                    kv_cache_group,
+                )
+                for block_size, kernel_size_list, max_num_blocks_per_req, kv_cache_group in zip(
+                    block_sizes, kernel_sizes, max_num_blocks, kv_cache_groups
+                )
+            ]
+        else:
+            self.block_tables = [
+                BlockTable(
+                    block_size,
+                    max_num_reqs,
+                    max_num_blocks_per_req,
+                    max_num_batched_tokens,
+                    pin_memory,
+                    device,
+                    kernel_size_list,
+                    cp_kv_cache_interleave_size,
+                    num_speculative_tokens,
+                )
+                for block_size, kernel_size_list, max_num_blocks_per_req in zip(
+                    block_sizes, kernel_sizes, max_num_blocks
+                )
+            ]
 
     def append_row(self, block_ids: tuple[list[int], ...], row_idx: int) -> None:
         for i, block_table in enumerate(self.block_tables):
@@ -338,13 +409,27 @@ class MultiGroupBlockTable:
         num_reqs: int,
         query_start_loc: torch.Tensor,
         positions: torch.Tensor,
+        positions_compressed_list: list[np.ndarray] | None = None,
+        req_indices_compressed_list: list[np.ndarray] | None = None,
     ) -> None:
-        for block_table in self.block_tables:
-            block_table.compute_slot_mapping(num_reqs, query_start_loc, positions)
+        for i, block_table in enumerate(self.block_tables):
+            if positions_compressed_list and req_indices_compressed_list:
+                block_table.compute_slot_mapping_draft(req_indices_compressed_list[i], positions_compressed_list[i])
+            else:
+                block_table.compute_slot_mapping(num_reqs, query_start_loc, positions)
 
-    def compute_slot_mapping_draft(self, req_indices: np.ndarray, positions: np.ndarray) -> None:
-        for block_table in self.block_tables:
-            block_table.compute_slot_mapping_draft(req_indices, positions)
+    def compute_slot_mapping_draft(
+        self,
+        req_indices: np.ndarray,
+        positions: np.ndarray,
+        positions_compressed_list: list[np.ndarray] | None = None,
+        req_indices_compressed_list: list[np.ndarray] | None = None,
+    ) -> None:
+        for i, block_table in enumerate(self.block_tables):
+            if positions_compressed_list and req_indices_compressed_list:
+                block_table.compute_slot_mapping_draft(req_indices_compressed_list[i], positions_compressed_list[i])
+            else:
+                block_table.compute_slot_mapping_draft(req_indices, positions)
 
     def commit_block_table(self, num_reqs: int) -> None:
         for block_table in self.block_tables:
