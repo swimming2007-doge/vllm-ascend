@@ -106,6 +106,9 @@ class AscendGemmaRMSNorm(GemmaRMSNorm):
             return x, residual
 
         x, _ = torch.ops._C_ascend.npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)
+        # ── DIAG ──
+        from vllm_ascend.diag_think import log_gemma_rmsnorm
+        log_gemma_rmsnorm(self, x, x)
         return x
 
 

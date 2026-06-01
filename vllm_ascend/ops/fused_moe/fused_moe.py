@@ -406,10 +406,14 @@ class AscendFusedMoE(FusedMoE):
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         self.ensure_moe_quant_config_init()
-        return self.runner.forward(
+        result = self.runner.forward(
             hidden_states,
             router_logits,
         )
+        from vllm_ascend.diag_think import log_moe
+        out = result[0] if isinstance(result, tuple) else result
+        log_moe(self, hidden_states, out)
+        return result
 
     def forward_impl(  # type: ignore[override]
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor, return_with_event: bool = False

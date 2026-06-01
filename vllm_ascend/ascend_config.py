@@ -354,7 +354,7 @@ class AscendCompilationConfig:
         enable_npugraph_ex: bool = True,
         enable_static_kernel: bool = False,
         fuse_norm_quant: bool = True,
-        fuse_qknorm_rope: bool = True,
+        fuse_qknorm_rope: bool = False,
         fuse_allreduce_rms: bool = False,
         **kwargs,
     ):

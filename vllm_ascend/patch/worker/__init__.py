@@ -40,7 +40,10 @@ if not is_310p():
     import vllm_ascend.patch.worker.patch_gdn_attn  # noqa
 
     if not vllm_version_is("0.19.1"):
-        import vllm_ascend.patch.worker.patch_qwen3_dflash  # noqa
+        try:
+            import vllm_ascend.patch.worker.patch_qwen3_dflash  # noqa
+        except ImportError:
+            pass
 import vllm_ascend.patch.worker.patch_rejection_sampler  # noqa
 import vllm_ascend.patch.worker.patch_v2.patch_uva  # noqa
 import vllm_ascend.patch.worker.patch_huanyuan_vl  # noqa

@@ -251,9 +251,13 @@ class AscendLogitsProcessor(LogitsProcessor):
         embedding_bias: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
         if lmhead_tp_enable():
-            return self._get_logits_lmheadtp(hidden_states, lm_head, embedding_bias)
+            logits = self._get_logits_lmheadtp(hidden_states, lm_head, embedding_bias)
         else:
-            return self._get_logits_normal(hidden_states, lm_head, embedding_bias)
+            logits = self._get_logits_normal(hidden_states, lm_head, embedding_bias)
+        from vllm_ascend.diag_think import log_lm_head
+        if logits is not None:
+            log_lm_head(hidden_states, logits)
+        return logits
 
     def _get_logits_lmheadtp(
         self,

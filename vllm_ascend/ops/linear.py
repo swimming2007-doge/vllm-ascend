@@ -85,7 +85,10 @@ class AscendUnquantizedLinearMethod(UnquantizedLinearMethod):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return torch.ops.vllm.unquantized_gemm(x, layer.weight, bias)
+        out = torch.ops.vllm.unquantized_gemm(x, layer.weight, bias)
+        from vllm_ascend.diag_think import log_linear
+        log_linear(layer, x, out)
+        return out
 
 
 # TODO(realliujiaxu): Remove this class after linear of vllm supports custom comm group

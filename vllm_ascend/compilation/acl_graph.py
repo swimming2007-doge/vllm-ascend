@@ -107,6 +107,9 @@ class ACLGraphWrapper:
         # in case we need to access the original runnable.
         return self.runnable
 
+    # Diagnostic counter for thinking-loop debugging (VLLM_ASCEND_DIAG_THINK=1)
+    _diag_call: int = 0
+
     def __call__(self, *args, **kwargs):
         forward_context = get_forward_context()
         batch_descriptor = forward_context.batch_descriptor
@@ -197,6 +200,16 @@ class ACLGraphWrapper:
             )
 
         logger.info_once("Replaying aclgraph")
+
+        # ── THINKING-LOOP DIAGNOSTIC (VLLM_ASCEND_DIAG_THINK=1) ──
+        if not torch.npu.is_current_stream_capturing():
+            import os as _os3
+            if _os3.environ.get("VLLM_ASCEND_DIAG_THINK", "0") == "1":
+                ACLGraphWrapper._diag_call += 1
+                _c = ACLGraphWrapper._diag_call
+                _bs = str(batch_descriptor) if hasattr(batch_descriptor, '__str__') else '?'
+                if _c % 10 == 0 or _c <= 3:
+                    print(f"[DIAG][graph={_c}] REPLAY bs={_bs}", flush=True)
         # In async scheduling or multi-threaded (MT) scenarios, it is possible that
         # the CPU's record event (from update_attn_params) for the iteration i completes
         # before the grph replay of iteration i-1.

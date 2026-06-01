@@ -275,6 +275,8 @@ class AscendGemma4RotaryEmbedding(Gemma4RotaryEmbedding):
         offsets: torch.Tensor | None = None,
         is_neox_style_override: bool | None = None,
     ):
+        from vllm_ascend.diag_think import log_rotary
+        log_rotary(self, positions, query, key)
         return AscendRotaryEmbedding.forward_oot(self, positions, query, key, offsets, is_neox_style_override)
 
 class AscendYaRNRotaryEmbedding(YaRNScalingRotaryEmbedding):

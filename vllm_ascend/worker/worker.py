@@ -64,8 +64,10 @@ from vllm_ascend.utils import (
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
-if not vllm_version_is("0.19.1"):
+try:
     from vllm.v1.worker.worker_base import CompilationTimes  # noqa: E402
+except ImportError:
+    CompilationTimes = None  # vllm 0.19.1 doesn't have this
 
 torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
 from torch._dynamo.variables import TorchInGraphFunctionVariable  # noqa: E402

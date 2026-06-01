@@ -75,7 +75,10 @@ Qwen3VLForConditionalGeneration._get_deepstack_input_embeds = tensor_parallel_wr
 
 if not vllm_version_is("0.19.1"):
     # Only patch for latest main
-    from vllm.model_executor.models.qwen3_vl import pos_embed_interpolate_native
+    try:
+        from vllm.model_executor.models.qwen3_vl import pos_embed_interpolate_native
+    except ImportError:
+        pos_embed_interpolate_native = None
 
     def _fast_pos_embed_interpolate(self, grid_thw: list[list[int]]) -> torch.Tensor:
         outputs = []
