@@ -29,8 +29,12 @@ from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.layer import FusedMoE, UnquantizedFusedMoEMethod, get_compressed_expert_map
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import RoutedExpertsCapturer
-from vllm.model_executor.layers.fused_moe.runner.default_moe_runner import DefaultMoERunner  # type: ignore
-from vllm.model_executor.layers.fused_moe.shared_fused_moe import SharedFusedMoE
+from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner  # type: ignore
+# SharedFusedMoE removed in vllm 0.20.2; shared experts now handled by MoERunner
+try:
+    from vllm.model_executor.layers.fused_moe.shared_fused_moe import SharedFusedMoE  # vllm < 0.20
+except ImportError:
+    SharedFusedMoE = None  # type: ignore
 
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
@@ -221,7 +225,9 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
 
 
 # Please remove this inheritance after extending vllm, todo(wxs)
-class AscendMoERunner(DefaultMoERunner):
+class AscendMoERunner(MoERunner):
+    """Ascend-specific MoE runner that delegates to the layer's forward_impl."""
+
     @property
     def use_dp_chunking(self) -> bool:
         """Ascend uses its own forward_impl path, not the FlashInfer Cutlass
@@ -229,6 +235,38 @@ class AscendMoERunner(DefaultMoERunner):
         return False
 
     # TODO: Remove this after drop v0.19.1 support
+    def _forward_impl(
+        self,
+        layer: torch.nn.Module,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        shared_experts_input: torch.Tensor | None,
+        input_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Override the default _forward_impl to use Ascend-specific
+        implementation. This delegates to the layer's forward_impl method
+        which contains the Ascend-specific MoE computation logic.
+        """
+        # Sync aux and main stream for shared expert multi-stream overlap.
+        self._maybe_sync_shared_experts_stream(shared_experts_input)
+
+        if self.gate is not None:
+            router_logits, _ = self.gate(hidden_states)
+
+        with self._sequence_parallel_context():
+            hidden_states, router_logits = self._maybe_dispatch(
+                layer, hidden_states, router_logits)
+
+            shared_output, hidden_states = self._apply_quant_method(
+                layer=layer,
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                shared_experts_input=shared_experts_input,
+                input_ids=input_ids,
+            )
+
+            return self._maybe_combine(shared_output, hidden_states)
+
     def forward_impl(
         self,
         layer: torch.nn.Module,
@@ -236,15 +274,10 @@ class AscendMoERunner(DefaultMoERunner):
         router_logits: torch.Tensor,
         shared_input: torch.Tensor | None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """
-        Override the default forward_impl to use Ascend-specific implementation.
-        This delegates to the layer's forward_impl method which contains the
-        Ascend-specific MoE computation logic.
+        """Legacy forward_impl for backward compatibility.
+        Delegates to _forward_impl.
         """
         result = layer.forward_impl(hidden_states, router_logits)
-        # If the layer has shared experts, forward_impl returns a tuple (shared_out, routed_out)
-        # Otherwise, it returns just routed_out
-        # The torch op expects the same return type based on whether it's moe_forward or moe_forward_shared
         return result
 
     def forward_dispatch(
@@ -254,6 +287,7 @@ class AscendMoERunner(DefaultMoERunner):
         router_logits: torch.Tensor,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Legacy forward_dispatch for backward compatibility."""
         with self._sequence_parallel_context():
             return self.forward_impl(
                 layer,
@@ -366,7 +400,6 @@ class AscendFusedMoE(FusedMoE):
             self.gate if is_legacy else kwargs.pop("gate", None),
             self.shared_experts if is_legacy else kwargs.pop("shared_experts", None),
             self.quant_method,
-            self.reduce_results,
             self.vllm_config.parallel_config.enable_dbo,
         )
 
@@ -550,7 +583,9 @@ class AscendFusedMoE(FusedMoE):
             return routed_out
 
 
-class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
+class AscendSharedFusedMoE(AscendFusedMoE):
+    # NOTE: SharedFusedMoE was removed in vllm 0.20.2.
+    # Shared experts are now managed by MoERunner internally.
     def __init__(
         self,
         shared_experts: torch.nn.Module,
@@ -596,7 +631,6 @@ class AscendSharedFusedMoE(SharedFusedMoE, AscendFusedMoE):
             self.gate,
             self._shared_experts,
             self.quant_method,
-            self.reduce_results,
             self.vllm_config.parallel_config.enable_dbo,
         )
 
