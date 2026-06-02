@@ -73,7 +73,7 @@ _ATTN_KEYS_BUFFER = None
 # Ascend FIA TND currently supports these head dimensions on the vLLM-Ascend
 # path. Larger heterogeneous-head models need a prefill fallback to avoid
 # unsupported-kernel behavior.
-FIA_TND_SUPPORTED_HEAD_SIZES = {64, 128, 192, 256}
+FIA_TND_SUPPORTED_HEAD_SIZES = {64, 128, 192}
 
 GraphParamKind = Literal["paged_attention", "fia"]
 
@@ -342,7 +342,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         attn_state = common_attn_metadata.attn_state
 
         # Get attn_mask from singleton AttentionMaskBuilder
-        attn_mask = self.attn_mask_builder.get_attention_mask(self.model_config)
+        attn_mask = self.attn_mask_builder.get_attention_mask(common_attn_metadata.causal, self.model_config)
 
         # TODO: Yet another unnecessary H2D while we already have a query_start_loc on device
         query_start_loc = query_start_loc_cpu.pin_memory().to(self.device, non_blocking=True)
@@ -1269,6 +1269,27 @@ class AscendAttentionBackendImpl(AttentionImpl):
     ) -> torch.Tensor:
         if _EXTRA_CTX.capturing:
             return self.full_graph_pa(query, attn_metadata, output)
+
+        # Pre-compute workspace during eager warmup so it is available
+        # for graph capture without launching a kernel inside the
+        # captured stream (which would fail with "the current capture
+        # mode does not support this operation").
+        graph_params = get_graph_params()
+        num_tokens = query.shape[0]
+        if graph_params.workspaces.get(num_tokens) is None:
+            workspace = torch_npu._npu_paged_attention_get_workspace(
+                query=query,
+                key_cache=self.key_cache,
+                value_cache=self.value_cache,
+                num_kv_heads=self.num_kv_heads,
+                num_heads=self.num_heads,
+                scale_value=self.scale,
+                block_table=attn_metadata.block_tables,
+                context_lens=attn_metadata.seq_lens,
+                out=output,
+            )
+            update_graph_params_workspaces(num_tokens, workspace)
+
         torch_npu._npu_paged_attention(
             query=query,
             key_cache=self.key_cache,
@@ -1487,43 +1508,70 @@ class AscendAttentionBackendImpl(AttentionImpl):
         output: torch.Tensor,
     ):
         num_tokens = query.shape[0]
+        needs_fallback = self._should_use_large_head_attention_fallback()
+
+        # ── KV-sharing prefill with shared cache ──
         if (
             self.kv_sharing_target_layer_name is not None
-            and key is not None
-            and value is not None
+            and key is not None and value is not None
             and query.shape[0] == key.shape[0]
             and attn_metadata.attn_state in (AscendAttentionState.PrefillNoCache, AscendAttentionState.ChunkedPrefill)
         ):
             shared_key, shared_value = self._get_current_token_shared_kv(attn_metadata)
             if shared_key is not None and shared_value is not None:
                 return self._forward_large_head_prefill_attention(
-                    query,
-                    shared_key,
-                    shared_value,
-                    attn_metadata,
-                    output,
-                )
+                    query, shared_key, shared_value, attn_metadata, output)
 
-        if (
-            attn_metadata.attn_state == AscendAttentionState.DecodeOnly
-            and self.sliding_window is None
-            and (
-                using_paged_attention(num_tokens, self.vllm_config) or self._should_use_large_head_attention_fallback()
-            )
-        ):
-            output = self.forward_paged_attention(query, attn_metadata, output)
-        elif (
-            not _EXTRA_CTX.capturing
-            and self._should_use_large_head_attention_fallback()
-            and self.kv_sharing_target_layer_name is None
-            and key is not None
-            and value is not None
-            and query.shape[0] == key.shape[0]
-            and attn_metadata.attn_state in (AscendAttentionState.PrefillNoCache, AscendAttentionState.ChunkedPrefill)
-        ):
-            output = self._forward_large_head_prefill_attention(query, key, value, attn_metadata, output)
+        # ── Large head (unsupported by FIA) → Use npu_fusion_attention ──
+        if needs_fallback:
+            if (
+                attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+                and self.sliding_window is None
+                and using_paged_attention(num_tokens, self.vllm_config)
+            ):
+                # Decode with paged attention (no sliding window & using PA)
+                output = self.forward_paged_attention(query, attn_metadata, output)
+            elif (
+                not _EXTRA_CTX.capturing
+                and key is not None and value is not None
+                and query.shape[0] == key.shape[0]
+                and attn_metadata.attn_state in (AscendAttentionState.PrefillNoCache, AscendAttentionState.ChunkedPrefill)
+            ):
+                # Prefill → npu_fusion_attention (handles any head_dim)
+                output = self._forward_large_head_prefill_attention(
+                    query, key, value, attn_metadata, output)
+            elif (
+                not _EXTRA_CTX.capturing
+                and attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+                and self.sliding_window is not None
+            ):
+                # Decode with sliding window → npu_fusion_attention (FIA
+                # doesn't support head_dim=256 on all CANN versions).
+                # Skip during graph capture: host-to-device memcpy in
+                # _gather_paged_kv_to_dense is not allowed in captured stream.
+                output = self._forward_large_head_prefill_attention(
+                    query, key, value, attn_metadata, output)
+            elif (
+                attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+            ):
+                # Decode that didn't match PA conditions → use paged_attention anyway
+                output = self.forward_paged_attention(query, attn_metadata, output)
+            else:
+                # Other cases (e.g., graph capturing or unknown state) →
+                # use npu_fusion_attention as FIA does not support this head size
+                output = self._forward_large_head_prefill_attention(
+                    query, key, value, attn_metadata, output)
         else:
-            output = self.forward_fused_infer_attention(query, key, value, attn_metadata, output, kv_cache)
+            # ── Normal head size → Use FIA ──
+            if (
+                attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+                and self.sliding_window is None
+                and using_paged_attention(num_tokens, self.vllm_config)
+            ):
+                output = self.forward_paged_attention(query, attn_metadata, output)
+            else:
+                output = self.forward_fused_infer_attention(
+                    query, key, value, attn_metadata, output, kv_cache)
 
         return output
 
