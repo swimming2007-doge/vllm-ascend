@@ -152,6 +152,22 @@ class MoECommMethod(ABC):
             use_fusion_ops=self.use_fusion_ops,
         )
 
+        if getattr(fused_experts_input.activation, 'value', fused_experts_input.activation) == "gelu":
+            import sys
+            print(
+                f"[GEMMA4_MOE_DIAG] fused_experts: "
+                f"after_dispatch_hidden_dtype={token_dispatch_output.hidden_states.dtype} "
+                f"dynamic_scale_is_none={token_dispatch_output.dynamic_scale is None} "
+                f"group_list_type={token_dispatch_output.group_list_type} "
+                f"quant_type={fused_experts_input.quant.quant_type} "
+                f"activation={fused_experts_input.activation} "
+                f"use_fusion_ops={self.use_fusion_ops} "
+                f"fusion={mlp_compute_input.fusion} "
+                f"comm_type={type(self).__name__}",
+                file=sys.stderr,
+                flush=True,
+            )
+
         mlp_output, before_gmm2_evt = self._apply_mlp(mlp_compute_input)
 
         before_combine_evt = torch.npu.current_stream().record_event()
@@ -317,7 +333,7 @@ class FusedMC2CommImpl(MoECommMethod):
                 bias2=fused_experts_input.weights.w2_scale_bias,
                 probs=fused_experts_input.topk_weights.to(torch.float32),
                 group=self.token_dispatcher.moe_all_to_all_group_name,
-                max_output_size=131072,
+                max_output_size=65536,
                 swiglu_limit=fused_experts_input.swiglu_limit,
                 x_active_mask=fused_experts_input.routing.mc2_mask,
                 out=out,

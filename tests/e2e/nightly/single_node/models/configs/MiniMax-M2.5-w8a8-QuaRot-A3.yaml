@@ -24,6 +24,7 @@ test_cases:
       - "--port"
       - "$SERVER_PORT"
       - "--trust-remote-code"
+      - "--async-scheduling"
       - "--gpu-memory-utilization"
       - "0.85"
       - "--quantization"

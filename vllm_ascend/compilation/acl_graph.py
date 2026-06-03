@@ -107,9 +107,6 @@ class ACLGraphWrapper:
         # in case we need to access the original runnable.
         return self.runnable
 
-    # Diagnostic counter for thinking-loop debugging (VLLM_ASCEND_DIAG_THINK=1)
-    _diag_call: int = 0
-
     def __call__(self, *args, **kwargs):
         forward_context = get_forward_context()
         batch_descriptor = forward_context.batch_descriptor
@@ -200,16 +197,6 @@ class ACLGraphWrapper:
             )
 
         logger.info_once("Replaying aclgraph")
-
-        # ── THINKING-LOOP DIAGNOSTIC (VLLM_ASCEND_DIAG_THINK=1) ──
-        if not torch.npu.is_current_stream_capturing():
-            import os as _os3
-            if _os3.environ.get("VLLM_ASCEND_DIAG_THINK", "0") == "1":
-                ACLGraphWrapper._diag_call += 1
-                _c = ACLGraphWrapper._diag_call
-                _bs = str(batch_descriptor) if hasattr(batch_descriptor, '__str__') else '?'
-                if _c % 10 == 0 or _c <= 3:
-                    print(f"[DIAG][graph={_c}] REPLAY bs={_bs}", flush=True)
         # In async scheduling or multi-threaded (MT) scenarios, it is possible that
         # the CPU's record event (from update_attn_params) for the iteration i completes
         # before the grph replay of iteration i-1.
@@ -277,16 +264,9 @@ class GraphParams:
     workspaces: dict[int, torch.Tensor]
     handles: dict[int, list[torch_npu._C._NPUTaskGroupHandle]]
     attn_params: dict[int, list[tuple]]
-    # New: key -> (params, handle, event) mapping for reliable lookup
-    # Structure: {num_tokens: {layer_key: (params_tuple, handle, event)}}
-    attn_params_by_key: dict[int, dict[str, tuple]] = None
-    conv1d_params: dict[int, list[tuple]] = None  # for causal conv1d params
-    conv1d_handles: dict[int, list[torch_npu._C._NPUTaskGroupHandle]] = None
-    conv1d_events: dict[int, list[torch.npu.ExternalEvent]] = None
-
-    def __post_init__(self):
-        if self.attn_params_by_key is None:
-            self.attn_params_by_key = {size: {} for size in self.attn_params.keys()}
+    conv1d_params: dict[int, list[tuple]]  # for causal conv1d params
+    conv1d_handles: dict[int, list[torch_npu._C._NPUTaskGroupHandle]]  # for causal conv1d params handles
+    conv1d_events: dict[int, list[torch.npu.ExternalEvent]]  # for causal conv1d params events
 
 
 _graph_params: GraphParams | None = None
@@ -301,7 +281,6 @@ def set_graph_params(aclgraph_capture_sizes: list[int]):
         {size: None for size in aclgraph_capture_sizes},
         {size: [] for size in aclgraph_capture_sizes},
         {size: [] for size in aclgraph_capture_sizes},
-        {size: {} for size in aclgraph_capture_sizes},  # attn_params_by_key
         {size: [] for size in aclgraph_capture_sizes},
         {size: [] for size in aclgraph_capture_sizes},
         {size: [] for size in aclgraph_capture_sizes},
@@ -330,7 +309,6 @@ def set_draft_graph_params(aclgraph_capture_sizes: list[int]):
         {size: None for size in aclgraph_capture_sizes},
         {size: [] for size in aclgraph_capture_sizes},
         {size: [] for size in aclgraph_capture_sizes},
-        {size: {} for size in aclgraph_capture_sizes},  # attn_params_by_key
         {size: [] for size in aclgraph_capture_sizes},
         {size: [] for size in aclgraph_capture_sizes},
         {size: [] for size in aclgraph_capture_sizes},
@@ -359,7 +337,6 @@ def set_draft_graph_prefill_params(aclgraph_capture_sizes: list[int]):
         {size: None for size in aclgraph_capture_sizes},
         {size: [] for size in aclgraph_capture_sizes},
         {size: [] for size in aclgraph_capture_sizes},
-        {size: {} for size in aclgraph_capture_sizes},  # attn_params_by_key
         {size: [] for size in aclgraph_capture_sizes},
         {size: [] for size in aclgraph_capture_sizes},
         {size: [] for size in aclgraph_capture_sizes},
@@ -374,4 +351,3 @@ def update_draft_graph_prefill_params_workspaces(num_tokens: int, workspace: Any
 
 def get_draft_graph_prefill_params():
     return _draft_graph_prefill_params
-

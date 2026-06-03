@@ -23,8 +23,6 @@ from vllm.utils.math_utils import cdiv
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
-    
-
 
 class AscendConfig:
     """
@@ -137,7 +135,6 @@ class AscendConfig:
         self.enable_cpu_binding = additional_config.get("enable_cpu_binding", True)
         self.multistream_dsa_preprocess = additional_config.get("multistream_dsa_preprocess", False)
         self.multistream_dsv4_dsa_overlap = additional_config.get("multistream_dsv4_dsa_overlap", False)
-        self.prefill_comm_compute_overlap = additional_config.get("prefill_comm_compute_overlap", False)
 
         self.enable_context_parallel = self._get_config_value(
             additional_config,
@@ -269,9 +266,6 @@ class AscendConfig:
 
         # Enable dispatch/combine op inter-node communication by ROCE
         self.enable_mc2_hierarchy_comm = additional_config.get("enable_mc2_hierarchy_comm", False)
-
-        # Enable optimized reduce sampling scheme
-        self.enable_reduce_sample = additional_config.get("enable_reduce_sample", False)
 
         self.mix_placement = additional_config.get("mix_placement", False)
         self._check_mix_placement()
@@ -490,7 +484,7 @@ class AscendCompilationConfig:
         enable_npugraph_ex: bool = True,
         enable_static_kernel: bool = False,
         fuse_norm_quant: bool = True,
-        fuse_qknorm_rope: bool = False,
+        fuse_qknorm_rope: bool = True,
         fuse_allreduce_rms: bool = False,
         **kwargs,
     ):

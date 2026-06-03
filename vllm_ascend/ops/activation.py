@@ -37,8 +37,6 @@ class AscendSiluAndMul(SiluAndMul):
         weight_prefetch_method.maybe_prefetch_mlp_weight_preprocess(weight_prefetch_method.MLP_DOWN, x)
         out = torch_npu.npu_swiglu(x)
         weight_prefetch_method.maybe_prefetch_mlp_weight_postprocess(out)
-        from vllm_ascend.diag_think import log_silu_and_mul
-        log_silu_and_mul(self, x, out)
         return out
 
 

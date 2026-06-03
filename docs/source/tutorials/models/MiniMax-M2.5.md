@@ -151,6 +151,7 @@ vllm serve /path/to/weight/MiniMax-M2.5-w8a8-QuaRot \
     --port 8000 \
     --trust-remote-code \
     --quantization ascend \
+    --async-scheduling \
     --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
     --additional-config '{"enable_cpu_binding":true}' \
     --enable-expert-parallel \
@@ -245,6 +246,7 @@ vllm serve /opt/data/verification/models/MiniMax-M2.5/ \
   --reasoning-parser minimax_m2_append_think \
   --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
   --mm_processor_cache_type="shm" \
+  --async-scheduling \
   --additional-config '{"enable_cpu_binding":true}'
 ```
 
@@ -300,6 +302,7 @@ vllm serve /opt/data/verification/models/MiniMax-M2.5/ \
   --reasoning-parser minimax_m2_append_think \
   --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
   --mm_processor_cache_type="shm" \
+  --async-scheduling \
   --additional-config '{"enable_cpu_binding":true}'
 ```
 

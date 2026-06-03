@@ -166,6 +166,7 @@ vllm serve /root/.cache/modelscope/hub/models/vllm-ascend/GLM5-w4a8 \
 --quantization ascend \
 --enable-chunked-prefill \
 --enable-prefix-caching \
+--async-scheduling \
 --additional-config '{"fuse_muls_add": true, "multistream_overlap_shared_expert": true, "ascend_compilation_config": {"enable_npugraph_ex": true}}' \
 --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
 --speculative-config '{"num_speculative_tokens": 3, "method": "deepseek_mtp"}' 
@@ -201,6 +202,7 @@ vllm serve /root/.cache/modelscope/hub/models/vllm-ascend/GLM5-w8a8 \
 --quantization ascend \
 --enable-chunked-prefill \
 --enable-prefix-caching \
+--async-scheduling \
 --additional-config '{"fuse_muls_add": true, "multistream_overlap_shared_expert": true, "ascend_compilation_config": {"enable_npugraph_ex": true}}' \
 --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
 --speculative-config '{"num_speculative_tokens": 3, "method": "deepseek_mtp"}' 
@@ -239,6 +241,7 @@ vllm serve /root/.cache/modelscope/hub/models/vllm-ascend/GLM-5-w4a8 \
 --quantization ascend \
 --enable-chunked-prefill \
 --enable-prefix-caching \
+--async-scheduling \
 --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
 --additional-config '{"fuse_muls_add": true, "multistream_overlap_shared_expert": true, "ascend_compilation_config": {"enable_npugraph_ex": true}}' \
 --speculative-config '{"num_speculative_tokens": 3, "method": "deepseek_mtp"}'
@@ -251,6 +254,7 @@ vllm serve /root/.cache/modelscope/hub/models/vllm-ascend/GLM-5-w4a8 \
 The parameters are explained as follows:
 
 - For single-node deployment, we recommend using `dp1tp16` and turn off expert parallel in low-latency scenarios.
+- `--async-scheduling` Asynchronous scheduling is a technique used to optimize inference efficiency. It allows non-blocking task scheduling to improve concurrency and throughput, especially when processing large-scale models.
 
 ### Multi-node Deployment
 
@@ -571,6 +575,7 @@ vllm serve /root/.cache/modelscope/hub/models/vllm-ascend/GLM5-w8a8 \
 --quantization ascend \
 --enable-chunked-prefill \
 --enable-prefix-caching \
+--async-scheduling \
 --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
 --additional-config '{"fuse_muls_add": true, "multistream_overlap_shared_expert": true, "ascend_compilation_config": {"enable_npugraph_ex": true}}' \
 --speculative-config '{"num_speculative_tokens": 3, "method": "deepseek_mtp"}'
@@ -622,6 +627,7 @@ vllm serve /root/.cache/modelscope/hub/models/vllm-ascend/GLM5-w8a8 \
 --quantization ascend \
 --enable-chunked-prefill \
 --enable-prefix-caching \
+--async-scheduling \
 --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
 --additional-config '{"fuse_muls_add": true, "multistream_overlap_shared_expert": true, "ascend_compilation_config": {"enable_npugraph_ex": true}}' \
 --speculative-config '{"num_speculative_tokens": 3, "method": "deepseek_mtp"}'
@@ -794,6 +800,7 @@ Before you start, please
             --max-num-batched-tokens 4096 \
             --trust-remote-code \
             --max-num-seqs 64 \
+            --async-scheduling \
             --enable-chunked-prefill \
             --quantization ascend \
             --gpu-memory-utilization 0.95 \
@@ -875,6 +882,7 @@ Before you start, please
             --max-num-batched-tokens 4096 \
             --trust-remote-code \
             --max-num-seqs 64 \
+            --async-scheduling \
             --enable-chunked-prefill \
             --gpu-memory-utilization 0.95 \
             --quantization ascend \
@@ -960,6 +968,7 @@ Before you start, please
             --trust-remote-code \
             --max-num-seqs 8 \
             --gpu-memory-utilization 0.92 \
+            --async-scheduling \
             --quantization ascend \
             --enable-auto-tool-choice \
             --tool-call-parser glm47 \
@@ -1041,6 +1050,7 @@ Before you start, please
              --trust-remote-code \
              --max-num-seqs 8 \
              --gpu-memory-utilization 0.92 \
+             --async-scheduling \
              --quantization ascend \
              --enable-auto-tool-choice \
              --tool-call-parser glm47 \
@@ -1122,6 +1132,7 @@ Before you start, please
              --trust-remote-code \
              --max-num-seqs 8 \
              --gpu-memory-utilization 0.92 \
+             --async-scheduling \
              --quantization ascend \
              --enable-auto-tool-choice \
              --tool-call-parser glm47 \
@@ -1203,6 +1214,7 @@ Before you start, please
              --trust-remote-code \
              --max-num-seqs 8 \
              --gpu-memory-utilization 0.92 \
+             --async-scheduling \
              --quantization ascend \
              --enable-auto-tool-choice \
              --tool-call-parser glm47 \

@@ -338,11 +338,6 @@ __aicore__ inline void CausalConv1dV310<T>::WriteBackState(int32_t cacheIdx, int
     if (len <= 0) {
         return;
     }
-    const int32_t expectedDimTileSize = (c0 + dimTileSize <= dim) ? dimTileSize : (dim - c0);
-    if (c0 < 0 || c0 >= dim || dimTileSize <= 0 || dimTileSize > expectedDimTileSize) {
-        // Invalid c0 or dimTileSize would cause wrong state writeback
-        return;
-    }
 
     const int32_t lastT = len - 1;
     LocalTensor<T> ring = inBuf.Get<T>();
@@ -500,7 +495,7 @@ __aicore__ inline void CausalConv1dV310<T>::Process()
             cacheIdx = static_cast<int32_t>(cacheIdx64);
         }
 
-        const bool hasInit = (tilingData_->hasInitialStateMode != 0) ? (initialStateModeGm.GetValue(seq) != 0) : true;
+        const bool hasInit = (tilingData_->hasInitialStateMode != 0) ? (initialStateModeGm.GetValue(seq) != 0) : false;
         int32_t stateTokenOffset = 0;
         if (isSpecDecodingGlobal) {
             int32_t accepted = static_cast<int32_t>(numAcceptedTokensGm.GetValue(seq));

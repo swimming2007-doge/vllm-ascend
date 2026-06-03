@@ -70,7 +70,10 @@ docker run --rm \
 
 Run the following script to execute online inference.
 
-``` bash
+```{test} bash
+:sync-yaml: tests/e2e/models/configs/Mixtral-8x7B-Instruct-v0.1.yaml
+:sync-class: env
+:sync-target: envs
 
 export HCCL_OP_EXPANSION_MODE="AIV"
 export OMP_PROC_BIND=false
@@ -82,7 +85,10 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export VLLM_ASCEND_ENABLE_FLASHCOMM1=1
 ```
 
-``` bash
+```{test} bash
+:sync-yaml: tests/e2e/models/configs/Mixtral-8x7B-Instruct-v0.1.yaml
+:sync-target: test_cases[0].model test_cases[0].server_cmd
+:sync-class: cmd
 
 vllm serve "mistralai/Mixtral-8x7B-Instruct-v0.1" \
   --tensor-parallel-size 4 \

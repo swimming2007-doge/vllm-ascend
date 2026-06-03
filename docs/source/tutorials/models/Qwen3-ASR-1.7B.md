@@ -47,7 +47,10 @@ In addition, if you don't want to use the docker image as above, you can also bu
 
 ## Deployment
 
-``` bash
+```{test} bash
+:sync-yaml: tests/e2e/models/configs/Qwen3-ASR-1.7B.yaml
+:sync-target: test_cases[0].model test_cases[0].server_cmd
+:sync-class: cmd
 
 vllm serve "Qwen/Qwen3-ASR-1.7B" \
   --tensor-parallel-size 1 \

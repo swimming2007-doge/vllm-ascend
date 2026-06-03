@@ -127,13 +127,6 @@
   tests:
     - tests/ut/batch_invariant
 
-- name: tools
-  optional: true
-  source_file_dependencies:
-    - tools/
-  tests:
-    - tests/ut/tools
-
 - name: dummy
   optional: true
   source_file_dependencies:

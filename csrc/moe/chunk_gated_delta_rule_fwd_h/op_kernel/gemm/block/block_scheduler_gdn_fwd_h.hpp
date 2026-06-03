@@ -63,7 +63,6 @@ struct BlockSchedulerGdnFwdH {
     uint32_t kHeadDim;
     uint32_t vHeadDim;
     uint32_t chunkSize;
-    uint32_t initalStateStride0;
     uint32_t vBlockSize{128};
     uint32_t isVariedLen;
     uint32_t shapeBatch;
@@ -131,7 +130,6 @@ struct BlockSchedulerGdnFwdH {
         kHeadDim = gdnFwdHTilingData->kHeadDim;
         vHeadDim = gdnFwdHTilingData->vHeadDim;
         chunkSize = gdnFwdHTilingData->chunkSize;
-        initalStateStride0 = gdnFwdHTilingData->initalStateStride0;
         isVariedLen = gdnFwdHTilingData->isVariedLen;
         shapeBatch = gdnFwdHTilingData->shapeBatch;
         tokenBatch = gdnFwdHTilingData->tokenBatch;
@@ -212,7 +210,7 @@ struct BlockSchedulerGdnFwdH {
         kHeadIdx = vHeadIdx / headGroups;
         offsets[currStage].isInitialState = chunkIdx == 0; 
         offsets[currStage].isFinalState = chunkIdx == (batchChunks - 1);
-        offsets[currStage].initialStateOffset = (batchIdx * vNumHead + vHeadIdx) * kHeadDim * initalStateStride0;
+        offsets[currStage].initialStateOffset = (batchIdx * vNumHead + vHeadIdx) * kHeadDim * vHeadDim; 
         offsets[currStage].finalStateOffset = (batchIdx * vNumHead + vHeadIdx) * kHeadDim * vHeadDim;  
         offsets[currStage].hSrcOffset = (shapeBatchIdx * vNumHead * totalChunks + vHeadIdx * totalChunks + chunkOffset + chunkIdx) * kHeadDim * vHeadDim;
         offsets[currStage].hDstOffset = offsets[currStage].hSrcOffset + kHeadDim * vHeadDim;

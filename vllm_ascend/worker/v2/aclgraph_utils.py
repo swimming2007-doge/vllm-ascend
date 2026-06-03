@@ -155,23 +155,4 @@ class ModelWithContext(nn.Module):
 
     def compute_logits(self, hidden_states: torch.Tensor):
         # draft model has `compute_logits`, which is not in ModelWithContext
-        logits = self.original_model.compute_logits(hidden_states)
-        # ── THINKING-LOOP DIAGNOSTIC (VLLM_ASCEND_DIAG_THINK=1) ──
-        # Skip during graph capture: .item() triggers NPU sync -> crash
-        if not torch.npu.is_current_stream_capturing():
-            import os as _os
-            if _os.environ.get("VLLM_ASCEND_DIAG_THINK", "0") == "1":
-                _cnt = getattr(ModelWithContext, '_diag_step', 0) + 1
-                ModelWithContext._diag_step = _cnt
-                if _cnt % 10 == 0 or _cnt <= 20:
-                    l = logits.detach().float().squeeze()
-                    tok101 = float(l[101])
-                    top5_vals, top5_ids = l.topk(min(5, l.numel()))
-                    rank101 = int((l > tok101).sum().item())
-                    # Also check hidden_state norm (sanity check)
-                    hs_norm = hidden_states.detach().float().norm().item()
-                    print(f"[DIAG][step={_cnt}] token101(<channel|>) logit={tok101:.4f} "
-                          f"rank={rank101} hs_norm={hs_norm:.2f} "
-                          f"top5={list(zip(top5_ids.tolist(), [round(float(v),2) for v in top5_vals.tolist()]))}",
-                          flush=True)
-        return logits
+        return self.original_model.compute_logits(hidden_states)

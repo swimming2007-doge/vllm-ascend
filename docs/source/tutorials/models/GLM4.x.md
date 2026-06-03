@@ -149,6 +149,7 @@ vllm serve Eco-Tech/GLM-4.7-W8A8-floatmtp \
   --max-model-len 133000 \
   --max-num-batched-tokens 8192 \
   --max-num-seqs 16 \
+  --async-scheduling \
   --quantization ascend \
   --trust-remote-code \
   --gpu-memory-utilization 0.9 \
@@ -160,6 +161,7 @@ vllm serve Eco-Tech/GLM-4.7-W8A8-floatmtp \
 **Notice:**
 The parameters are explained as follows:
 
+- `--async-scheduling` Asynchronous scheduling is a technique used to optimize inference efficiency. It allows non-blocking task scheduling to improve concurrency and throughput, especially when processing large-scale models.
 - `fusion_ops_gmmswigluquant` The performance of the GmmSwigluQuant fusion operator tends to degrade when the total number of NPUs is ≤ 16.
 - `VLLM_ASCEND_ENABLE_FLASHCOMM1` Due to the FD feature of the FIA operator being invalidated by padding data introduced by this feature, we recommend disabling the `flashcomm1` feature for long-sequence (≥16k) and low-concurrency (≤8 batch size) scenarios.For long-sequence and high-concurrency scenarios, you may enable this feature to achieve improved Prefill performance.
 
@@ -203,6 +205,7 @@ vllm serve Eco-Tech/GLM-4.7-W8A8-floatmtp \
   --max-model-len 140000 \
   --max-num-batched-tokens 8192 \
   --max-num-seqs 16 \
+  --async-scheduling \
   --quantization ascend \
   --trust-remote-code \
   --gpu-memory-utilization 0.9 \
@@ -253,6 +256,7 @@ vllm serve Eco-Tech/GLM-4.7-W8A8-floatmtp \
   --max-model-len 140000 \
   --max-num-batched-tokens 8192 \
   --max-num-seqs 16 \
+  --async-scheduling \
   --quantization ascend \
   --trust-remote-code \
   --gpu-memory-utilization 0.9 \
@@ -543,6 +547,7 @@ Before you start, please
             --max-num-batched-tokens 128 \
             --max-num-seqs 4 \
             --trust-remote-code \
+            --async-scheduling \
             --gpu-memory-utilization 0.9 \
             --quantization ascend \
             --speculative-config '{"num_speculative_tokens": 3, "method":"mtp"}' \
@@ -612,6 +617,7 @@ Before you start, please
             --max-num-batched-tokens 128 \
             --max-num-seqs 4 \
             --trust-remote-code \
+            --async-scheduling \
             --gpu-memory-utilization 0.9 \
             --quantization ascend \
             --speculative-config '{"num_speculative_tokens": 3, "method":"mtp"}' \

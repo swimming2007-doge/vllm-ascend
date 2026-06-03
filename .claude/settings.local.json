@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git *)",
+      "Bash(rsync *)",
+      "Bash(tar -cf - --exclude='.git' -C /workspace/vllm-ascend .)",
+      "Bash(tar -xf - -C /home/wumeng/vllm-ascend)"
+    ]
+  }
+}

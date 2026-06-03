@@ -21,12 +21,7 @@ from pathlib import Path
 from vllm import envs
 from vllm.logger import logger
 
-from vllm_ascend.utils import (
-    ASCEND_QUANTIZATION_METHOD,
-    COMPRESSED_TENSORS_METHOD,
-    AscendDeviceType,
-    get_ascend_device_type,
-)
+from vllm_ascend.utils import ASCEND_QUANTIZATION_METHOD, COMPRESSED_TENSORS_METHOD
 
 
 def get_model_file(
@@ -75,7 +70,7 @@ def get_model_file(
             )
             return Path(downloaded_path)
     except Exception as e:
-        logger.warning("Could not download %s from %s: %s", filename, model, e)
+        logger.debug("Could not download %s from %s: %s", filename, model, e)
         return None
 
 
@@ -166,12 +161,7 @@ def maybe_auto_detect_quantization(vllm_config) -> None:
     detected = detect_quantization_method(model, revision=revision)
 
     if detected is None:
-        logger.info(
-            'No quantization signature detected from model files for "%s". '
-            "The model will be loaded as float. "
-            'To force a quantization method, pass "--quantization <method>" explicitly.',
-            model,
-        )
+        # No quantization signature found — nothing to do.
         return
 
     if user_quant is not None:
@@ -210,9 +200,6 @@ def maybe_auto_detect_quantization(vllm_config) -> None:
 
 
 def enable_fa_quant(vllm_config, layer_name=None) -> bool:
-    is_kv_consumer = vllm_config.kv_transfer_config is not None and vllm_config.kv_transfer_config.is_kv_consumer
-    if not is_kv_consumer and get_ascend_device_type() != AscendDeviceType.A5:
-        return False
     if vllm_config.quant_config is not None and getattr(vllm_config.quant_config, "enable_fa_quant", False):
         if layer_name is not None:
             return vllm_config.quant_config.enabling_fa_quant(vllm_config, layer_name)

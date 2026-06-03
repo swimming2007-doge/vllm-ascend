@@ -5,47 +5,8 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import KVCacheGroupSpec
 from vllm.v1.utils import CpuGpuBuffer
+from vllm.v1.worker.block_table import _compute_slot_mapping_kernel
 from vllm.v1.worker.cp_utils import get_total_cp_world_size
-
-
-def _compute_slot_mapping_torch(
-    num_tokens: int,
-    max_num_tokens: int,
-    query_start_loc: torch.Tensor,
-    positions: torch.Tensor,
-    block_table: torch.Tensor,
-    block_table_stride: int,
-    block_size: int,
-    slot_mapping: torch.Tensor,
-    total_cp_world_size: int,
-    total_cp_rank: int,
-    cp_kv_cache_interleave_size: int,
-    pad_id: int,
-) -> None:
-    """Pure-PyTorch slot mapping that replaces the Triton kernel on Ascend."""
-    num_reqs = query_start_loc.shape[0] - 1
-    virtual_block_size = block_size * total_cp_world_size
-
-    for req_idx in range(num_reqs):
-        start_idx = int(query_start_loc[req_idx])
-        end_idx = int(query_start_loc[req_idx + 1])
-        if start_idx >= end_idx:
-            continue
-        pos = positions[start_idx:end_idx]
-        block_indices = (pos // virtual_block_size).to(torch.int64)
-        block_numbers = block_table[req_idx, block_indices]
-        virtual_block_offsets = pos - block_indices * virtual_block_size
-        is_local = ((virtual_block_offsets // cp_kv_cache_interleave_size) % total_cp_world_size) == total_cp_rank
-        local_block_offsets = (
-            virtual_block_offsets // (total_cp_world_size * cp_kv_cache_interleave_size)
-        ) * cp_kv_cache_interleave_size + (virtual_block_offsets % cp_kv_cache_interleave_size)
-        slot_numbers = block_numbers * block_size + local_block_offsets
-        slot_mapping[start_idx:end_idx] = torch.where(
-            is_local, slot_numbers, torch.full_like(slot_numbers, pad_id))
-
-    # Pad remaining slots for graph compatibility
-    if num_tokens < max_num_tokens:
-        slot_mapping[num_tokens:max_num_tokens] = pad_id
 
 
 class BlockTable:
@@ -183,7 +144,7 @@ class BlockTable:
         num_tokens = positions.shape[0]
         total_cp_world_size = self.pcp_world_size * self.dcp_world_size
         total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
-        _compute_slot_mapping_torch(
+        _compute_slot_mapping_kernel[(num_reqs + 1,)](
             num_tokens,
             self.max_num_batched_tokens,
             query_start_loc,
@@ -192,10 +153,11 @@ class BlockTable:
             self.block_table.gpu.stride(0),
             self.block_size,
             self.slot_mapping.gpu,
-            total_cp_world_size,
-            total_cp_rank,
-            self.cp_kv_cache_interleave_size,
-            PAD_SLOT_ID,
+            TOTAL_CP_WORLD_SIZE=total_cp_world_size,
+            TOTAL_CP_RANK=total_cp_rank,
+            CP_KV_CACHE_INTERLEAVE_SIZE=self.cp_kv_cache_interleave_size,
+            PAD_ID=PAD_SLOT_ID,
+            BLOCK_SIZE=1024,
         )
 
     def compute_slot_mapping_draft(self, req_indices: np.ndarray, positions: np.ndarray) -> None:

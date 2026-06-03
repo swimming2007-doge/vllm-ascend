@@ -66,6 +66,7 @@ The communication execution mode also matters. `update_aclgraph_sizes()` uses di
 
 Ascend currently narrows some generic upstream modes in `vllm_ascend.platform.NPUPlatform.check_and_update_config()`.
 
+- `FULL_AND_PIECEWISE` is normalized to `PIECEWISE`.
 - Encoder-decoder models are forced to `PIECEWISE`.
 - `use_inductor` is disabled for ACL graph paths.
 - `ASCEND_LAUNCH_BLOCKING=1` is rejected when ACL graph is enabled.

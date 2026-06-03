@@ -150,7 +150,6 @@ public:
 
         uint32_t epilogueCoreNum = 40,
         float swigluLimit = 0.0f,
-        uint32_t blockK = 1,
         Callback &&callback = Callback{}
     )
     {
@@ -186,7 +185,7 @@ public:
 
         for (uint32_t loopIdx = loopStartIdx; loopIdx < loopStartIdx + tasksForIdx; ++loopIdx) {
 
-            auto gmTileC = gmC[loopIdx * blockK];
+            auto gmTileC = gmC[loopIdx * blockN];
 
             auto &ubC = ubCList[ubListId];
             auto &ubD = ubDList[ubListId];
@@ -309,7 +308,7 @@ private:
     int32_t eventUbDVMTE3List[UB_STAGES];
 
     uint32_t ubListId{0};
-    size_t ubOffset = 0;
+    size_t ubOffset;
 
     AscendC::LocalTensor<float> ubCFp32List[UB_STAGES];
     AscendC::LocalTensor<float> ubCFp32ChunkNList[UB_STAGES];

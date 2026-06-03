@@ -40,7 +40,6 @@ def _make_tokens(
     return tokens
 
 
-@pytest.mark.skip("Probabilistic failure, need zengtian after fix")
 @pytest.mark.parametrize("num_seqs", [1, 8, 32, 128])
 @pytest.mark.parametrize("vocab_size", [5120, 151936])
 @pytest.mark.parametrize(

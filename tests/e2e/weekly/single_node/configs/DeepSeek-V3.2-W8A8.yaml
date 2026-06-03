@@ -40,6 +40,7 @@ test_cases:
       - "--trust-remote-code"
       - "--quantization"
       - "ascend"
+      - "--async-scheduling"
       - "--gpu-memory-utilization"
       - "0.95"
       - "--compilation-config"
