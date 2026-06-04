@@ -244,7 +244,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             elif self.get_model_name(model) == "KimiK25ForConditionalGeneration":
                 self.model.config.image_token_index = model.config.media_placeholder_token_id
             else:
-                self.model.config.image_token_index = model.config.image_token_index
+                self.model.config.image_token_index = getattr(
+                    model.config, 'image_token_index', None
+                )
             target_language_model = model.get_language_model()
         else:
             target_language_model = model
@@ -459,25 +461,26 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 ]
 
             assert len(self.draft_attn_groups) > 0
-            builder = self.draft_attn_groups[0].get_metadata_builder()
             # update the tensor's address for each step.
             for draft_step in range(self.num_speculative_tokens):
-                common_attn_metadata = self.shallow_copy_metadata(common_attn_metadata)
-                # Set the real slot_mapping.
-                common_attn_metadata.slot_mapping = self.slot_mapping_group[draft_step]
-                common_attn_metadata.seq_lens = self.seq_lens_group[draft_step][:num_reqs]
-                common_attn_metadata.query_start_loc = self.query_start_loc_group[draft_step][: num_reqs + 1]
-                if self.pcp_size * self.dcp_size > 1 and draft_step > 0:
-                    assert self.block_table_tensor_clone is not None, "block_table_tensor_clone is not init"
-                    slicing_length = num_reqs * self.decode_threshold
-                    common_attn_metadata.block_table_tensor = self.block_table_tensor_clone[:slicing_length]
-                attn_metadata_eagle = builder.build_for_graph_capture(
-                    common_attn_metadata,
-                    AscendAttentionState.SpecDecoding if self.method == "mtp" else AscendAttentionState.ChunkedPrefill,
-                )
                 per_layer_attn_metadata = dict()
-                for layer_name in self.attn_layer_names:
-                    per_layer_attn_metadata[layer_name] = attn_metadata_eagle
+                for attn_group in self.draft_attn_groups:
+                    builder = attn_group.get_metadata_builder()
+                    common_attn_metadata = self.shallow_copy_metadata(common_attn_metadata)
+                    # Set the real slot_mapping.
+                    common_attn_metadata.slot_mapping = self.slot_mapping_group[draft_step]
+                    common_attn_metadata.seq_lens = self.seq_lens_group[draft_step][:num_reqs]
+                    common_attn_metadata.query_start_loc = self.query_start_loc_group[draft_step][: num_reqs + 1]
+                    if self.pcp_size * self.dcp_size > 1 and draft_step > 0:
+                        assert self.block_table_tensor_clone is not None, "block_table_tensor_clone is not init"
+                        slicing_length = num_reqs * self.decode_threshold
+                        common_attn_metadata.block_table_tensor = self.block_table_tensor_clone[:slicing_length]
+                    attn_metadata_eagle = builder.build_for_graph_capture(
+                        common_attn_metadata,
+                        AscendAttentionState.SpecDecoding if self.method == "mtp" else AscendAttentionState.ChunkedPrefill,
+                    )
+                    for layer_name in attn_group.layer_names:
+                        per_layer_attn_metadata[layer_name] = attn_metadata_eagle
                 multi_steps_attn_metadata.append(per_layer_attn_metadata)
 
         model_positions = self._get_positions(num_tokens)
@@ -812,7 +815,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                                 mtp_slot_mapping,
                                 attn_group=attn_group,
                             )
-                            for layer_name in self.attn_layer_names:
+                            for layer_name in attn_group.layer_names:
                                 per_layer_attn_metadata[layer_name] = attn_metadata
                         multi_steps_attn_metadata.append(per_layer_attn_metadata)
         else:
@@ -831,7 +834,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                             aclgraph_runtime_mode,
                             attn_group=attn_group,
                         )
-                        for layer_name in self.attn_layer_names:
+                        for layer_name in attn_group.layer_names:
                             per_layer_attn_metadata[layer_name] = attn_metadata
                     multi_steps_attn_metadata.append(per_layer_attn_metadata)
 
@@ -1006,7 +1009,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # cast to int32 is crucial when eagle model is compiled.
             # tensor.argmax() returns int64 by default.
             input_ids = draft_token_ids_tensor[draft_step]
-            positions += 1
+            if not getattr(self, 'constant_draft_positions', False):
+                positions += 1
 
             # NOTE(woosuk): We should handle the case where the draft model
             # generates tokens beyond the max model length. Since it is complex

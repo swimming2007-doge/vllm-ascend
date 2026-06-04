@@ -39,6 +39,9 @@ def get_spec_decode_method(method, vllm_config, device, runner):
         return AscendSuffixDecodingProposer(vllm_config, runner)
     elif method == "medusa":
         return AscendMedusaProposer(vllm_config, device)
+    elif method == "mtp" and vllm_config.speculative_config.use_gemma4_mtp():
+        from vllm_ascend.spec_decode.gemma4_proposer import AscendGemma4Proposer
+        return AscendGemma4Proposer(vllm_config, device, runner)
     elif method in ("eagle", "eagle3", "mtp"):
         return AscendEagleProposer(vllm_config, device, runner)
     elif method == "dflash":

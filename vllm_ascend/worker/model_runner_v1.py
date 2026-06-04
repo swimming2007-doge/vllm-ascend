@@ -81,7 +81,12 @@ from vllm.v1.worker.utils import select_common_block_size
 from vllm_ascend.utils import vllm_version_is
 
 if not vllm_version_is("0.20.2"):
-    from vllm.v1.outputs import RoutedExpertsLists
+    try:
+        from vllm.v1.outputs import RoutedExpertsLists
+    except ImportError:
+        # vLLM 0.21.0+ replaced RoutedExpertsLists with
+        # routed_experts_dict in ModelRunnerOutput.
+        RoutedExpertsLists = None  # type: ignore
 from vllm.v1.sample.logits_processor import build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
@@ -128,6 +133,7 @@ from vllm_ascend.spec_decode import get_spec_decode_method
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
 from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
+from vllm_ascend.spec_decode.gemma4_proposer import AscendGemma4Proposer
 from vllm_ascend.spec_decode.extract_hidden_states_proposer import (
     AscendExtractHiddenStatesProposer,
 )
@@ -238,6 +244,21 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: "ECConnectorOutput | None"
     cudagraph_stats: CUDAGraphStat | None
     batch_desc: BatchDescriptor
+
+
+def _log_npu_mem(tag: str) -> None:
+    """Log NPU memory allocated/reserved for debugging OOM issues."""
+    try:
+        import logging
+        allocated = torch.npu.memory_allocated() / (1024 ** 3)
+        reserved = torch.npu.memory_reserved() / (1024 ** 3)
+        max_allocated = torch.npu.max_memory_allocated() / (1024 ** 3)
+        logging.getLogger("vllm_ascend.worker.model_runner_v1").info(
+            "[NPU_MEM][%s] allocated=%.2fGB reserved=%.2fGB max_allocated=%.2fGB",
+            tag, allocated, reserved, max_allocated,
+        )
+    except Exception:
+        pass
 
 
 class NPUModelRunner(GPUModelRunner):
@@ -530,6 +551,7 @@ class NPUModelRunner(GPUModelRunner):
             AscendNgramProposer
             | AscendNgramProposerNPU
             | AscendEagleProposer
+            | AscendGemma4Proposer
             | AscendDraftModelProposer
             | AscendDflashProposer
             | AscendSuffixDecodingProposer
@@ -2231,7 +2253,11 @@ class NPUModelRunner(GPUModelRunner):
             ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
             cudagraph_stats=cudagraph_stats,
             **(
-                {} if vllm_version_is("0.20.2") else {"routed_experts": routed_experts_lists}
+                {} if vllm_version_is("0.20.2") else (
+                    {"routed_experts_dict": routed_experts_lists}
+                    if vllm_version_is("0.21.0")
+                    else {"routed_experts": routed_experts_lists}
+                )
             ),
         )
         if self.ascend_config.profiling_chunk_config.need_timing and hasattr(self, '_execution_start_time'):
@@ -2951,7 +2977,7 @@ class NPUModelRunner(GPUModelRunner):
                 cm.block_table_tensor, cm.slot_mapping = _get_block_table_and_slot_mapping(
                     kv_cache_gid, total_num_scheduled_tokens_compressed_list)  # type: ignore[arg-type]
             if self.speculative_config and spec_decode_common_attn_metadata is None:
-                if isinstance(self.drafter, AscendEagleProposer | AscendDraftModelProposer | AscendDflashProposer):
+                if isinstance(self.drafter, AscendEagleProposer | AscendGemma4Proposer | AscendDraftModelProposer | AscendDflashProposer):
                     if self.drafter.attn_layer_names[0] in kv_cache_group.layer_names:
                         spec_decode_common_attn_metadata = cm
                 else:
@@ -3340,6 +3366,7 @@ class NPUModelRunner(GPUModelRunner):
 
     def load_model(self) -> None:
         logger.info("Starting to load model %s...", self.model_config.model)
+        _log_npu_mem("before target load_model")
 
         if self.ascend_config.mix_placement:
             # TODO: Enabling the mix placement in deepseek_v2.py
@@ -3367,6 +3394,7 @@ class NPUModelRunner(GPUModelRunner):
                 model_register(self.model)
             if self.drafter:
                 logger.info("Loading drafter model...")
+                _log_npu_mem("before drafter load_model")
                 if self.vllm_config.quant_config is not None:
                     patch_load_weights(self.vllm_config)
                 with get_tp_context(self.drafter):
@@ -3387,6 +3415,7 @@ class NPUModelRunner(GPUModelRunner):
                 self.model = self.load_lora_model(self.model, self.vllm_config, self.device)
         self.model_memory_usage = m.consumed_memory
         logger.info("Loading model weights took %.4f GB", m.consumed_memory / float(2**30))
+        _log_npu_mem("after load_model complete")
 
         # wrap the model with full graph wrapper if needed.
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
@@ -3424,6 +3453,7 @@ class NPUModelRunner(GPUModelRunner):
             kv_cache_config: Configuration for the KV cache, including the KV
             cache size of each layer
         """
+        _log_npu_mem("before initialize_kv_cache")
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
         self._mamba_copy_bufs = None
@@ -3439,16 +3469,31 @@ class NPUModelRunner(GPUModelRunner):
 
         self.may_reinitialize_input_batch(kv_cache_config)
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
+        _log_npu_mem("after kv_cache_tensors allocation")
         # TODO: refactor the logic of attention
         # Initialize drafter attention group initialization
         if self.speculative_config and (
             self.speculative_config.use_eagle() or self.speculative_config.uses_draft_model()
         ):
-            assert isinstance(self.drafter, AscendEagleProposer | AscendDflashProposer | AscendDraftModelProposer)
-            block_size = (self.kernel_block_sizes[0] if isinstance(
-            self.kernel_block_sizes, list) else self.kernel_block_sizes)
-            self.drafter.initialize_attn_backend(kv_cache_config, block_size)
+            assert isinstance(
+                self.drafter,
+                AscendEagleProposer | AscendGemma4Proposer | AscendDflashProposer | AscendDraftModelProposer,
+            )
+            if isinstance(self.drafter, AscendGemma4Proposer):
+                # Gemma4 MTP needs per-group kernel_block_sizes (list of ints),
+                # not a single block_size.  Pass the list directly.
+                kernel_block_sizes = (
+                    self.kernel_block_sizes
+                    if isinstance(self.kernel_block_sizes, list)
+                    else [self.kernel_block_sizes]
+                )
+                self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
+            else:
+                block_size = (self.kernel_block_sizes[0] if isinstance(
+                self.kernel_block_sizes, list) else self.kernel_block_sizes)
+                self.drafter.initialize_attn_backend(kv_cache_config, block_size)
 
+        _log_npu_mem("after drafter attn_backend init")
         if has_kv_transfer_group():
             get_kv_transfer_group().register_kv_caches(kv_caches)
 

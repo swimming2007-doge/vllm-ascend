@@ -1419,6 +1419,31 @@ class AscendAttentionBackendImpl(AttentionImpl):
         value = self.value_cache.reshape(-1, self.num_kv_heads, self.head_size).index_select(0, slots)
         return key, value
 
+    def _get_shared_kv_from_block_table(
+        self,
+        attn_metadata: AscendMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[None, None]:
+        """Gather K/V from the shared target cache using block tables.
+
+        Used when slot_mapping is not available (e.g., during speculative
+        decoding where the draft model inherits attn_metadata from the
+        target but slot_mapping may not be populated for draft layers).
+        """
+        if self.key_cache is None or self.value_cache is None:
+            return None, None
+        block_table = attn_metadata.block_tables
+        seq_lens = attn_metadata.seq_lens_list
+        if block_table is None or not seq_lens:
+            return None, None
+
+        try:
+            dense_key, dense_value = self._gather_paged_kv_to_dense(
+                self.key_cache, self.value_cache, block_table, seq_lens,
+            )
+            return dense_key, dense_value
+        except Exception:
+            return None, None
+
     def do_kv_cache_update(
         self,
         layer: torch.nn.Module,
@@ -1487,6 +1512,22 @@ class AscendAttentionBackendImpl(AttentionImpl):
         output: torch.Tensor,
     ):
         num_tokens = query.shape[0]
+
+        # KV-sharing layers (e.g., Gemma4 MTP draft) read K/V from the
+        # target layer's cache.  Ensure self.key_cache / self.value_cache
+        # are initialised from the kv_cache tuple BEFORE calling
+        # _get_current_token_shared_kv, otherwise they will still be
+        # None (the draft layers do not own a private cache) and the
+        # shared-KV prefill path is skipped, falling through to FIA
+        # which does not support head_dim > 192 on Ascend TND.
+        if (
+            self.kv_sharing_target_layer_name is not None
+            and self.key_cache is None
+            and kv_cache is not None
+            and len(kv_cache) >= 2
+        ):
+            self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
+
         if (
             self.kv_sharing_target_layer_name is not None
             and key is not None
@@ -1494,7 +1535,19 @@ class AscendAttentionBackendImpl(AttentionImpl):
             and query.shape[0] == key.shape[0]
             and attn_metadata.attn_state in (AscendAttentionState.PrefillNoCache, AscendAttentionState.ChunkedPrefill)
         ):
+            # Try slot_mapping-based lookup first (needed when the
+            # same request's target K/V are at known cache slots).
             shared_key, shared_value = self._get_current_token_shared_kv(attn_metadata)
+
+            # Fall back to block-table gathering.  This is the normal
+            # path for speculative decoding where the draft model
+            # inherits the target's paged KV cache but slot_mapping
+            # may not be populated for the draft's attn_metadata.
+            if shared_key is None or shared_value is None:
+                shared_key, shared_value = self._get_shared_kv_from_block_table(
+                    attn_metadata
+                )
+
             if shared_key is not None and shared_value is not None:
                 return self._forward_large_head_prefill_attention(
                     query,
@@ -1504,24 +1557,29 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     output,
                 )
 
+        use_large_head_fallback = self._should_use_large_head_attention_fallback()
+
         if (
-            attn_metadata.attn_state == AscendAttentionState.DecodeOnly
-            and self.sliding_window is None
-            and (
-                using_paged_attention(num_tokens, self.vllm_config) or self._should_use_large_head_attention_fallback()
-            )
+            attn_metadata.attn_state in (AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding)
+            and (self.sliding_window is None or self.kv_sharing_target_layer_name is not None)
+            and (using_paged_attention(num_tokens, self.vllm_config) or use_large_head_fallback)
         ):
+            # PA works for all head_dims on this Ascend device;
+            # the large-head fallback flag just means we skip FIA.
             output = self.forward_paged_attention(query, attn_metadata, output)
         elif (
             not _EXTRA_CTX.capturing
-            and self._should_use_large_head_attention_fallback()
+            and use_large_head_fallback
             and self.kv_sharing_target_layer_name is None
             and key is not None
             and value is not None
             and query.shape[0] == key.shape[0]
-            and attn_metadata.attn_state in (AscendAttentionState.PrefillNoCache, AscendAttentionState.ChunkedPrefill)
+            and attn_metadata.attn_state in (AscendAttentionState.PrefillNoCache, AscendAttentionState.ChunkedPrefill, AscendAttentionState.SpecDecoding)
         ):
             output = self._forward_large_head_prefill_attention(query, key, value, attn_metadata, output)
+        elif use_large_head_fallback:
+            # Large head_dim + non-DecodeOnly, non-prefill edge case.
+            output = self.forward_paged_attention(query, attn_metadata, output)
         else:
             output = self.forward_fused_infer_attention(query, key, value, attn_metadata, output, kv_cache)
 

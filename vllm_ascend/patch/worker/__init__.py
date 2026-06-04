@@ -26,7 +26,10 @@ if HAS_TRITON:
     import vllm_ascend.patch.worker.patch_triton
 
     if _V2_MODEL_RUNNER_SUPPORTED:
-        import vllm_ascend.patch.worker.patch_v2.patch_triton  # noqa
+        try:
+            import vllm_ascend.patch.worker.patch_v2.patch_triton  # noqa
+        except ImportError:
+            pass
 
 
 import vllm_ascend.patch.worker.patch_weight_utils  # noqa
@@ -53,8 +56,11 @@ import vllm_ascend.patch.worker.patch_deepseek_mtp  # noqa
 import vllm_ascend.patch.worker.patch_gqa_c8  # noqa
 
 if _V2_MODEL_RUNNER_SUPPORTED:
-    import vllm_ascend.patch.worker.patch_v2.patch_uva  # noqa
-    import vllm_ascend.patch.worker.patch_v2.patch_input_batch  # noqa
-    import vllm_ascend.patch.worker.patch_v2.patch_model_state  # noqa
-    import vllm_ascend.patch.worker.patch_v2.patch_block_table  # noqa
-    import vllm_ascend.patch.worker.patch_v2.patch_attn_utils  # noqa
+    try:
+        import vllm_ascend.patch.worker.patch_v2.patch_uva  # noqa
+        import vllm_ascend.patch.worker.patch_v2.patch_input_batch  # noqa
+        import vllm_ascend.patch.worker.patch_v2.patch_model_state  # noqa
+        import vllm_ascend.patch.worker.patch_v2.patch_block_table  # noqa
+        import vllm_ascend.patch.worker.patch_v2.patch_attn_utils  # noqa
+    except ImportError:
+        pass

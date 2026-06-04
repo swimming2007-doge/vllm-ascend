@@ -1,7 +1,19 @@
 from vllm.v1.worker.gpu import input_batch, model_runner, structured_outputs
 from vllm.v1.worker.gpu.sample import bad_words, gumbel, logprob, penalties, prompt_logprob, sampler, states
-from vllm.v1.worker.gpu.spec_decode import rejection_sampler, rejection_sampler_utils
-from vllm.v1.worker.gpu.spec_decode.eagle import speculator
+
+try:
+    from vllm.v1.worker.gpu.spec_decode import rejection_sampler, rejection_sampler_utils
+except ImportError:
+    # vLLM 0.21.0+ removed rejection_sampler_utils; the
+    # rejection_sample function moved or was refactored.
+    # V2 model runner patches are not compatible with this version.
+    rejection_sampler = None
+    rejection_sampler_utils = None
+
+try:
+    from vllm.v1.worker.gpu.spec_decode.eagle import speculator
+except ImportError:
+    speculator = None
 
 from vllm_ascend.worker.v2.input_batch import post_update
 from vllm_ascend.worker.v2.sample.bad_words import apply_bad_words
@@ -20,15 +32,19 @@ sampler.gumbel_sample = gumbel_sample
 input_batch.post_update = post_update
 prompt_logprob.compute_topk_logprobs = compute_topk_logprobs
 sampler.compute_topk_logprobs = compute_topk_logprobs
-rejection_sampler.compute_topk_logprobs = compute_topk_logprobs
+if rejection_sampler is not None:
+    rejection_sampler.compute_topk_logprobs = compute_topk_logprobs
 states.apply_min_p = apply_min_p
 penalties.bincount = bincount
-speculator.gumbel_sample = gumbel_sample
+if speculator is not None:
+    speculator.gumbel_sample = gumbel_sample
 model_runner.post_update = post_update
 bad_words.apply_bad_words = apply_bad_words
 gumbel.apply_temperature = apply_temperature
 states.apply_temperature = apply_temperature
 logprob.compute_token_logprobs = compute_token_logprobs
 structured_outputs._apply_grammar_bitmask_kernel = _apply_grammar_bitmask_kernel
-rejection_sampler_utils.rejection_sample = npu_rejection_sample
-rejection_sampler.rejection_sample = npu_rejection_sample
+if rejection_sampler_utils is not None:
+    rejection_sampler_utils.rejection_sample = npu_rejection_sample
+if rejection_sampler is not None:
+    rejection_sampler.rejection_sample = npu_rejection_sample
