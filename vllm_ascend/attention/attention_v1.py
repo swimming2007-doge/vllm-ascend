@@ -625,7 +625,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         actual_seq_lengths_q = attn_metadata[key].actual_seq_lengths_q
                     input_layout = "TND"
                     extra_args = {}
-                    if self.enable_c8_quant:
+                    # Detect c8_quant from captured params (static method, no self)
+                    if c8_k_aq_scale is not None:
                         extra_args = {
                             "key_antiquant_scale": c8_k_aq_scale,
                             "key_antiquant_offset": c8_k_aq_offset,
