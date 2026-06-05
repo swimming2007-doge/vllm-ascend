@@ -519,6 +519,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
         attn_count = 0
         with torch.npu.stream(update_stream):
             for key in attn_keys:
+                import sys
+                print(
+                    f"[GRAPH-REPLAY-ITER] key_idx={attn_count} "
+                    f"key={key} is_draft={_EXTRA_CTX.is_draft_model} "
+                    f"use_key_lookup={use_key_lookup}",
+                    file=sys.stderr, flush=True,
+                )
                 if use_key_lookup:
                     # ---- key-based lookup (order-independent) ----
                     if key not in params_by_key:
@@ -668,6 +675,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     torch.npu.graph_task_update_end(update_stream)
                     event.record(update_stream)
                 attn_count += 1
+        import sys
+        print(
+            f"[GRAPH-REPLAY-DONE] is_draft={_EXTRA_CTX.is_draft_model} "
+            f"processed={attn_count} keys",
+            file=sys.stderr, flush=True,
+        )
 
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
