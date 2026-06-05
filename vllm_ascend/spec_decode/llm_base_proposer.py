@@ -1847,6 +1847,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
     def _update_full_graph_params(self, forward_context, num_tokens, draft_attn_metadatas=None):
         assert len(self.draft_attn_groups) > 0
         attn_backend = self.draft_attn_groups[0].backend
+        # Must set is_draft_model=True so update_graph_params uses draft
+        # graph params and draft_attn_metadatas (not target metadata).
+        _EXTRA_CTX.is_draft_model = True
+        _EXTRA_CTX.is_draft_model_prefill = False
         update_full_graph_params(
             attn_backend,
             self.update_stream,
