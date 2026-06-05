@@ -478,6 +478,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
             f"available_sizes={list(graph_params.attn_params_by_key.keys())}",
             file=sys.stderr, flush=True,
         )
+        if _EXTRA_CTX.is_draft_model:
+            print(
+                f"[GRAPH-REPLAY-DRAFT] params_by_key keys: {list(params_by_key.keys())}",
+                file=sys.stderr, flush=True,
+            )
 
         if _EXTRA_CTX.is_draft_model:
             attn_metadata = draft_attn_metadatas
@@ -958,7 +963,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
         captures those addresses directly and reads the up-to-date content
         during replay, so task groups are unnecessary.
         """
-        graph_params = get_graph_params()
+        if _EXTRA_CTX.is_draft_model:
+            graph_params = get_draft_graph_params()
+        else:
+            graph_params = get_graph_params()
         num_tokens = query.shape[0]
         if _EXTRA_CTX.capturing:
             # Get workspace from cache or calculate it if not present.
@@ -1000,7 +1008,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
         attn_metadata: AscendMetadata,
         output: torch.Tensor | None = None,
     ):
-        graph_params = get_graph_params()
+        if _EXTRA_CTX.is_draft_model:
+            graph_params = get_draft_graph_params()
+        else:
+            graph_params = get_graph_params()
         num_tokens = query.shape[0]
         if _EXTRA_CTX.capturing:
             # Get workspace from cache or calculate it if not present.
