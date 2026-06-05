@@ -516,6 +516,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
         use_key_lookup = len(params_by_key) > 0
 
+        # Filter attn_keys to only include keys present in params_by_key.
+        # This prevents draft model keys from leaking into target model
+        # replay and vice versa, and ensures attn_count stays accurate.
+        if use_key_lookup:
+            attn_keys = [k for k in attn_keys if k in params_by_key]
+
         attn_count = 0
         with torch.npu.stream(update_stream):
             for key in attn_keys:
@@ -528,8 +534,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 )
                 if use_key_lookup:
                     # ---- key-based lookup (order-independent) ----
-                    if key not in params_by_key:
-                        continue
                     param_info = params_by_key[key]
                     param_tuple = param_info["params"]
                     handle = param_info["handle"]
