@@ -469,6 +469,15 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # Use key-based lookup (attn_params_by_key) when available.
         # Falls back to zip-based pairing for backwards compatibility.
         params_by_key = graph_params.attn_params_by_key.get(num_tokens, {})
+        import sys
+        print(
+            f"[GRAPH-REPLAY] num_tokens={num_tokens} "
+            f"is_draft={_EXTRA_CTX.is_draft_model} "
+            f"params_by_key_size={len(params_by_key)} "
+            f"attn_params_list_size={len(graph_params.attn_params.get(num_tokens, []))} "
+            f"available_sizes={list(graph_params.attn_params_by_key.keys())}",
+            file=sys.stderr, flush=True,
+        )
 
         if _EXTRA_CTX.is_draft_model:
             attn_metadata = draft_attn_metadatas
