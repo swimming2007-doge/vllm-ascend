@@ -73,7 +73,7 @@ _ATTN_KEYS_BUFFER = None
 # Ascend FIA TND currently supports these head dimensions on the vLLM-Ascend
 # path. Larger heterogeneous-head models need a prefill fallback to avoid
 # unsupported-kernel behavior.
-FIA_TND_SUPPORTED_HEAD_SIZES = {64, 128, 192}
+FIA_TND_SUPPORTED_HEAD_SIZES = {64, 128, 192, 256}
 
 GraphParamKind = Literal["paged_attention", "fia"]
 
@@ -639,6 +639,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 ):
                     param_kind, param, layer_name = _normalize_graph_param(param, key)
                     if param_kind == "paged_attention":
+                        if handle is None:
+                            # PA was captured without task group wrapping
+                            # (e.g. large-head fallback). Padded tensors
+                            # are at stable addresses -- no update needed.
+                            event.record(update_stream)
+                            continue
                         (
                             query,
                             key_cache,
@@ -1012,6 +1018,62 @@ class AscendAttentionBackendImpl(AttentionImpl):
         handle = torch.npu.graph_task_group_end(stream)
         graph_params.handles[num_tokens].append(handle)
         return output, num_tokens
+
+    def _full_graph_pa_large_head(
+        self,
+        query: torch.Tensor,
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor | None = None,
+    ):
+        """Capture PA op directly without task group wrapping.
+
+        Used as a workaround for models whose head_dim is not supported by
+        FIA TND (e.g. Gemma4 with head_dim=256/512). When all layers use
+        the PA fallback, ``full_graph_pa`` creates a task group per layer
+        (60 task groups for Gemma4 31B), which can exceed the CANN runtime
+        task-group limit and fail with error 107033 during
+        ``rtStreamEndCapture``.
+
+        In FULL_DECODE_ONLY mode the padded attention metadata tensors
+        (block_table, seq_lens) reside at stable addresses.  The graph
+        captures those addresses directly and reads the up-to-date content
+        during replay, so task groups are unnecessary.
+        """
+        graph_params = get_graph_params()
+        num_tokens = query.shape[0]
+        if _EXTRA_CTX.capturing:
+            # Get workspace from cache or calculate it if not present.
+            workspace = graph_params.workspaces.get(num_tokens)
+            if workspace is None:
+                workspace = torch_npu._npu_paged_attention_get_workspace(
+                    query=query,
+                    key_cache=self.key_cache,
+                    value_cache=self.value_cache,
+                    num_kv_heads=self.num_kv_heads,
+                    num_heads=self.num_heads,
+                    scale_value=self.scale,
+                    block_table=attn_metadata.block_tables,
+                    context_lens=attn_metadata.seq_lens,
+                    out=output,
+                )
+                update_graph_params_workspaces(num_tokens, workspace)
+
+            # Direct PA call inside graph context -- no task group,
+            # no event, no handle.  Padded metadata tensors at stable
+            # addresses provide current data on each replay.
+            torch_npu._npu_paged_attention(
+                query=query,
+                key_cache=self.key_cache,
+                value_cache=self.value_cache,
+                num_kv_heads=self.num_kv_heads,
+                num_heads=self.num_heads,
+                scale_value=self.scale,
+                block_table=attn_metadata.block_tables,
+                context_lens=attn_metadata.seq_lens,
+                out=output,
+                workspace=workspace,
+            )
+            return output
 
     def full_graph_pa(
         self,
