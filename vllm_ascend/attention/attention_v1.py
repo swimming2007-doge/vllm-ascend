@@ -75,6 +75,11 @@ _ATTN_KEYS_BUFFER = None
 # unsupported-kernel behavior.
 FIA_TND_SUPPORTED_HEAD_SIZES = {64, 128, 192, 256}
 
+# Diagnostic counters for graph capture
+_PA_TASK_GROUP_COUNT = 0
+_FIA_CAPTURE_COUNT = 0
+_GRAPH_CAPTURE_LAYER_LOG: list[str] = []
+
 GraphParamKind = Literal["paged_attention", "fia"]
 
 
@@ -897,6 +902,16 @@ class AscendAttentionBackendImpl(AttentionImpl):
             attn_params = attn_params + (None, None, None, None)  # type: ignore
         graph_params.attn_params[num_tokens].append(AttentionGraphParam("fia", attn_params, layer_name))
 
+        global _FIA_CAPTURE_COUNT
+        import sys
+        _FIA_CAPTURE_COUNT += 1
+        print(
+            f"[GRAPH-CAPTURE] FIA+TASKGROUP #{_FIA_CAPTURE_COUNT} "
+            f"layer={self._layer_name} head_dim={self.head_size} "
+            f"num_tokens={num_tokens} sliding={self.sliding_window}",
+            file=sys.stderr, flush=True,
+        )
+
         torch.npu.graph_task_group_begin(stream)
         torch_npu.npu_fused_infer_attention_score.out(
             query=query,
@@ -993,6 +1008,15 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 weak_ref_tensors(output),
                 weak_ref_tensors(softmax_lse),
             )
+        )
+        global _FIA_CAPTURE_COUNT
+        import sys
+        _FIA_CAPTURE_COUNT += 1
+        print(
+            f"[GRAPH-CAPTURE] FIA-V2+TASKGROUP #{_FIA_CAPTURE_COUNT} "
+            f"layer={self._layer_name} head_dim={self.head_size} "
+            f"num_tokens={num_tokens} sliding={self.sliding_window}",
+            file=sys.stderr, flush=True,
         )
         torch.npu.graph_task_group_begin(stream)
         torch_npu.npu_fused_infer_attention_score_v2.out(
@@ -1125,6 +1149,15 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 )
             )
 
+            global _PA_TASK_GROUP_COUNT
+            import sys
+            _PA_TASK_GROUP_COUNT += 1
+            print(
+                f"[GRAPH-CAPTURE] PA+TASKGROUP #{_PA_TASK_GROUP_COUNT} "
+                f"layer={self._layer_name} head_dim={self.head_size} "
+                f"num_tokens={num_tokens} num_kv_heads={self.num_kv_heads}",
+                file=sys.stderr, flush=True,
+            )
             torch.npu.graph_task_group_begin(stream)
             torch_npu._npu_paged_attention(
                 query=query,
@@ -1620,6 +1653,28 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 )
 
         use_large_head_fallback = self._should_use_large_head_attention_fallback()
+
+        # Diagnostic: log routing decision once per layer per capture phase
+        global _GRAPH_CAPTURE_LAYER_LOG
+        if _EXTRA_CTX.capturing:
+            import sys
+            layer_key = f"{self._layer_name}|num_tokens={num_tokens}"
+            if layer_key not in _GRAPH_CAPTURE_LAYER_LOG:
+                _GRAPH_CAPTURE_LAYER_LOG.append(layer_key)
+                if use_large_head_fallback:
+                    print(
+                        f"[GRAPH-CAPTURE] ROUTE layer={self._layer_name} "
+                        f"head_dim={self.head_size} path=LARGE-HEAD-PA "
+                        f"num_tokens={num_tokens} sliding={self.sliding_window}",
+                        file=sys.stderr, flush=True,
+                    )
+                else:
+                    print(
+                        f"[GRAPH-CAPTURE] ROUTE layer={self._layer_name} "
+                        f"head_dim={self.head_size} path=FIA "
+                        f"num_tokens={num_tokens} sliding={self.sliding_window}",
+                        file=sys.stderr, flush=True,
+                    )
 
         if (
             attn_metadata.attn_state in (AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding)
