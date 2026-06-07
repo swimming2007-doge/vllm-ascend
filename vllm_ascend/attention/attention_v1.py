@@ -574,7 +574,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         draft_step = attn_count // num_layers
                         block_table = attn_metadata[draft_step][key].block_tables
                         seq_lens = attn_metadata[draft_step][key].seq_lens
-                        attn_count = attn_count + 1
                     else:
                         metadata_key = layer_name if layer_name in attn_metadata else key
                         current_attn_metadata = attn_metadata[metadata_key]
@@ -607,7 +606,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         draft_step = attn_count // num_layers
                         seq_lens = attn_metadata[draft_step][key].seq_lens_list
                         actual_seq_lengths_q = attn_metadata[draft_step][key].actual_seq_lengths_q
-                        attn_count = attn_count + 1
                     else:
                         seq_lens = attn_metadata[key].seq_lens_list
                         actual_seq_lengths_q = attn_metadata[key].actual_seq_lengths_q
@@ -651,7 +649,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         )
                         seq_lens = attn_metadata[draft_step][key].seq_lens_list
                         actual_seq_lengths_q = attn_metadata[draft_step][key].actual_seq_lengths_q
-                        attn_count = attn_count + 1
                     else:
                         seq_lens = attn_metadata[key].seq_lens_list
                         actual_seq_lengths_q = attn_metadata[key].actual_seq_lengths_q
