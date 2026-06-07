@@ -642,6 +642,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     ) = params[:21]
                     if _EXTRA_CTX.is_draft_model:
                         draft_step = attn_count // num_layers
+                        import sys
+                        print(
+                            f"[GRAPH-REPLAY-FIA] key={key} attn_count={attn_count} "
+                            f"num_layers={num_layers} draft_step={draft_step} "
+                            f"len(attn_metadata)={len(attn_metadata)}",
+                            file=sys.stderr, flush=True,
+                        )
                         seq_lens = attn_metadata[draft_step][key].seq_lens_list
                         actual_seq_lengths_q = attn_metadata[draft_step][key].actual_seq_lengths_q
                         attn_count = attn_count + 1
