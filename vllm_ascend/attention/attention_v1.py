@@ -75,11 +75,6 @@ _ATTN_KEYS_BUFFER = None
 # unsupported-kernel behavior.
 FIA_TND_SUPPORTED_HEAD_SIZES = {64, 128, 192, 256}
 
-# Diagnostic counters for graph capture
-_PA_TASK_GROUP_COUNT = 0
-_FIA_CAPTURE_COUNT = 0
-_GRAPH_CAPTURE_LAYER_LOG: list[str] = []
-
 # Global counter for assigning unique per-layer indices to
 # AscendAttentionBackendImpl instances during graph construction.
 _next_impl_index = 0
@@ -469,15 +464,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # Use key-based lookup (attn_params_by_key) when available.
         # Falls back to zip-based pairing for backwards compatibility.
         params_by_key = graph_params.attn_params_by_key.get(num_tokens, {})
-        print(
-            f"is_draft={_EXTRA_CTX.is_draft_model} "
-            f"params_by_key_size={len(params_by_key)} "
-            f"attn_params_list_size={len(graph_params.attn_params.get(num_tokens, []))} "
-            f"available_sizes={list(graph_params.attn_params_by_key.keys())}",
-        )
-        if _EXTRA_CTX.is_draft_model:
-            print(
-            )
 
         if _EXTRA_CTX.is_draft_model:
             attn_metadata = draft_attn_metadatas
@@ -530,10 +516,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
         attn_count = 0
         with torch.npu.stream(update_stream):
             for _step_idx, key in _iter_items:
-                print(
-                    f"key={key} is_draft={_EXTRA_CTX.is_draft_model} "
-                    f"step={_step_idx} use_key_lookup={use_key_lookup}",
-                )
                 if use_key_lookup:
                     # ---- key-based lookup (order-independent) ----
                     param_info = params_by_key[key]
@@ -647,10 +629,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     ) = params[:21]
                     draft_step = _step_idx if _step_idx is not None else (attn_count // num_layers)
                     if _EXTRA_CTX.is_draft_model:
-                        print(
-                            f"step={draft_step} "
-                            f"len(attn_metadata)={len(attn_metadata)}",
-                        )
                         seq_lens = attn_metadata[draft_step][key].seq_lens_list
                         actual_seq_lengths_q = attn_metadata[draft_step][key].actual_seq_lengths_q
                     else:
@@ -687,9 +665,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     torch.npu.graph_task_update_end(update_stream)
                     event.record(update_stream)
                 attn_count += 1
-        print(
-            f"processed={attn_count} keys",
-        )
 
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
@@ -815,13 +790,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
             attn_params = attn_params + (None, None, None, None)  # type: ignore
         graph_params.attn_params[num_tokens].append(AttentionGraphParam("fia", attn_params, layer_name))
 
-        global _FIA_CAPTURE_COUNT
-        _FIA_CAPTURE_COUNT += 1
-        print(
-            f"layer={self._layer_name} head_dim={self.head_size} "
-            f"num_tokens={num_tokens} sliding={self.sliding_window}",
-        )
-
         torch.npu.graph_task_group_begin(stream)
         torch_npu.npu_fused_infer_attention_score.out(
             query=query,
@@ -935,10 +903,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
         )
         global _FIA_CAPTURE_COUNT
         _FIA_CAPTURE_COUNT += 1
-        print(
-            f"layer={self._layer_name} head_dim={self.head_size} "
-            f"num_tokens={num_tokens} sliding={self.sliding_window}",
-        )
         torch.npu.graph_task_group_begin(stream)
         torch_npu.npu_fused_infer_attention_score_v2.out(
             query=query,
@@ -1009,11 +973,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
             # Direct PA call inside graph context -- no task group,
             # no event, no handle.  Padded metadata tensors at stable
             # addresses provide current data on each replay.
-            print(
-                f"head_dim={self.head_size} num_tokens={num_tokens} "
-                f"is_draft={_EXTRA_CTX.is_draft_model} "
-                f"key_cache_init={self.key_cache is not None}",
-            )
             torch_npu._npu_paged_attention(
                 query=query,
                 key_cache=self.key_cache,
@@ -1107,12 +1066,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 )
             )
 
-            global _PA_TASK_GROUP_COUNT
-            _PA_TASK_GROUP_COUNT += 1
-            print(
-                f"layer={self._layer_name} head_dim={self.head_size} "
-                f"num_tokens={num_tokens} num_kv_heads={self.num_kv_heads}",
-            )
             torch.npu.graph_task_group_begin(stream)
             torch_npu._npu_paged_attention(
                 query=query,
@@ -1623,23 +1576,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 )
 
         use_large_head_fallback = self._should_use_large_head_attention_fallback()
-
-        # Diagnostic: log routing decision once per layer per capture phase
-        global _GRAPH_CAPTURE_LAYER_LOG
-        if _EXTRA_CTX.capturing:
-            layer_key = f"{self._layer_name}|num_tokens={num_tokens}"
-            if layer_key not in _GRAPH_CAPTURE_LAYER_LOG:
-                _GRAPH_CAPTURE_LAYER_LOG.append(layer_key)
-                if use_large_head_fallback:
-                    print(
-                        f"head_dim={self.head_size} path=LARGE-HEAD-PA "
-                        f"num_tokens={num_tokens} sliding={self.sliding_window}",
-                    )
-                else:
-                    print(
-                        f"head_dim={self.head_size} path=FIA "
-                        f"num_tokens={num_tokens} sliding={self.sliding_window}",
-                    )
 
         if (
             attn_metadata.attn_state in (AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding)
