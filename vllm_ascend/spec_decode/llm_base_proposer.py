@@ -1849,17 +1849,21 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         attn_backend = self.draft_attn_groups[0].backend
         # Must set is_draft_model=True so update_graph_params uses draft
         # graph params and draft_attn_metadatas (not target metadata).
-        _EXTRA_CTX.is_draft_model = True
-        _EXTRA_CTX.is_draft_model_prefill = False
-        update_full_graph_params(
-            attn_backend,
-            self.update_stream,
-            forward_context,
-            num_tokens,
-            self.vllm_config,
-            self.vllm_config.speculative_config,
-            draft_attn_metadatas=draft_attn_metadatas,
-        )
+        prev_is_draft = _EXTRA_CTX.is_draft_model
+        try:
+            _EXTRA_CTX.is_draft_model = True
+            _EXTRA_CTX.is_draft_model_prefill = False
+            update_full_graph_params(
+                attn_backend,
+                self.update_stream,
+                forward_context,
+                num_tokens,
+                self.vllm_config,
+                self.vllm_config.speculative_config,
+                draft_attn_metadatas=draft_attn_metadatas,
+            )
+        finally:
+            _EXTRA_CTX.is_draft_model = prev_is_draft
 
     # adjusting tensor into desired size
     def _adjust_tensor(self, tensor, desired_size):

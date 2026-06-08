@@ -509,32 +509,47 @@ class AscendAttentionBackendImpl(AttentionImpl):
         num_layers = len(attn_keys)
         if num_layers == 0:
             return
+
+        # Key-based lookup is only valid for the target model.
+        # For the draft model, each layer appears multiple times in the
+        # captured graph (once per spec step), so params_by_key (which
+        # stores only the last write per layer_name) would miss all but
+        # the final step's task groups, leaving the rest with stale
+        # capture-time parameters.  Force zip-based pairing for draft.
+        use_key_lookup = (len(params_by_key) > 0
+                          and not _EXTRA_CTX.is_draft_model)
+
         if _EXTRA_CTX.is_draft_model:
+            # Zip-based: multiply keys to match captured count (one
+            # task group per layer per spec step).
             captured_param_count = len(graph_params.attn_params.get(num_tokens, []))
             if captured_param_count > 0:
                 attn_keys = attn_keys * (captured_param_count // num_layers)
-
-        use_key_lookup = len(params_by_key) > 0
-
-        # Filter attn_keys to only include keys present in params_by_key.
-        # This prevents draft model keys from leaking into target model
-        # replay and vice versa, and ensures attn_count stays accurate.
-        if use_key_lookup:
-            attn_keys = [k for k in attn_keys if k in params_by_key]
+            _iter_items = [(None, k) for k in attn_keys]
+        else:
+            # Target model: filter to keys present in params_by_key
+            if use_key_lookup:
+                attn_keys = [k for k in attn_keys if k in params_by_key]
+            _iter_items = [(None, k) for k in attn_keys]
 
         attn_count = 0
         with torch.npu.stream(update_stream):
-            for key in attn_keys:
+            for _step_idx, key in _iter_items:
                 import sys
                 print(
                     f"[GRAPH-REPLAY-ITER] key_idx={attn_count} "
                     f"key={key} is_draft={_EXTRA_CTX.is_draft_model} "
-                    f"use_key_lookup={use_key_lookup}",
+                    f"step={_step_idx} use_key_lookup={use_key_lookup}",
                     file=sys.stderr, flush=True,
                 )
                 if use_key_lookup:
                     # ---- key-based lookup (order-independent) ----
                     param_info = params_by_key[key]
+                    # Skip task-group-free large_head layers: these capture
+                    # padded metadata tensor addresses directly and read
+                    # up-to-date content on each replay.
+                    if param_info.get("large_head"):
+                        continue
                     param_tuple = param_info["params"]
                     handle = param_info["handle"]
                     event = param_info["event"]
@@ -570,8 +585,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         num_kv_heads, num_heads, scale,
                         block_table, seq_lens, output,
                     ) = params
+                    draft_step = _step_idx if _step_idx is not None else (attn_count // num_layers)
                     if _EXTRA_CTX.is_draft_model:
-                        draft_step = attn_count // num_layers
                         block_table = attn_metadata[draft_step][key].block_tables
                         seq_lens = attn_metadata[draft_step][key].seq_lens
                     else:
@@ -602,8 +617,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         block_size, seq_lens, num_kv_heads, num_heads, scale,
                         sliding_window, sinks, attn_output, softmax_lse,
                     ) = params[:14]
+                    draft_step = _step_idx if _step_idx is not None else (attn_count // num_layers)
                     if _EXTRA_CTX.is_draft_model:
-                        draft_step = attn_count // num_layers
                         seq_lens = attn_metadata[draft_step][key].seq_lens_list
                         actual_seq_lengths_q = attn_metadata[draft_step][key].actual_seq_lengths_q
                     else:
@@ -638,12 +653,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         c8_k_aq_scale, c8_k_aq_offset,
                         c8_v_aq_scale, c8_v_aq_offset,
                     ) = params[:21]
+                    draft_step = _step_idx if _step_idx is not None else (attn_count // num_layers)
                     if _EXTRA_CTX.is_draft_model:
-                        draft_step = attn_count // num_layers
                         import sys
                         print(
                             f"[GRAPH-REPLAY-FIA] key={key} attn_count={attn_count} "
-                            f"num_layers={num_layers} draft_step={draft_step} "
+                            f"step={draft_step} "
                             f"len(attn_metadata)={len(attn_metadata)}",
                             file=sys.stderr, flush=True,
                         )
@@ -851,8 +866,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
         handle = torch.npu.graph_task_group_end(stream)
         graph_params.handles[num_tokens].append(handle)
 
-        # Store by key for order-independent replay lookup
-        if layer_name and num_tokens in graph_params.attn_params_by_key:
+        # Store by key for order-independent replay lookup.
+        # Skip for draft model: each layer appears multiple times
+        # (once per spec step), so by-name storage would lose all
+        # but the last step's task group.
+        if (not _EXTRA_CTX.is_draft_model
+                and layer_name
+                and num_tokens in graph_params.attn_params_by_key):
             graph_params.attn_params_by_key[num_tokens][layer_name] = {
                 "params": graph_params.attn_params[num_tokens][-1],
                 "handle": handle,
@@ -1009,6 +1029,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
             # Direct PA call inside graph context -- no task group,
             # no event, no handle.  Padded metadata tensors at stable
             # addresses provide current data on each replay.
+            import sys
+            print(
+                f"[GRAPH-CAPTURE] PA-LARGE-HEAD layer={self._layer_name} "
+                f"head_dim={self.head_size} num_tokens={num_tokens} "
+                f"is_draft={_EXTRA_CTX.is_draft_model} "
+                f"key_cache_init={self.key_cache is not None}",
+                file=sys.stderr, flush=True,
+            )
             torch_npu._npu_paged_attention(
                 query=query,
                 key_cache=self.key_cache,
@@ -1021,6 +1049,32 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 out=output,
                 workspace=workspace,
             )
+
+            # Register in attn_params_by_key for diagnostics and to mark
+            # this layer as handled (task-group-free; skip during replay).
+            # Register for diagnostics; skip draft model for same
+            # reason as full_graph_pa (multi-step overwrite).
+            layer_name = self._layer_name
+            if (not _EXTRA_CTX.is_draft_model
+                    and layer_name
+                    and num_tokens in graph_params.attn_params_by_key):
+                graph_params.attn_params_by_key[num_tokens][layer_name] = {
+                    "params": (
+                        weak_ref_tensors(query),
+                        weak_ref_tensors(self.key_cache),
+                        weak_ref_tensors(self.value_cache),
+                        self.num_kv_heads,
+                        self.num_heads,
+                        self.scale,
+                        attn_metadata.block_tables,
+                        attn_metadata.seq_lens,
+                        weak_ref_tensors(output),
+                    ),
+                    "handle": None,
+                    "event": None,
+                    "large_head": True,
+                }
+
             return output
 
     def full_graph_pa(
@@ -1101,9 +1155,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
             handle = torch.npu.graph_task_group_end(stream)
             graph_params.handles[num_tokens].append(handle)
 
-            # Store by key for order-independent replay lookup
+            # Store by key for order-independent replay lookup.
+            # Skip for draft model: each layer appears multiple
+            # times (once per spec step), so by-name storage would
+            # lose all but the last step's task group.
             layer_name = self._layer_name
-            if layer_name and num_tokens in graph_params.attn_params_by_key:
+            if (not _EXTRA_CTX.is_draft_model
+                    and layer_name
+                    and num_tokens in graph_params.attn_params_by_key):
                 graph_params.attn_params_by_key[num_tokens][layer_name] = {
                     "params": graph_params.attn_params[num_tokens][-1],
                     "handle": handle,
