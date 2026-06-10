@@ -1460,14 +1460,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # shared_key is already dense [total_kv_len, num_kv_heads, head_dim]
         actual_seq_lengths_kv = [shared_key.shape[0]]
         # For cross-attention to shared target KV, all KV entries are from
-        # past target tokens, so bidirectional attention is correct.
-        # Using causal (sparse_mode=3) with different qlen/kvlen can
-        # restrict the query to only batch-index KV positions, producing
-        # zero output on Ascend NPU.
-        actual_causal = False
-        sparse_mode = 4 if self.sliding_window is not None else 3 if actual_causal else 0
+        # past target tokens. Use causal (sparse_mode=3) for full-attn
+        # layers since Ascend FIA may not support sparse_mode=0.
+        # With attn_mask=None, FIA will not apply a causal mask between
+        # the query batch position and KV positions — the actual positions
+        # are used instead.
+        sparse_mode = 4 if self.sliding_window is not None else 3
         pre_tokens = self.sliding_window if self.sliding_window is not None else SWA_INT_MAX
-        next_tokens = 0 if actual_causal or self.sliding_window is not None else SWA_INT_MAX
+        next_tokens = 0 if self.sliding_window is not None else SWA_INT_MAX
         # Cross-attention to shared target KV: all KV entries are from past
         # target tokens, so no causal mask is needed. Use attn_mask=None
         # to let FIA determine masking from actual_seq_qlen/kvlen alone.
