@@ -1309,10 +1309,28 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     _kc_nz = self.key_cache[_bt_vals[0], :_sl[0], :, :].abs().sum().item()
                     _vc_nz = self.value_cache[_bt_vals[0], :_sl[0], :, :].abs().sum().item()
                     print(f"[PA-KVSHARE] first-block cached K abs_sum={_kc_nz:.2f} V abs_sum={_vc_nz:.2f} (seq_len={_sl[0]})", file=sys.stderr, flush=True)
+        # ── KV sharing: swap to target's key_cache ──
+        # The draft model's AscendAttention backend has its own
+        # (empty) key_cache tensor.  When kv_sharing_target_layer_name
+        # is set we must read K/V from the *target* model's cache.
+        _target_impl = getattr(self, '_kv_share_target_impl', None)
+        if _target_impl is not None and getattr(_target_impl, 'key_cache', None) is not None:
+            _kc = _target_impl.key_cache
+            _vc = _target_impl.value_cache
+            if _kv_share_tgt is not None:
+                import sys
+                _own_ptr = self.key_cache.data_ptr() if self.key_cache is not None else 0
+                _tgt_ptr = _kc.data_ptr()
+                _swapped = (_own_ptr != _tgt_ptr)
+                print(f"[PA-KVSHARE] SWAPPING key_cache: own_ptr={_own_ptr} target_ptr={_tgt_ptr} swapped={_swapped}", file=sys.stderr, flush=True)
+        else:
+            _kc = self.key_cache
+            _vc = self.value_cache
+
         torch_npu._npu_paged_attention(
             query=query,
-            key_cache=self.key_cache,
-            value_cache=self.value_cache,
+            key_cache=_kc,
+            value_cache=_vc,
             num_kv_heads=self.num_kv_heads,
             num_heads=self.num_heads,
             scale_value=self.scale,

@@ -159,6 +159,19 @@ class AscendGemma4Proposer(_VllmGemma4Proposer, AscendSpecDecodeBaseProposer):
             impl = getattr(attn, "impl", None)
             if impl is not None and kv_share_tgt is not None:
                 object.__setattr__(impl, "kv_sharing_target_layer_name", kv_share_tgt)
+                # CRITICAL: Save a reference to the target attention
+                # backend so that forward_paged_attention can swap
+                # self.key_cache → target's key_cache at runtime.
+                # Without this, PA reads from the draft model's own
+                # empty key_cache tensor, producing all-zero attention.
+                target_impl = getattr(target_module, "impl", None)
+                if target_impl is not None:
+                    object.__setattr__(impl, "_kv_share_target_impl", target_impl)
+                    logger.info(
+                        "MTP KV-sharing: draft layer %d impl will use "
+                        "target '%s' key_cache at runtime.",
+                        draft_idx, tgt_name,
+                    )
 
             if draft_nkv != tgt_nkv or draft_nh != tgt_nh:
                 logger.info(
