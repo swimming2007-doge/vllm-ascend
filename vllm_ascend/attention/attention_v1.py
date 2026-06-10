@@ -1459,9 +1459,15 @@ class AscendAttentionBackendImpl(AttentionImpl):
         query = query[:num_tokens]
         # shared_key is already dense [total_kv_len, num_kv_heads, head_dim]
         actual_seq_lengths_kv = [shared_key.shape[0]]
-        sparse_mode = 4 if self.sliding_window is not None else 3 if attn_metadata.causal else 0
+        # For cross-attention to shared target KV, all KV entries are from
+        # past target tokens, so bidirectional attention is correct.
+        # Using causal (sparse_mode=3) with different qlen/kvlen can
+        # restrict the query to only batch-index KV positions, producing
+        # zero output on Ascend NPU.
+        actual_causal = False
+        sparse_mode = 4 if self.sliding_window is not None else 3 if actual_causal else 0
         pre_tokens = self.sliding_window if self.sliding_window is not None else SWA_INT_MAX
-        next_tokens = 0 if attn_metadata.causal or self.sliding_window is not None else SWA_INT_MAX
+        next_tokens = 0 if actual_causal or self.sliding_window is not None else SWA_INT_MAX
         attn_mask = attn_metadata.attn_mask
         if attn_mask is not None and attn_mask.dtype not in (torch.bool, torch.uint8):
             attn_mask = attn_mask.bool()
@@ -1472,7 +1478,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                   f"shared_v={shared_value.shape} num_tokens={num_tokens} "
                   f"actual_seq_kvlen={actual_seq_lengths_kv} "
                   f"actual_seq_qlen={attn_metadata.actual_seq_lengths_q} "
-                  f"sparse_mode={sparse_mode} pre_tokens={pre_tokens}",
+                  f"sparse_mode={sparse_mode} pre_tokens={pre_tokens} next_tokens={next_tokens} "
+                  f"orig_causal={attn_metadata.causal} sliding_window={self.sliding_window}",
                   file=sys.stderr, flush=True)
         attn_output = torch_npu.npu_fusion_attention(
             query=query,
