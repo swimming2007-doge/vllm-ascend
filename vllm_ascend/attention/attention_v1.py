@@ -1652,13 +1652,23 @@ class AscendAttentionBackendImpl(AttentionImpl):
         ):
             # Try slot_mapping-based lookup first (needed when the
             # same request's target K/V are at known cache slots).
-            if _kv_share_tgt is not None:
-                print(f"[ATTENTION-KVSHARE] BRANCH=shared_kv_prefill attn_state={attn_metadata.attn_state}", file=sys.stderr, flush=True)
-            shared_key, shared_value = self._get_current_token_shared_kv(attn_metadata)
-            if _kv_share_tgt is not None:
-                _sk_ok = shared_key is not None
-                _sv_ok = shared_value is not None
-                print(f"[ATTENTION-KVSHARE] _get_current_token_shared_kv: key_ok={_sk_ok} val_ok={_sv_ok}", file=sys.stderr, flush=True)
+            # BUT: for SpecDecoding, slot_mapping may only cover the
+            # most recent target-model token slots, not the full KV
+            # cache.  _get_current_token_shared_kv would then return
+            # a tiny K/V slice instead of None, preventing the
+            # block-table fallback below.  Skip it for SpecDecoding.
+            if attn_metadata.attn_state != AscendAttentionState.SpecDecoding:
+                if _kv_share_tgt is not None:
+                    print(f"[ATTENTION-KVSHARE] BRANCH=shared_kv_prefill attn_state={attn_metadata.attn_state}", file=sys.stderr, flush=True)
+                shared_key, shared_value = self._get_current_token_shared_kv(attn_metadata)
+                if _kv_share_tgt is not None:
+                    _sk_ok = shared_key is not None
+                    _sv_ok = shared_value is not None
+                    print(f"[ATTENTION-KVSHARE] _get_current_token_shared_kv: key_ok={_sk_ok} val_ok={_sv_ok}", file=sys.stderr, flush=True)
+            else:
+                if _kv_share_tgt is not None:
+                    print(f"[ATTENTION-KVSHARE] BRANCH=shared_kv_prefill SPECDECODING (skip slot_mapping)", file=sys.stderr, flush=True)
+                shared_key, shared_value = None, None
 
             # Fall back to block-table gathering.  This is the normal
             # path for speculative decoding where the draft model
