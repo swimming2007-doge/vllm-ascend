@@ -1447,62 +1447,62 @@ class AscendAttentionBackendImpl(AttentionImpl):
         attn_metadata: AscendMetadata,
         output: torch.Tensor,
     ) -> torch.Tensor:
-        """FIA attention with already-dense shared KV from block_table.
+        """Manual PyTorch attention with already-dense shared KV from block_table.
 
-        Unlike _forward_large_head_prefill_attention which passes key/value
-        through _get_large_head_prefill_kv (which can truncate dense KV to
-        key[:num_tokens] or re-gather it as paged), this method accepts
-        already-gathered dense shared KV and passes the full KV length
-        as actual_seq_kvlen.
+        Ascend FIA (npu_fusion_attention) cannot handle cross-attention where
+        actual_seq_qlen differs from actual_seq_kvlen — it either crashes with
+        mask shape errors or produces zero output.  Use PyTorch's
+        scaled_dot_product_attention instead, which correctly supports
+        cross-attention with arbitrary Q/KV lengths and GQA (grouped-query
+        attention).
         """
-        num_tokens = attn_metadata.actual_seq_lengths_q[-1]
-        query = query[:num_tokens]
-        # shared_key is already dense [total_kv_len, num_kv_heads, head_dim]
-        actual_seq_lengths_kv = [shared_key.shape[0]]
-        # For cross-attention to shared target KV, all KV entries are from
-        # past target tokens. Use causal (sparse_mode=3) for full-attn
-        # layers since Ascend FIA may not support sparse_mode=0.
-        # With attn_mask=None, FIA will not apply a causal mask between
-        # the query batch position and KV positions — the actual positions
-        # are used instead.
-        sparse_mode = 4 if self.sliding_window is not None else 3
-        pre_tokens = self.sliding_window if self.sliding_window is not None else SWA_INT_MAX
-        next_tokens = 0 if self.sliding_window is not None else SWA_INT_MAX
-        # Cross-attention to shared target KV: all KV entries are from past
-        # target tokens, so no causal mask is needed. Use attn_mask=None
-        # to let FIA determine masking from actual_seq_qlen/kvlen alone.
-        # Passing the pre-allocated [2048,2048] mask can cause FIA errors
-        # when actual_seq_qlen differs from actual_seq_kvlen.
-        attn_mask = None
         import sys
+        import torch.nn.functional as F
+        num_tokens = attn_metadata.actual_seq_lengths_q[-1]
+        # Slice to actual query tokens
+        q = query[:num_tokens]  # [T, H, D]  T=num_tokens, H=num_heads
+        k = shared_key            # [S, Hkv, D]
+        v = shared_value          # [S, Hkv, D]
+
+        # For sliding-window layers: create an attention mask that limits
+        # each query to its pre_tokens preceding KV positions.  Since all
+        # KV entries are past target tokens, this is effectively full
+        # attention when the KV length is smaller than the window.
+        sliding_window = self.sliding_window
+        attn_mask = None
+        if sliding_window is not None and k.shape[0] > sliding_window:
+            # Create a causal-like mask: query at position i can attend to
+            # KV positions [i+offset-sliding_window, i+offset] where
+            # offset aligns the last query with the last KV.
+            S = k.shape[0]
+            mask = torch.ones(num_tokens, S, dtype=q.dtype, device=q.device) * float('-inf')
+            offset = S - num_tokens
+            for i in range(num_tokens):
+                start = max(0, i + offset - sliding_window + 1)
+                end = i + offset + 1
+                mask[i, start:end] = 0
+            attn_mask = mask
+
         _kv_share_tgt = getattr(self, '_kv_share_target_impl', None)
         if _kv_share_tgt is not None:
-            print(f"[ATTENTION-SHARED-FIA] query={query.shape} shared_k={shared_key.shape} "
-                  f"shared_v={shared_value.shape} num_tokens={num_tokens} "
-                  f"actual_seq_kvlen={actual_seq_lengths_kv} "
-                  f"actual_seq_qlen={attn_metadata.actual_seq_lengths_q} "
-                  f"sparse_mode={sparse_mode} pre_tokens={pre_tokens} next_tokens={next_tokens} "
-                  f"orig_causal={attn_metadata.causal} sliding_window={self.sliding_window}",
+            print(f"[ATTENTION-SHARED-SDPA] query={q.shape} shared_k={k.shape} "
+                  f"shared_v={v.shape} num_tokens={num_tokens} "
+                  f"sliding_window={sliding_window} num_heads={self.num_heads} "
+                  f"num_kv_heads={self.num_kv_heads} scale={self.scale}",
                   file=sys.stderr, flush=True)
-        attn_output = torch_npu.npu_fusion_attention(
-            query=query,
-            key=shared_key,
-            value=shared_value,
-            head_num=self.num_heads,
-            input_layout="TND",
-            atten_mask=attn_mask,
+
+        # PyTorch sdpa handles GQA natively: Q heads = H, KV heads = Hkv.
+        attn_output = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_mask,
             scale=self.scale,
-            pre_tockens=pre_tokens,
-            next_tockens=next_tokens,
-            actual_seq_qlen=attn_metadata.actual_seq_lengths_q,
-            actual_seq_kvlen=actual_seq_lengths_kv,
-            sparse_mode=sparse_mode,
-        )[0]
+        )  # [T, H, D]
+
         if _kv_share_tgt is not None:
-            print(f"[ATTENTION-SHARED-FIA] output shape={attn_output.shape} "
+            print(f"[ATTENTION-SHARED-SDPA] output shape={attn_output.shape} "
                   f"mean={attn_output.mean().item():.6f} std={attn_output.std().item():.6f}",
                   file=sys.stderr, flush=True)
-        output[:num_tokens] = attn_output[:num_tokens]
+        output[:num_tokens] = attn_output
         return output
 
     def _get_large_head_prefill_kv(
