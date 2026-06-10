@@ -1368,7 +1368,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                             _scores = torch.matmul(_q0.unsqueeze(0), _k.transpose(0, 1).unsqueeze(0).transpose(-2, -1)) * _scale
                             _scores = _scores.squeeze(0)  # [h, seq]
                             _attn_w = F.softmax(_scores, dim=-1)
-                            _ref_out = torch.matmul(_attn_w.unsqueeze(0), _v.unsqueeze(0).transpose(1, 2)).squeeze(0)  # [h, d]
+                            _ref_out = torch.matmul(_attn_w.unsqueeze(1), _v.transpose(0, 1)).squeeze(1)  # [h, d]
                             _ref_flat = _ref_out.reshape(-1)
                             _pa_out = output[0].reshape(self.num_heads, self.head_size)
                             _pa_flat = _pa_out.reshape(-1)

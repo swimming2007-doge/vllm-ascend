@@ -1044,40 +1044,37 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 exceeds_max_model_len = positions >= self.vllm_config.model_config.max_model_len
                 clamped_positions = torch.where(exceeds_max_model_len, 0, positions)
 
+            # For MTP with constant positions, each sequential iteration
+            # processes exactly batch_size tokens (e.g. 1).  Using
+            # input_batch_size (which equals num_input_tokens from the
+            # merged forward) introduces stale token slots that leak
+            # old positions / backbone hidden states / token ids into
+            # the model forward.  Override it here so every slot the
+            # model sees is a real draft token.
+            _loop_input_bs = batch_size if (
+                self.method == "mtp" and getattr(self, 'constant_draft_positions', False)
+            ) else input_batch_size
+            _EXTRA_CTX.num_tokens = _loop_input_bs
+
             # copy inputs to buffer for cudagraph
             self.input_ids[:batch_size] = input_ids
-            if self.method == "mtp" and getattr(self, 'constant_draft_positions', False):
-                # MTP with constant positions: ALL input tokens share
-                # the same position and backbone hidden states.
-                # _set_positions(batch_size, ...) only sets batch_size
-                # slots, but the model reads input_batch_size slots.
-                # Stale positions cause the draft tokens to attend to
-                # wrong KV-cache entries via mismatched RoPE.
-                pos0 = clamped_positions[0].expand(input_batch_size)
-                self._set_positions(input_batch_size, pos0)
-                # Likewise broadcast the backbone hidden states so
-                # every token slot sees the same context.
-                self.hidden_states[:input_batch_size] = (
-                    hidden_states[:1].expand(input_batch_size, -1)
-                )
-            else:
-                self._set_positions(batch_size, clamped_positions)
-                self.hidden_states[:batch_size] = hidden_states.view(batch_size, -1)
+            self._set_positions(batch_size, clamped_positions)
+            self.hidden_states[:batch_size] = hidden_states.view(batch_size, -1)
 
             # ── DEBUG: loop iteration inputs ──
             import sys
-            _dbg_pos = self._get_positions(input_batch_size)
-            _dbg_hs = self.hidden_states[:input_batch_size]
+            _dbg_pos = self._get_positions(_loop_input_bs)
+            _dbg_hs = self.hidden_states[:_loop_input_bs]
             print(f"[MTP-ASCEND DEBUG] --- loop iter {draft_step} --- token={input_ids.tolist()}", file=sys.stderr, flush=True)
             print(f"[MTP-ASCEND DEBUG]   positions={_dbg_pos.tolist() if _dbg_pos.numel()<=5 else _dbg_pos[:5].tolist()}", file=sys.stderr, flush=True)
             print(f"[MTP-ASCEND DEBUG]   input hidden_states mean={_dbg_hs.mean().item():.6f} std={_dbg_hs.std().item():.6f} shape={_dbg_hs.shape}", file=sys.stderr, flush=True)
             if self.supports_mm_inputs:
                 self.inputs_embeds[:batch_size] = self.model.embed_input_ids(input_ids)
 
-                input_ids = self.input_ids[:input_batch_size]
-                inputs_embeds = self.inputs_embeds[:input_batch_size]
+                input_ids = self.input_ids[:_loop_input_bs]
+                inputs_embeds = self.inputs_embeds[:_loop_input_bs]
             else:
-                input_ids = self.input_ids[:input_batch_size]
+                input_ids = self.input_ids[:_loop_input_bs]
                 inputs_embeds = None
 
             # Run the model.
@@ -1085,9 +1082,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # The lifecycle of `input_ids`, `positions`, `hidden_states` runs through all
             # speculative tokens' proposings. `model_input_ids`, `model_positions` and
             # `model_hidden_states` represent the speculative model inputs.
-            model_input_ids = self.input_ids[:input_batch_size]
-            model_positions = self._get_positions(input_batch_size)
-            model_hidden_states = self.hidden_states[:input_batch_size]
+            model_input_ids = self.input_ids[:_loop_input_bs]
+            model_positions = self._get_positions(_loop_input_bs)
+            model_hidden_states = self.hidden_states[:_loop_input_bs]
 
             model_hidden_states, model_positions = self.maybe_pad_and_reduce(model_hidden_states, model_positions)
 
