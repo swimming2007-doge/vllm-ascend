@@ -1287,6 +1287,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
     ) -> torch.Tensor:
         if _EXTRA_CTX.capturing:
             return self.full_graph_pa(query, attn_metadata, output)
+        _kv_share_tgt = getattr(self, 'kv_sharing_target_layer_name', None)
+        if _kv_share_tgt is not None:
+            import sys
+            _kc_shape = self.key_cache.shape if self.key_cache is not None else None
+            _bt_shape = attn_metadata.block_tables.shape if attn_metadata.block_tables is not None else None
+            _sl = attn_metadata.seq_lens.tolist() if attn_metadata.seq_lens is not None else None
+            print(f"[PA-KVSHARE] target={_kv_share_tgt} query={query.shape} nheads={self.num_heads} nkv={self.num_kv_heads} head_dim={self.head_size}", file=sys.stderr, flush=True)
+            print(f"[PA-KVSHARE] key_cache={_kc_shape} block_table={_bt_shape} seq_lens={_sl}", file=sys.stderr, flush=True)
         torch_npu._npu_paged_attention(
             query=query,
             key_cache=self.key_cache,
@@ -1531,6 +1539,21 @@ class AscendAttentionBackendImpl(AttentionImpl):
     ):
         num_tokens = query.shape[0]
 
+        # ── DIAGNOSTIC: check KV-sharing setup for MTP draft layers ──
+        _kv_share_tgt = getattr(self, 'kv_sharing_target_layer_name', None)
+        if _kv_share_tgt is not None:
+            import sys
+            _k_shape = key.shape if key is not None else None
+            _v_shape = value.shape if value is not None else None
+            _qk_match = (query.shape[0] == key.shape[0]) if key is not None else False
+            _kc_ok = self.key_cache is not None
+            _vc_ok = self.value_cache is not None
+            _state = attn_metadata.attn_state if attn_metadata is not None else None
+            print(f"[ATTENTION-KVSHARE] num_tokens={num_tokens} head_size={self.head_size} kv_heads={self.num_kv_heads} num_heads={self.num_heads}", file=sys.stderr, flush=True)
+            print(f"[ATTENTION-KVSHARE] kv_share_target={_kv_share_tgt} key_cache_ok={_kc_ok} val_cache_ok={_vc_ok}", file=sys.stderr, flush=True)
+            print(f"[ATTENTION-KVSHARE] query.shape={query.shape} key.shape={_k_shape} val.shape={_v_shape} qk_match={_qk_match}", file=sys.stderr, flush=True)
+            print(f"[ATTENTION-KVSHARE] attn_state={_state} key_is_None={key is None} val_is_None={value is None}", file=sys.stderr, flush=True)
+
         # KV-sharing layers (e.g., Gemma4 MTP draft) read K/V from the
         # target layer's cache.  Ensure self.key_cache / self.value_cache
         # are initialised from the kv_cache tuple BEFORE calling
@@ -1545,6 +1568,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
             and len(kv_cache) >= 2
         ):
             self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
+            if _kv_share_tgt is not None:
+                print(f"[ATTENTION-KVSHARE] key_cache INITIALIZED from kv_cache tuple, shapes: k={self.key_cache.shape} v={self.value_cache.shape}", file=sys.stderr, flush=True)
 
         if (
             self.kv_sharing_target_layer_name is not None
@@ -1555,7 +1580,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
         ):
             # Try slot_mapping-based lookup first (needed when the
             # same request's target K/V are at known cache slots).
+            if _kv_share_tgt is not None:
+                print(f"[ATTENTION-KVSHARE] BRANCH=shared_kv_prefill attn_state={attn_metadata.attn_state}", file=sys.stderr, flush=True)
             shared_key, shared_value = self._get_current_token_shared_kv(attn_metadata)
+            if _kv_share_tgt is not None:
+                _sk_ok = shared_key is not None
+                _sv_ok = shared_value is not None
+                print(f"[ATTENTION-KVSHARE] _get_current_token_shared_kv: key_ok={_sk_ok} val_ok={_sv_ok}", file=sys.stderr, flush=True)
 
             # Fall back to block-table gathering.  This is the normal
             # path for speculative decoding where the draft model
@@ -1565,8 +1596,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 shared_key, shared_value = self._get_shared_kv_from_block_table(
                     attn_metadata
                 )
+                if _kv_share_tgt is not None:
+                    _sk_ok = shared_key is not None
+                    _sv_ok = shared_value is not None
+                    print(f"[ATTENTION-KVSHARE] _get_shared_kv_from_block_table: key_ok={_sk_ok} val_ok={_sv_ok}", file=sys.stderr, flush=True)
 
             if shared_key is not None and shared_value is not None:
+                if _kv_share_tgt is not None:
+                    print(f"[ATTENTION-KVSHARE] -> _forward_large_head_prefill_attention shared_k shape={shared_key.shape} v shape={shared_value.shape}", file=sys.stderr, flush=True)
                 return self._forward_large_head_prefill_attention(
                     query,
                     shared_key,
@@ -1574,16 +1611,25 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     attn_metadata,
                     output,
                 )
+            elif _kv_share_tgt is not None:
+                print(f"[ATTENTION-KVSHARE] ** FAILED to get shared KV, falling through **", file=sys.stderr, flush=True)
 
         use_large_head_fallback = self._should_use_large_head_attention_fallback()
+        _pa_usable = using_paged_attention(num_tokens, self.vllm_config)
+
+        if _kv_share_tgt is not None:
+            _state_name = attn_metadata.attn_state.name if attn_metadata is not None else "None"
+            print(f"[ATTENTION-KVSHARE] BRANCH-SELECT: state={_state_name} large_head_fb={use_large_head_fallback} pa_usable={_pa_usable} sliding_window={self.sliding_window}", file=sys.stderr, flush=True)
 
         if (
             attn_metadata.attn_state in (AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding)
             and (self.sliding_window is None or self.kv_sharing_target_layer_name is not None)
-            and (using_paged_attention(num_tokens, self.vllm_config) or use_large_head_fallback)
+            and (_pa_usable or use_large_head_fallback or self.kv_sharing_target_layer_name is not None)
         ):
             # PA works for all head_dims on this Ascend device;
             # the large-head fallback flag just means we skip FIA.
+            if _kv_share_tgt is not None:
+                print(f"[ATTENTION-KVSHARE] -> forward_paged_attention (decode/specdec path)", file=sys.stderr, flush=True)
             output = self.forward_paged_attention(query, attn_metadata, output)
         elif (
             not _EXTRA_CTX.capturing
@@ -1594,12 +1640,21 @@ class AscendAttentionBackendImpl(AttentionImpl):
             and query.shape[0] == key.shape[0]
             and attn_metadata.attn_state in (AscendAttentionState.PrefillNoCache, AscendAttentionState.ChunkedPrefill, AscendAttentionState.SpecDecoding)
         ):
+            if _kv_share_tgt is not None:
+                print(f"[ATTENTION-KVSHARE] -> _forward_large_head_prefill_attention (dummy kv fallback)", file=sys.stderr, flush=True)
             output = self._forward_large_head_prefill_attention(query, key, value, attn_metadata, output)
         elif use_large_head_fallback:
             # Large head_dim + non-DecodeOnly, non-prefill edge case.
+            if _kv_share_tgt is not None:
+                print(f"[ATTENTION-KVSHARE] -> forward_paged_attention (edge case)", file=sys.stderr, flush=True)
             output = self.forward_paged_attention(query, attn_metadata, output)
         else:
+            if _kv_share_tgt is not None:
+                print(f"[ATTENTION-KVSHARE] -> forward_fused_infer_attention (default FIA)", file=sys.stderr, flush=True)
             output = self.forward_fused_infer_attention(query, key, value, attn_metadata, output, kv_cache)
+
+        if _kv_share_tgt is not None:
+            print(f"[ATTENTION-KVSHARE] OUTPUT: mean={output.mean().item():.6f} std={output.std().item():.6f} shape={output.shape}", file=sys.stderr, flush=True)
 
         # ── DEBUG: attention dump for Gemma4 MTP (head_size==512) ──
         import os as _os

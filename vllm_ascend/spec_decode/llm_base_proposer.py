@@ -998,7 +998,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # ── DEBUG: MTP sequential loop pre-entry ──
         import sys
         _hs_buf = self.hidden_states.shape
-        _tgt_hs = target_hidden_states.shape
+        _tgt_hs = hidden_states.shape  # backbone hidden from merged forward
         _hs_shape = hidden_states.shape
         print(f"[MTP-ASCEND DEBUG] === ENTERING SEQUENTIAL LOOP ===", file=sys.stderr, flush=True)
         print(f"[MTP-ASCEND DEBUG] method={self.method} use_cuda_graph={self.use_cuda_graph} constant_draft_positions={getattr(self, 'constant_draft_positions', False)}", file=sys.stderr, flush=True)
