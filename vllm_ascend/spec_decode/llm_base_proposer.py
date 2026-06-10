@@ -1136,8 +1136,14 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
             # ── DEBUG: loop iteration output ──
             import sys
+            _topk = min(5, logits.shape[-1])
+            _topk_vals, _topk_ids = torch.topk(logits, _topk, dim=-1)
             print(f"[MTP-ASCEND DEBUG]   output hidden_states mean={hidden_states.mean().item():.6f} std={hidden_states.std().item():.6f} shape={hidden_states.shape}", file=sys.stderr, flush=True)
             print(f"[MTP-ASCEND DEBUG]   draft[{draft_step+1}]={draft_token_ids.tolist()}", file=sys.stderr, flush=True)
+            if _topk_vals.numel() <= 5:
+                print(f"[MTP-ASCEND DEBUG]   logits top-{_topk}: vals={_topk_vals.tolist()} ids={_topk_ids.tolist()}", file=sys.stderr, flush=True)
+            else:
+                print(f"[MTP-ASCEND DEBUG]   logits top-{_topk}: vals={_topk_vals[0].tolist()} ids={_topk_ids[0].tolist()}", file=sys.stderr, flush=True)
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = draft_token_ids_tensor.swapaxes(0, 1)
