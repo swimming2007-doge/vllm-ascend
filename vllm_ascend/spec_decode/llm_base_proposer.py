@@ -1046,8 +1046,23 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
             # copy inputs to buffer for cudagraph
             self.input_ids[:batch_size] = input_ids
-            self._set_positions(batch_size, clamped_positions)
-            self.hidden_states[:batch_size] = hidden_states.view(batch_size, -1)
+            if self.method == "mtp" and getattr(self, 'constant_draft_positions', False):
+                # MTP with constant positions: ALL input tokens share
+                # the same position and backbone hidden states.
+                # _set_positions(batch_size, ...) only sets batch_size
+                # slots, but the model reads input_batch_size slots.
+                # Stale positions cause the draft tokens to attend to
+                # wrong KV-cache entries via mismatched RoPE.
+                pos0 = clamped_positions[0].expand(input_batch_size)
+                self._set_positions(input_batch_size, pos0)
+                # Likewise broadcast the backbone hidden states so
+                # every token slot sees the same context.
+                self.hidden_states[:input_batch_size] = (
+                    hidden_states[:1].expand(input_batch_size, -1)
+                )
+            else:
+                self._set_positions(batch_size, clamped_positions)
+                self.hidden_states[:batch_size] = hidden_states.view(batch_size, -1)
 
             # ── DEBUG: loop iteration inputs ──
             import sys

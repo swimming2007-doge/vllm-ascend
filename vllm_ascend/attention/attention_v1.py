@@ -1295,6 +1295,20 @@ class AscendAttentionBackendImpl(AttentionImpl):
             _sl = attn_metadata.seq_lens.tolist() if attn_metadata.seq_lens is not None else None
             print(f"[PA-KVSHARE] target={_kv_share_tgt} query={query.shape} nheads={self.num_heads} nkv={self.num_kv_heads} head_dim={self.head_size}", file=sys.stderr, flush=True)
             print(f"[PA-KVSHARE] key_cache={_kc_shape} block_table={_bt_shape} seq_lens={_sl}", file=sys.stderr, flush=True)
+            # Print first few block indices to verify they are valid
+            if attn_metadata.block_tables is not None and attn_metadata.block_tables.numel() > 0:
+                _bt_flat = attn_metadata.block_tables.flatten()
+                _bt_vals = _bt_flat[:(_bt_flat.numel() if _bt_flat.numel() <= 8 else 8)].tolist()
+                print(f"[PA-KVSHARE] block_table first values={_bt_vals}", file=sys.stderr, flush=True)
+                # Quick sanity: read first KV entry from first block
+                if self.key_cache is not None and _bt_vals[0] >= 0 and _bt_vals[0] < self.key_cache.shape[0]:
+                    _kc_sample = self.key_cache[_bt_vals[0], 0, :, :].mean().item()
+                    _vc_sample = self.value_cache[_bt_vals[0], 0, :, :].mean().item()
+                    print(f"[PA-KVSHARE] first-block[0] k_mean={_kc_sample:.6f} v_mean={_vc_sample:.6f}", file=sys.stderr, flush=True)
+                    # Also check if ALL entries are zeros (cache not filled)
+                    _kc_nz = self.key_cache[_bt_vals[0], :_sl[0], :, :].abs().sum().item()
+                    _vc_nz = self.value_cache[_bt_vals[0], :_sl[0], :, :].abs().sum().item()
+                    print(f"[PA-KVSHARE] first-block cached K abs_sum={_kc_nz:.2f} V abs_sum={_vc_nz:.2f} (seq_len={_sl[0]})", file=sys.stderr, flush=True)
         torch_npu._npu_paged_attention(
             query=query,
             key_cache=self.key_cache,
@@ -1306,6 +1320,46 @@ class AscendAttentionBackendImpl(AttentionImpl):
             context_lens=attn_metadata.seq_lens,
             out=output,
         )
+        # ── DEBUG: compare PA output per-token ──
+        if _kv_share_tgt is not None and output is not None:
+            import sys
+            for _ti in range(min(output.shape[0], 3)):
+                _o_tok = output[_ti]
+                print(f"[PA-KVSHARE] PA output token[{_ti}] mean={_o_tok.mean().item():.6f} std={_o_tok.std().item():.6f}", file=sys.stderr, flush=True)
+            # ── PyTorch reference attention for token[0] ──
+            # Only run on first token, first call, to avoid overhead
+            if not hasattr(self, '_pa_ref_checked'):
+                self._pa_ref_checked = True
+                try:
+                    import torch.nn.functional as F
+                    _bt = attn_metadata.block_tables
+                    _sl = attn_metadata.seq_lens
+                    if _bt is not None and _sl is not None and _sl.numel() > 0:
+                        _seq_len = min(_sl[0].item(), 128)  # first block only
+                        _blk = _bt[0, 0].item()
+                        if _blk >= 0 and _blk < self.key_cache.shape[0]:
+                            _k = self.key_cache[_blk, :_seq_len, :, :]  # [seq, kv_h, d]
+                            _v = self.value_cache[_blk, :_seq_len, :, :]
+                            # Expand GQA: [seq, kv_h, d] → [seq, nheads, d]
+                            _gqa = self.num_heads // self.num_kv_heads
+                            _k = _k.unsqueeze(2).expand(-1, -1, _gqa, -1).reshape(_seq_len, self.num_heads, self.head_size)
+                            _v = _v.unsqueeze(2).expand(-1, -1, _gqa, -1).reshape(_seq_len, self.num_heads, self.head_size)
+                            _q0 = query[0].reshape(self.num_heads, self.head_size)  # [h, d]
+                            _scale = self.scale
+                            # QK^T
+                            _scores = torch.matmul(_q0.unsqueeze(0), _k.transpose(0, 1).unsqueeze(0).transpose(-2, -1)) * _scale
+                            _scores = _scores.squeeze(0)  # [h, seq]
+                            _attn_w = F.softmax(_scores, dim=-1)
+                            _ref_out = torch.matmul(_attn_w.unsqueeze(0), _v.unsqueeze(0).transpose(1, 2)).squeeze(0)  # [h, d]
+                            _ref_flat = _ref_out.reshape(-1)
+                            _pa_out = output[0].reshape(self.num_heads, self.head_size)
+                            _pa_flat = _pa_out.reshape(-1)
+                            _diff = (_ref_flat - _pa_flat).abs().mean().item()
+                            _cos = torch.nn.functional.cosine_similarity(_ref_flat, _pa_flat, dim=0).item()
+                            print(f"[PA-KVSHARE] REF-vs-PA: abs_diff={_diff:.6f} cos_sim={_cos:.6f} ref_mean={_ref_flat.mean().item():.6f} pa_mean={_pa_flat.mean().item():.6f}", file=sys.stderr, flush=True)
+                            print(f"[PA-KVSHARE] REF attn_w[0,:5]={_attn_w[0,:5].tolist()} sum={_attn_w[0].sum().item():.4f}", file=sys.stderr, flush=True)
+                except Exception as _e:
+                    print(f"[PA-KVSHARE] REF comparison failed: {_e}", file=sys.stderr, flush=True)
         return output
 
     def _forward_encoder_attention(
