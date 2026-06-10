@@ -1439,6 +1439,62 @@ class AscendAttentionBackendImpl(AttentionImpl):
         output[:num_tokens] = attn_output[:num_tokens]
         return output
 
+    def _forward_shared_kv_prefill_attention(
+        self,
+        query: torch.Tensor,
+        shared_key: torch.Tensor,
+        shared_value: torch.Tensor,
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """FIA attention with already-dense shared KV from block_table.
+
+        Unlike _forward_large_head_prefill_attention which passes key/value
+        through _get_large_head_prefill_kv (which can truncate dense KV to
+        key[:num_tokens] or re-gather it as paged), this method accepts
+        already-gathered dense shared KV and passes the full KV length
+        as actual_seq_kvlen.
+        """
+        num_tokens = attn_metadata.actual_seq_lengths_q[-1]
+        query = query[:num_tokens]
+        # shared_key is already dense [total_kv_len, num_kv_heads, head_dim]
+        actual_seq_lengths_kv = [shared_key.shape[0]]
+        sparse_mode = 4 if self.sliding_window is not None else 3 if attn_metadata.causal else 0
+        pre_tokens = self.sliding_window if self.sliding_window is not None else SWA_INT_MAX
+        next_tokens = 0 if attn_metadata.causal or self.sliding_window is not None else SWA_INT_MAX
+        attn_mask = attn_metadata.attn_mask
+        if attn_mask is not None and attn_mask.dtype not in (torch.bool, torch.uint8):
+            attn_mask = attn_mask.bool()
+        import sys
+        _kv_share_tgt = getattr(self, '_kv_share_target_impl', None)
+        if _kv_share_tgt is not None:
+            print(f"[ATTENTION-SHARED-FIA] query={query.shape} shared_k={shared_key.shape} "
+                  f"shared_v={shared_value.shape} num_tokens={num_tokens} "
+                  f"actual_seq_kvlen={actual_seq_lengths_kv} "
+                  f"actual_seq_qlen={attn_metadata.actual_seq_lengths_q} "
+                  f"sparse_mode={sparse_mode} pre_tokens={pre_tokens}",
+                  file=sys.stderr, flush=True)
+        attn_output = torch_npu.npu_fusion_attention(
+            query=query,
+            key=shared_key,
+            value=shared_value,
+            head_num=self.num_heads,
+            input_layout="TND",
+            atten_mask=attn_mask,
+            scale=self.scale,
+            pre_tockens=pre_tokens,
+            next_tockens=next_tokens,
+            actual_seq_qlen=attn_metadata.actual_seq_lengths_q,
+            actual_seq_kvlen=actual_seq_lengths_kv,
+            sparse_mode=sparse_mode,
+        )[0]
+        if _kv_share_tgt is not None:
+            print(f"[ATTENTION-SHARED-FIA] output shape={attn_output.shape} "
+                  f"mean={attn_output.mean().item():.6f} std={attn_output.std().item():.6f}",
+                  file=sys.stderr, flush=True)
+        output[:num_tokens] = attn_output[:num_tokens]
+        return output
+
     def _get_large_head_prefill_kv(
         self,
         key: torch.Tensor,
@@ -1685,8 +1741,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
             if shared_key is not None and shared_value is not None:
                 if _kv_share_tgt is not None:
-                    print(f"[ATTENTION-KVSHARE] -> _forward_large_head_prefill_attention shared_k shape={shared_key.shape} v shape={shared_value.shape}", file=sys.stderr, flush=True)
-                return self._forward_large_head_prefill_attention(
+                    print(f"[ATTENTION-KVSHARE] -> _forward_shared_kv_prefill_attention shared_k shape={shared_key.shape} v shape={shared_value.shape}", file=sys.stderr, flush=True)
+                return self._forward_shared_kv_prefill_attention(
                     query,
                     shared_key,
                     shared_value,
