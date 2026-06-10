@@ -995,6 +995,21 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         input_batch_size = num_input_tokens if (self.method == "mtp" or self.use_cuda_graph) else batch_size
 
+        # ── DEBUG: MTP sequential loop pre-entry ──
+        import sys
+        _hs_buf = self.hidden_states.shape
+        _tgt_hs = target_hidden_states.shape
+        _hs_shape = hidden_states.shape
+        print(f"[MTP-ASCEND DEBUG] === ENTERING SEQUENTIAL LOOP ===", file=sys.stderr, flush=True)
+        print(f"[MTP-ASCEND DEBUG] method={self.method} use_cuda_graph={self.use_cuda_graph} constant_draft_positions={getattr(self, 'constant_draft_positions', False)}", file=sys.stderr, flush=True)
+        print(f"[MTP-ASCEND DEBUG] num_input_tokens={num_input_tokens} batch_size={batch_size} input_batch_size={input_batch_size}", file=sys.stderr, flush=True)
+        print(f"[MTP-ASCEND DEBUG] target_hidden_states.shape={_tgt_hs} hidden_states.shape={_hs_shape}", file=sys.stderr, flush=True)
+        print(f"[MTP-ASCEND DEBUG] self.hidden_states.buffer.shape={_hs_buf} self.hidden_size={self.hidden_size}", file=sys.stderr, flush=True)
+        print(f"[MTP-ASCEND DEBUG] positions after sample={positions.tolist() if positions.numel() <= 5 else positions[:5].tolist()}", file=sys.stderr, flush=True)
+        print(f"[MTP-ASCEND DEBUG] draft[0]={draft_token_ids_tensor[0].tolist()}", file=sys.stderr, flush=True)
+        if _hs_shape[-1] != _hs_buf[-1]:
+            print(f"[MTP-ASCEND DEBUG] ** WARNING ** hidden_states dim {_hs_shape[-1]} != buffer dim {_hs_buf[-1]}", file=sys.stderr, flush=True)
+
         forward_context = get_forward_context()
         _EXTRA_CTX.num_tokens = input_batch_size
         _EXTRA_CTX.num_accept_tokens = batch_size
@@ -1033,6 +1048,14 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             self.input_ids[:batch_size] = input_ids
             self._set_positions(batch_size, clamped_positions)
             self.hidden_states[:batch_size] = hidden_states.view(batch_size, -1)
+
+            # ── DEBUG: loop iteration inputs ──
+            import sys
+            _dbg_pos = self._get_positions(input_batch_size)
+            _dbg_hs = self.hidden_states[:input_batch_size]
+            print(f"[MTP-ASCEND DEBUG] --- loop iter {draft_step} --- token={input_ids.tolist()}", file=sys.stderr, flush=True)
+            print(f"[MTP-ASCEND DEBUG]   positions={_dbg_pos.tolist() if _dbg_pos.numel()<=5 else _dbg_pos[:5].tolist()}", file=sys.stderr, flush=True)
+            print(f"[MTP-ASCEND DEBUG]   input hidden_states mean={_dbg_hs.mean().item():.6f} std={_dbg_hs.std().item():.6f} shape={_dbg_hs.shape}", file=sys.stderr, flush=True)
             if self.supports_mm_inputs:
                 self.inputs_embeds[:batch_size] = self.model.embed_input_ids(input_ids)
 
@@ -1097,6 +1120,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             hidden_states = hidden_states[:batch_size]
             draft_token_ids = logits.argmax(dim=-1)
             draft_token_ids_tensor[draft_step + 1] = draft_token_ids
+
+            # ── DEBUG: loop iteration output ──
+            import sys
+            print(f"[MTP-ASCEND DEBUG]   output hidden_states mean={hidden_states.mean().item():.6f} std={hidden_states.std().item():.6f} shape={hidden_states.shape}", file=sys.stderr, flush=True)
+            print(f"[MTP-ASCEND DEBUG]   draft[{draft_step+1}]={draft_token_ids.tolist()}", file=sys.stderr, flush=True)
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = draft_token_ids_tensor.swapaxes(0, 1)

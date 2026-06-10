@@ -1601,6 +1601,30 @@ class AscendAttentionBackendImpl(AttentionImpl):
         else:
             output = self.forward_fused_infer_attention(query, key, value, attn_metadata, output, kv_cache)
 
+        # ── DEBUG: attention dump for Gemma4 MTP (head_size==512) ──
+        import os as _os
+        if _os.environ.get("DUMP_ATTENTION_DIR") and self.head_size == 512:
+            _dump_dir = _os.environ["DUMP_ATTENTION_DIR"]
+            _os.makedirs(_dump_dir, exist_ok=True)
+            _dump_name = f"attn_h{self.head_size}_nheads{self.num_heads}_nkv{self.num_kv_heads}_state{attn_metadata.attn_state.name}_ntok{query.shape[0]}.pt"
+            _dump_path = _os.path.join(_dump_dir, _dump_name)
+            _dump = {
+                "query_shape": tuple(query.shape),
+                "query_mean": query.mean().item(), "query_std": query.std().item(),
+                "output_shape": tuple(output.shape),
+                "output_mean": output.mean().item(), "output_std": output.std().item(),
+                "attn_state": attn_metadata.attn_state.name,
+                "num_heads": self.num_heads, "num_kv_heads": self.num_kv_heads,
+                "head_size": self.head_size, "scale": self.scale,
+                "kv_sharing_target": getattr(self, 'kv_sharing_target_layer_name', None),
+                "num_actual_tokens": getattr(attn_metadata, 'num_actual_tokens', None),
+                "causal": getattr(attn_metadata, 'causal', None),
+                "seq_lens": getattr(attn_metadata, 'seq_lens', None).cpu().tolist() if getattr(attn_metadata, 'seq_lens', None) is not None else None,
+            }
+            torch.save(_dump, _dump_path)
+            import sys
+            print(f"[ATTENTION-DUMP] {_dump_path}", file=sys.stderr, flush=True)
+
         return output
 
     def forward(
