@@ -1468,14 +1468,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
         sparse_mode = 4 if self.sliding_window is not None else 3 if actual_causal else 0
         pre_tokens = self.sliding_window if self.sliding_window is not None else SWA_INT_MAX
         next_tokens = 0 if actual_causal or self.sliding_window is not None else SWA_INT_MAX
-        attn_mask = attn_metadata.attn_mask
-        if attn_mask is not None:
-            # FIA with TND layout requires attn_mask shape [max_qlen, max_kvlen].
-            # The mask may be pre-allocated to [2048, 2048] — slice to actual sizes.
-            if attn_mask.dim() == 2:
-                attn_mask = attn_mask[:num_tokens, :shared_key.shape[0]]
-            if attn_mask.dtype not in (torch.bool, torch.uint8):
-                attn_mask = attn_mask.bool()
+        # Cross-attention to shared target KV: all KV entries are from past
+        # target tokens, so no causal mask is needed. Use attn_mask=None
+        # to let FIA determine masking from actual_seq_qlen/kvlen alone.
+        # Passing the pre-allocated [2048,2048] mask can cause FIA errors
+        # when actual_seq_qlen differs from actual_seq_kvlen.
+        attn_mask = None
         import sys
         _kv_share_tgt = getattr(self, '_kv_share_target_impl', None)
         if _kv_share_tgt is not None:
