@@ -1648,7 +1648,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             and key is not None
             and value is not None
             and query.shape[0] == key.shape[0]
-            and attn_metadata.attn_state in (AscendAttentionState.PrefillNoCache, AscendAttentionState.ChunkedPrefill)
+            and attn_metadata.attn_state in (AscendAttentionState.PrefillNoCache, AscendAttentionState.ChunkedPrefill, AscendAttentionState.SpecDecoding)
         ):
             # Try slot_mapping-based lookup first (needed when the
             # same request's target K/V are at known cache slots).
