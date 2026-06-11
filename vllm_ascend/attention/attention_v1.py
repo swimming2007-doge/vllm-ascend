@@ -1660,15 +1660,20 @@ class AscendAttentionBackendImpl(AttentionImpl):
             )
             # Fallback: if the retrieved KV is all zeros and per-group
             # block_tables are available (set by AscendGemma4Proposer),
-            # try each group's block_table to find the correct one.
+            # try the correct group's block_table first, then fall back
+            # to iterating all groups.
             _k_mean = dense_key.float().mean().item()
             _per_group_bt = getattr(self, '_per_group_bt_ref', None)
             if abs(_k_mean) < 1e-6 and _per_group_bt is not None and len(_per_group_bt) > 0:
                 import sys as _sys_fb
-                _sys_fb.stderr.write("[ATTENTION-BLOCKTABLE-FALLBACK] k_mean=%.6f trying per_group_block_tables (%d entries)\n" % (_k_mean, len(_per_group_bt)))
+                _my_gid = getattr(self, '_kv_share_gid', None)
+                _sys_fb.stderr.write("[ATTENTION-BLOCKTABLE-FALLBACK] k_mean=%.6f my_gid=%s trying per_group_block_tables (%d entries)\n" % (_k_mean, str(_my_gid), len(_per_group_bt)))
                 _sys_fb.stderr.flush()
-                for _gid, _bt in _per_group_bt.items():
+                # Try correct gid first
+                _found = False
+                if _my_gid is not None and _my_gid in _per_group_bt:
                     try:
+                        _bt = _per_group_bt[_my_gid]
                         _dk, _dv = self._gather_paged_kv_to_dense(
                             read_kc, read_vc, _bt, seq_lens,
                         )
@@ -1676,11 +1681,29 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         if abs(_km) > 1e-6:
                             dense_key, dense_value = _dk, _dv
                             block_table = _bt
-                            _sys_fb.stderr.write("[ATTENTION-BLOCKTABLE-FALLBACK] gid=%d FOUND non-zero k_mean=%.4f block_table[0,0]=%d\n" % (_gid, _km, int(_bt[0,0].item()) if _bt.numel() > 0 else -1))
+                            _found = True
+                            _sys_fb.stderr.write("[ATTENTION-BLOCKTABLE-FALLBACK] CORRECT gid=%d FOUND non-zero k_mean=%.4f block_table[0,0]=%d\n" % (_my_gid, _km, int(_bt[0,0].item()) if _bt.numel() > 0 else -1))
                             _sys_fb.stderr.flush()
-                            break
                     except Exception:
-                        continue
+                        pass
+                # If correct gid didn't work, try all others
+                if not _found:
+                    for _gid, _bt in _per_group_bt.items():
+                        if _gid == _my_gid:
+                            continue
+                        try:
+                            _dk, _dv = self._gather_paged_kv_to_dense(
+                                read_kc, read_vc, _bt, seq_lens,
+                            )
+                            _km = _dk.float().mean().item()
+                            if abs(_km) > 1e-6:
+                                dense_key, dense_value = _dk, _dv
+                                block_table = _bt
+                                _sys_fb.stderr.write("[ATTENTION-BLOCKTABLE-FALLBACK] gid=%d FOUND non-zero k_mean=%.4f block_table[0,0]=%d\n" % (_gid, _km, int(_bt[0,0].item()) if _bt.numel() > 0 else -1))
+                                _sys_fb.stderr.flush()
+                                break
+                        except Exception:
+                            continue
             import sys
             _kv_tgt = getattr(self, 'kv_sharing_target_layer_name', None)
             _swapped = (_tgt_impl is not None and _tgt_impl.key_cache is not None)

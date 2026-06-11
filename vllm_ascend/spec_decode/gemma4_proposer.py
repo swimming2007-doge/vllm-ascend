@@ -249,12 +249,38 @@ class AscendGemma4Proposer(_VllmGemma4Proposer, AscendSpecDecodeBaseProposer):
                 if getattr(mtp_attn, "num_heads", None) != tgt_nh:
                     object.__setattr__(mtp_attn, "num_heads", tgt_nh)
 
+    # ---- _store_gids_on_impls ----------------------------------------------
+    # After initialize_attn_backend and _fix_draft_kv_head_counts have both
+    # run, store the kv_cache_group_id on each draft attention backend impl
+    # so that _get_shared_kv_from_block_table can find the correct
+    # block_table for this layer's KV cache group.
+    def _store_gids_on_impls(self) -> None:
+        """Store kv_cache_group_id on each draft attention backend impl."""
+        if not hasattr(self, 'draft_attn_groups'):
+            return
+        draft_attn_layers = get_layers_from_vllm_config(
+            self.vllm_config, AttentionLayerBase,
+        )
+        for ag in self.draft_attn_groups:
+            gid = ag.kv_cache_group_id
+            for ln in ag.layer_names:
+                layer = draft_attn_layers.get(ln)
+                if layer is not None:
+                    impl = getattr(layer, 'impl', None)
+                    if impl is not None:
+                        object.__setattr__(impl, '_kv_share_gid', gid)
+
     # ---- load_model --------------------------------------------------------
     # We need BOTH:
     #   a) Ascend's load_model (loads draft model, identifies draft layers,
     #      shares embeddings, handles multimodality, etc.)
     #   b) Gemma4's _setup_gemma4_kv_sharing (wires kv_sharing_target_layer_name
     #      on each draft attention layer)
+
+    def initialize_attn_backend(self, kv_cache_config, kernel_block_sizes=None):
+        """Override to store per-layer gid on each draft attention backend."""
+        super().initialize_attn_backend(kv_cache_config, kernel_block_sizes)
+        self._store_gids_on_impls()
 
     def load_model(self, target_model):
         target_attn_layer_names = set(
