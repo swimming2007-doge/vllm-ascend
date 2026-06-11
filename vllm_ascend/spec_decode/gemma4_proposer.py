@@ -258,17 +258,32 @@ class AscendGemma4Proposer(_VllmGemma4Proposer, AscendSpecDecodeBaseProposer):
         """Store kv_cache_group_id on each draft attention backend impl."""
         if not hasattr(self, 'draft_attn_groups'):
             return
-        draft_attn_layers = get_layers_from_vllm_config(
-            self.vllm_config, AttentionLayerBase,
-        )
+        # Walk the draft model's layers to find attention impls and match
+        # them to attention groups by layer name.
+        draft_model = self.get_model()
+        if not (hasattr(draft_model, 'model') and hasattr(draft_model.model, 'layers')):
+            return
+        # Build gid lookup from attention group layer names
+        ln_to_gid = {}
         for ag in self.draft_attn_groups:
-            gid = ag.kv_cache_group_id
             for ln in ag.layer_names:
-                layer = draft_attn_layers.get(ln)
-                if layer is not None:
-                    impl = getattr(layer, 'impl', None)
-                    if impl is not None:
-                        object.__setattr__(impl, '_kv_share_gid', gid)
+                ln_to_gid[ln] = ag.kv_cache_group_id
+        # Walk draft model layers
+        for draft_idx, layer in enumerate(draft_model.model.layers):
+            attn_layer = getattr(layer, 'self_attn', None)
+            if attn_layer is None:
+                continue
+            attn = getattr(attn_layer, 'attn', None)
+            if attn is None:
+                continue
+            impl = getattr(attn, 'impl', None)
+            if impl is None:
+                continue
+            # Match by layer name patterns
+            for ln, gid in ln_to_gid.items():
+                if f"layers.{draft_idx}.self_attn" in ln:
+                    object.__setattr__(impl, '_kv_share_gid', gid)
+                    break
 
     # ---- load_model --------------------------------------------------------
     # We need BOTH:
