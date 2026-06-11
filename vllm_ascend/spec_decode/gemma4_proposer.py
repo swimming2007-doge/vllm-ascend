@@ -211,6 +211,10 @@ class AscendGemma4Proposer(_VllmGemma4Proposer, AscendSpecDecodeBaseProposer):
                         "target '%s' key_cache at runtime.",
                         draft_idx, tgt_name,
                     )
+                # Store a reference to the per_group_block_tables dict
+                # so that _get_shared_kv_from_block_table can use the
+                # correct block_table for this KV cache group.
+                object.__setattr__(impl, "_per_group_bt_ref", self._per_group_block_tables)
 
             if draft_nkv != tgt_nkv or draft_nh != tgt_nh:
                 logger.info(
