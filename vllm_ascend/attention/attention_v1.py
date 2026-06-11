@@ -1776,6 +1776,15 @@ class AscendAttentionBackendImpl(AttentionImpl):
     ):
         num_tokens = query.shape[0]
 
+        # ── DIAGNOSTIC: print block_tables content for head_size=512 layers ──
+        import sys as _sys_fi
+        if self.head_size == 512 and attn_metadata is not None:
+            _bt = attn_metadata.block_tables
+            _bt_id0 = int(_bt[0,0].item()) if _bt is not None and _bt.numel() > 0 else -1
+            _bt_shape = _bt.shape if _bt is not None else 'None'
+            _sys_fi.stderr.write("[ATTENTION-IMPL-META] head_size=%d kv_share=%s block_tables[0,0]=%d bt_shape=%s\n" % (self.head_size, str(getattr(self, 'kv_sharing_target_layer_name', None)), _bt_id0, str(_bt_shape)))
+            _sys_fi.stderr.flush()
+
         # ── DIAGNOSTIC: print for ALL draft model attention calls ──
         _kv_share_tgt = getattr(self, 'kv_sharing_target_layer_name', None)
         import sys
