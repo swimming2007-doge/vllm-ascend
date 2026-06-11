@@ -708,9 +708,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         common_attn_metadata.query_start_loc = self.query_start_loc_group[0][: num_reqs_padded + 1]
 
         common_attn_metadata.num_input_tokens = num_input_tokens
-        # FIXME(woosuk): The below two ops cause synchronization. Optimize.
+        # Build per-group attention metadata for the first speculative step.
+        # Gemma4 has multiple KV cache groups (sliding vs full attention) with
+        # different block tables.  Each draft attention group must receive its
+        # own block_table to read the correct KV cache.
         assert len(self.draft_attn_groups) > 0
-        builder = self.draft_attn_groups[0].get_metadata_builder()
         extra_attn_metadata_args: dict = {}
         if self.use_compress:
             extra_attn_metadata_args = dict(
@@ -719,19 +721,38 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 common_ratio_to_sas_metadata=dict(),
                 block_size=self.draft_attn_groups[0].kv_cache_spec.block_size,
             )
-        attn_metadata = builder.build(0, common_attn_metadata, self.runner.get_model(), **extra_attn_metadata_args)
-
-        if hasattr(attn_metadata, "causal") and not attn_metadata.causal:
-            attn_metadata.attn_mask = None
+        per_layer_attn_metadata = dict()
+        import sys as _sys_bt
+        _tables = getattr(self, "_per_group_block_tables", {})
+        _bt_keys = list(_tables.keys())
+        _sys_bt.stderr.write("[BLOCKTABLE-FIRST-STEP] num_groups=%d bt_gids=%s num_tables=%d\n" % (len(self.draft_attn_groups), str(_bt_keys), len(_tables)))
+        for _gid, _bt in _tables.items():
+            _bt_id0 = int(_bt[0,0].item()) if _bt is not None and _bt.numel() > 0 else -1
+            _sys_bt.stderr.write("[BLOCKTABLE-FIRST-STEP] gid=%d block0=%d\n" % (_gid, _bt_id0))
+        _sys_bt.stderr.flush()
+        for attn_group in self.draft_attn_groups:
+            gid = attn_group.kv_cache_group_id
+            # Swap in the correct block_table for this group.
+            # gpu_model_runner calls set_per_group_block_table() for each
+            # group, so _per_group_block_tables[gid] is the target model's
+            # block_table for this KV cache group.
+            if hasattr(self, '_per_group_block_tables') and gid in self._per_group_block_tables:
+                from copy import copy as _copy
+                cm = _copy(common_attn_metadata)
+                cm.block_table_tensor = self._per_group_block_tables[gid]
+            else:
+                cm = common_attn_metadata
+            builder = attn_group.get_metadata_builder()
+            attn_metadata = builder.build(0, cm, self.runner.get_model(), **extra_attn_metadata_args)
+            if hasattr(attn_metadata, "causal") and not attn_metadata.causal:
+                attn_metadata.attn_mask = None
+            for layer_name in attn_group.layer_names:
+                per_layer_attn_metadata[layer_name] = attn_metadata
 
         if self.uses_mrope:
             used_update_positions = self.mrope_positions[:, token_indices_to_sample]
         else:
             used_update_positions = self.positions[token_indices_to_sample]
-        per_layer_attn_metadata = dict()
-        # The first step of speculative.
-        for layer_name in self.attn_layer_names:
-            per_layer_attn_metadata[layer_name] = attn_metadata
         multi_steps_attn_metadata = [per_layer_attn_metadata]
 
         # Copy the old attn_metadata and update

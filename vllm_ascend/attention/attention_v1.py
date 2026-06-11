@@ -1632,8 +1632,22 @@ class AscendAttentionBackendImpl(AttentionImpl):
         Used when slot_mapping is not available (e.g., during speculative
         decoding where the draft model inherits attn_metadata from the
         target but slot_mapping may not be populated for draft layers).
+
+        IMPORTANT: For KV-sharing draft layers, self.key_cache points to the
+        draft model's own (empty) cache.  We must swap to the target layer's
+        cache via _kv_share_target_impl, mirroring the PA path fix.
         """
-        if self.key_cache is None or self.value_cache is None:
+        # Swap to target cache when KV-sharing (mirrors PA path fix in
+        # forward_paged_attention).
+        _tgt_impl = getattr(self, '_kv_share_target_impl', None)
+        if _tgt_impl is not None and _tgt_impl.key_cache is not None:
+            read_kc = _tgt_impl.key_cache
+            read_vc = _tgt_impl.value_cache
+        else:
+            read_kc = self.key_cache
+            read_vc = self.value_cache
+
+        if read_kc is None or read_vc is None:
             return None, None
         block_table = attn_metadata.block_tables
         seq_lens = attn_metadata.seq_lens_list
@@ -1642,15 +1656,32 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
         try:
             dense_key, dense_value = self._gather_paged_kv_to_dense(
-                self.key_cache, self.value_cache, block_table, seq_lens,
+                read_kc, read_vc, block_table, seq_lens,
             )
             import sys
             _kv_tgt = getattr(self, 'kv_sharing_target_layer_name', None)
+            _swapped = (_tgt_impl is not None and _tgt_impl.key_cache is not None)
+            _kc_shape = read_kc.shape if read_kc is not None else 'N/A'
+            _self_kc_id = id(self.key_cache) if self.key_cache is not None else 'N/A'
+            _read_kc_id = id(read_kc)
             print(f"[ATTENTION-BLOCKTABLE] key_shape={dense_key.shape} val_shape={dense_value.shape} "
                   f"k_mean={dense_key.float().mean().item():.4f} v_mean={dense_value.float().mean().item():.4f} "
                   f"seq_lens={seq_lens} block_table={block_table[:2].tolist() if block_table.numel() > 0 else 'empty'} "
-                  f"kv_target={_kv_tgt}",
+                  f"kv_target={_kv_tgt} head_size={self.head_size} num_kv_heads={self.num_kv_heads} "
+                  f"swapped_to_target={_swapped}",
                   file=sys.stderr, flush=True)
+            print(f"[ATTENTION-BLOCKTABLE-CACHE] self.kc_id={_self_kc_id} read_kc_id={_read_kc_id} "
+                  f"kc_shape={_kc_shape} swapped={_swapped} "
+                  f"kv_share_target_layer={_kv_tgt}",
+                  file=sys.stderr, flush=True)
+            # Check raw cache at first block
+            _bt = block_table[:1, :1].long().flatten()
+            if read_kc is not None and _bt.numel() > 0:
+                _block_id = _bt[0].item()
+                _block_data = read_kc[_block_id].float()
+                print(f"[ATTENTION-BLOCKTABLE-RAW] block[{_block_id}] k_mean={_block_data.mean().item():.6f} "
+                      f"k_absmax={_block_data.abs().max().item():.6f} k_shape={read_kc[_block_id].shape}",
+                      file=sys.stderr, flush=True)
             return dense_key, dense_value
         except Exception:
             return None, None
@@ -1668,6 +1699,20 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
         if self.key_cache is None:
             self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
+
+        # ── DIAGNOSTIC: log KV writes for head_size=512 (global attn) layers ──
+        import sys
+        _kv_share = getattr(self, 'kv_sharing_target_layer_name', None)
+        if self.head_size == 512:
+            _slot_ids = slot_mapping[:10].tolist() if slot_mapping.numel() >= 10 else slot_mapping.tolist()
+            print(f"[KV-CACHE-WRITE] head_size={self.head_size} num_kv_heads={self.num_kv_heads} "
+                  f"key_mean={key.float().mean().item():.4f} val_mean={value.float().mean().item():.4f} "
+                  f"key_shape={key.shape} val_shape={value.shape} "
+                  f"kc_shape={self.key_cache.shape if self.key_cache is not None else 'None'} "
+                  f"kc_id={id(self.key_cache) if self.key_cache is not None else 'None'} "
+                  f"slots={_slot_ids} kv_share_target={_kv_share} "
+                  f"is_kv_producer={getattr(self, 'is_kv_producer', 'N/A')}",
+                  file=sys.stderr, flush=True)
 
         DeviceOperator.reshape_and_cache(
             key=key,
@@ -1700,6 +1745,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 return query, key, value, output
             slots = attn_metadata.slot_mapping
             encoder_decoder = self.attn_type == AttentionType.ENCODER_DECODER
+            # DIAGNOSTIC: log KV writes for head_size=512 (global attn) layers
+            import sys as _sys_diag
+            if self.head_size == 512:
+                _slot_ids = slots[:10].tolist() if slots.numel() >= 10 else slots.tolist()
+                _is_draft = _EXTRA_CTX.is_draft_model if hasattr(_EXTRA_CTX, 'is_draft_model') else 'N/A'
+                _sys_diag.stderr.write(f"[KV-CACHE-WRITE-RC] head_size={self.head_size} num_kv_heads={self.num_kv_heads} key_mean={key.float().mean().item():.4f} val_mean={value.float().mean().item():.4f} key_shape={key.shape} val_shape={value.shape} kc_shape={self.key_cache.shape if self.key_cache is not None else 'None'} slots={_slot_ids} is_draft={_is_draft} kv_share_target={getattr(self, 'kv_sharing_target_layer_name', None)} layer={getattr(self, '_layer_name', 'N/A')}\n")
+                _sys_diag.stderr.flush()
             DeviceOperator.reshape_and_cache(
                 key=key[: attn_metadata.num_actual_tokens] if not encoder_decoder else key,
                 value=value[: attn_metadata.num_actual_tokens] if not encoder_decoder else value,

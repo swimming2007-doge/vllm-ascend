@@ -78,6 +78,45 @@ class AscendGemma4Proposer(_VllmGemma4Proposer, AscendSpecDecodeBaseProposer):
     def model_returns_tuple(self) -> bool:
         return True
 
+    # ---- build_per_group_and_layer_attn_metadata ----------------------------
+    # Override to add diagnostics for multi-group block table assignment.
+
+    def build_per_group_and_layer_attn_metadata(
+        self,
+        common_attn_metadata,
+        draft_index: int = 0,
+    ):
+        import sys
+        from copy import copy
+
+        per_group_attn_metadata: list[object] = []
+        per_layer_attn_metadata: dict[str, object] = {}
+        for attn_group in self.draft_attn_groups:
+            gid = attn_group.kv_cache_group_id
+            if gid in self._per_group_block_tables:
+                cm = copy(common_attn_metadata)
+                cm.block_table_tensor = self._per_group_block_tables[gid]
+                _bt = cm.block_table_tensor
+                _bt_info = _bt[:2].tolist() if _bt is not None and _bt.numel() > 0 else 'empty'
+            else:
+                cm = common_attn_metadata
+                _bt_info = 'FALLBACK-common'
+            attn_metadata = attn_group.get_metadata_builder().build_for_drafting(
+                common_attn_metadata=cm, draft_index=draft_index
+            )
+            per_group_attn_metadata.append(attn_metadata)
+            for layer_name in attn_group.layer_names:
+                per_layer_attn_metadata[layer_name] = attn_metadata
+            # Diagnostic: log group-level block_table assignment
+            _kv_spec = getattr(attn_group, 'kv_cache_spec', None)
+            _spec_block_size = getattr(_kv_spec, 'block_size', 'N/A') if _kv_spec is not None else 'N/A'
+            print(f"[BLOCKTABLE-GROUP] gid={gid} layers={attn_group.layer_names[:3]}... "
+                  f"block_table={_bt_info} spec_block_size={_spec_block_size} "
+                  f"in_tables={gid in self._per_group_block_tables} "
+                  f"num_groups={len(self.draft_attn_groups)}",
+                  file=sys.stderr, flush=True)
+        return per_group_attn_metadata, per_layer_attn_metadata
+
     # ---- _maybe_share_lm_head ----------------------------------------------
     # Gemma4 MTP's lm_head operates in draft hidden_size (e.g. 1024),
     # not the target's backbone hidden_size (e.g. 5376).  Sharing
