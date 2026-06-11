@@ -1459,10 +1459,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
         import sys
         import torch.nn.functional as F
         num_tokens = attn_metadata.actual_seq_lengths_q[-1]
-        # Slice to actual query tokens
-        q = query[:num_tokens]  # [T, H, D]  T=num_tokens, H=num_heads
-        k = shared_key            # [S, Hkv, D]
-        v = shared_value          # [S, Hkv, D]
+        # Slice to actual query tokens.
+        # vLLM uses [seq_len, num_heads, head_dim] but PyTorch sdpa in 3D
+        # format requires equal Q/KV sequence lengths.  For cross-attention
+        # (where num_tokens != KV length) we must use 4D format:
+        #   [batch, num_heads, seq_len, head_dim]
+        q = query[:num_tokens]  # [T, H, D]
+        k = shared_key           # [S, Hkv, D]
+        v = shared_value         # [S, Hkv, D]
 
         # For sliding-window layers: create an attention mask that limits
         # each query to its pre_tokens preceding KV positions.  Since all
@@ -1470,10 +1474,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # attention when the KV length is smaller than the window.
         sliding_window = self.sliding_window
         attn_mask = None
+        is_cross_attn = (q.shape[0] != k.shape[0])
         if sliding_window is not None and k.shape[0] > sliding_window:
-            # Create a causal-like mask: query at position i can attend to
-            # KV positions [i+offset-sliding_window, i+offset] where
-            # offset aligns the last query with the last KV.
             S = k.shape[0]
             mask = torch.ones(num_tokens, S, dtype=q.dtype, device=q.device) * float('-inf')
             offset = S - num_tokens
@@ -1488,20 +1490,58 @@ class AscendAttentionBackendImpl(AttentionImpl):
             print(f"[ATTENTION-SHARED-SDPA] query={q.shape} shared_k={k.shape} "
                   f"shared_v={v.shape} num_tokens={num_tokens} "
                   f"sliding_window={sliding_window} num_heads={self.num_heads} "
-                  f"num_kv_heads={self.num_kv_heads} scale={self.scale}",
+                  f"num_kv_heads={self.num_kv_heads} scale={self.scale} "
+                  f"cross_attn={is_cross_attn}",
                   file=sys.stderr, flush=True)
 
-        # PyTorch sdpa handles GQA natively: Q heads = H, KV heads = Hkv.
-        attn_output = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=attn_mask,
-            scale=self.scale,
-        )  # [T, H, D]
+        if is_cross_attn:
+            # 4D format for cross-attention: [B=1, H, L, D]
+            q_4d = q.unsqueeze(0).transpose(1, 2)   # [1, H, T, D]
+            k_4d = k.unsqueeze(0).transpose(1, 2)   # [1, Hkv, S, D]
+            v_4d = v.unsqueeze(0).transpose(1, 2)   # [1, Hkv, S, D]
+            if attn_mask is not None:
+                attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, T, S]
+            attn_output = F.scaled_dot_product_attention(
+                q_4d, k_4d, v_4d,
+                attn_mask=attn_mask,
+                scale=self.scale,
+            )  # [1, H, T, D]
+            attn_output = attn_output.squeeze(0).transpose(0, 1)  # [T, H, D]
+        else:
+            # 3D format ok for self-attention (same Q/KV length)
+            attn_output = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                scale=self.scale,
+            )  # [T, H, D]
 
         if _kv_share_tgt is not None:
             print(f"[ATTENTION-SHARED-SDPA] output shape={attn_output.shape} "
                   f"mean={attn_output.mean().item():.6f} std={attn_output.std().item():.6f}",
                   file=sys.stderr, flush=True)
+            # Reference check: manual matmul vs SDPA (handles GQA)
+            # Only for cross-attention where q_4d, k_4d, v_4d are defined
+            if is_cross_attn and attn_mask is None:
+                try:
+                    _q_ref = q_4d.float()
+                    _k_ref = k_4d.float()
+                    _v_ref = v_4d.float()
+                    n_qk = self.num_heads // max(self.num_kv_heads, 1)
+                    if n_qk > 1:
+                        _k_ref = _k_ref.repeat_interleave(n_qk, dim=1)
+                        _v_ref = _v_ref.repeat_interleave(n_qk, dim=1)
+                    _attn_weights = torch.matmul(_q_ref, _k_ref.transpose(-2, -1)) * self.scale
+                    _attn_weights = torch.softmax(_attn_weights, dim=-1)
+                    _ref_out = torch.matmul(_attn_weights, _v_ref)
+                    _ref_out = _ref_out.squeeze(0).transpose(0, 1).to(attn_output.dtype)
+                    _diff = (attn_output.float() - _ref_out.float()).abs()
+                    print(f"[ATTENTION-SDPA-REF] ref_mean={_ref_out.float().mean().item():.6f} "
+                          f"ref_std={_ref_out.float().std().item():.6f} "
+                          f"max_diff={_diff.max().item():.6f} mean_diff={_diff.mean().item():.6f} "
+                          f"match={torch.allclose(attn_output.float(), _ref_out.float(), atol=1e-2)}",
+                          file=sys.stderr, flush=True)
+                except Exception as e:
+                    print(f"[ATTENTION-SDPA-REF] ERROR: {e}", file=sys.stderr, flush=True)
         output[:num_tokens] = attn_output
         return output
 
@@ -1604,6 +1644,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
             dense_key, dense_value = self._gather_paged_kv_to_dense(
                 self.key_cache, self.value_cache, block_table, seq_lens,
             )
+            import sys
+            _kv_tgt = getattr(self, 'kv_sharing_target_layer_name', None)
+            print(f"[ATTENTION-BLOCKTABLE] key_shape={dense_key.shape} val_shape={dense_value.shape} "
+                  f"k_mean={dense_key.float().mean().item():.4f} v_mean={dense_value.float().mean().item():.4f} "
+                  f"seq_lens={seq_lens} block_table={block_table[:2].tolist() if block_table.numel() > 0 else 'empty'} "
+                  f"kv_target={_kv_tgt}",
+                  file=sys.stderr, flush=True)
             return dense_key, dense_value
         except Exception:
             return None, None
@@ -1677,20 +1724,30 @@ class AscendAttentionBackendImpl(AttentionImpl):
     ):
         num_tokens = query.shape[0]
 
-        # ── DIAGNOSTIC: check KV-sharing setup for MTP draft layers ──
+        # ── DIAGNOSTIC: print for ALL draft model attention calls ──
         _kv_share_tgt = getattr(self, 'kv_sharing_target_layer_name', None)
+        import sys
+        _is_draft = _EXTRA_CTX.is_draft_model
+        _k_shape = key.shape if key is not None else None
+        _v_shape = value.shape if value is not None else None
+        _qk_match = (query.shape[0] == key.shape[0]) if key is not None else False
+        _kc_ok = self.key_cache is not None
+        _vc_ok = self.value_cache is not None
+        _state = attn_metadata.attn_state if attn_metadata is not None else None
+        if _is_draft:
+            print(f"[ATTENTION-ALL] num_tokens={num_tokens} head_size={self.head_size} "
+                  f"kv_heads={self.num_kv_heads} num_heads={self.num_heads} "
+                  f"sw={self.sliding_window} is_draft=True "
+                  f"kv_share_target={_kv_share_tgt} kc_ok={_kc_ok} vc_ok={_vc_ok} "
+                  f"query={query.shape} key={_k_shape} val={_v_shape} qk_match={_qk_match} "
+                  f"state={_state}",
+                  file=sys.stderr, flush=True)
         if _kv_share_tgt is not None:
-            import sys
-            _k_shape = key.shape if key is not None else None
-            _v_shape = value.shape if value is not None else None
-            _qk_match = (query.shape[0] == key.shape[0]) if key is not None else False
-            _kc_ok = self.key_cache is not None
-            _vc_ok = self.value_cache is not None
-            _state = attn_metadata.attn_state if attn_metadata is not None else None
+            _state_name = _state.name if _state is not None else "None"
             print(f"[ATTENTION-KVSHARE] num_tokens={num_tokens} head_size={self.head_size} kv_heads={self.num_kv_heads} num_heads={self.num_heads}", file=sys.stderr, flush=True)
             print(f"[ATTENTION-KVSHARE] kv_share_target={_kv_share_tgt} key_cache_ok={_kc_ok} val_cache_ok={_vc_ok}", file=sys.stderr, flush=True)
             print(f"[ATTENTION-KVSHARE] query.shape={query.shape} key.shape={_k_shape} val.shape={_v_shape} qk_match={_qk_match}", file=sys.stderr, flush=True)
-            print(f"[ATTENTION-KVSHARE] attn_state={_state} key_is_None={key is None} val_is_None={value is None}", file=sys.stderr, flush=True)
+            print(f"[ATTENTION-KVSHARE] attn_state={_state_name} key_is_None={key is None} val_is_None={value is None}", file=sys.stderr, flush=True)
 
         # KV-sharing layers (e.g., Gemma4 MTP draft) read K/V from the
         # target layer's cache.  Ensure self.key_cache / self.value_cache
@@ -1769,6 +1826,37 @@ class AscendAttentionBackendImpl(AttentionImpl):
             _state_name = attn_metadata.attn_state.name if attn_metadata is not None else "None"
             print(f"[ATTENTION-KVSHARE] BRANCH-SELECT: state={_state_name} large_head_fb={use_large_head_fallback} pa_usable={_pa_usable} sliding_window={self.sliding_window}", file=sys.stderr, flush=True)
 
+        # Trace which branch each draft-model layer takes
+        _branch = "UNKNOWN"
+        if (
+            attn_metadata.attn_state in (AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding)
+            and (self.sliding_window is None or self.kv_sharing_target_layer_name is not None)
+            and (_pa_usable or use_large_head_fallback or self.kv_sharing_target_layer_name is not None)
+        ):
+            _branch = "PA"
+        elif (
+            not _EXTRA_CTX.capturing
+            and use_large_head_fallback
+            and self.kv_sharing_target_layer_name is None
+            and key is not None
+            and value is not None
+            and query.shape[0] == key.shape[0]
+            and attn_metadata.attn_state in (AscendAttentionState.PrefillNoCache, AscendAttentionState.ChunkedPrefill, AscendAttentionState.SpecDecoding)
+        ):
+            _branch = "LARGE_HEAD_PREFILL"
+        elif use_large_head_fallback:
+            _branch = "PA_EDGE"
+        else:
+            _branch = "FIA"
+
+        _state_name = attn_metadata.attn_state.name if attn_metadata is not None else "None"
+        print(f"[ATTENTION-BRANCH] is_draft={_is_draft} num_tokens={num_tokens} "
+              f"head_size={self.head_size} sw={self.sliding_window} "
+              f"kv_share={_kv_share_tgt} state={_state_name} "
+              f"large_head_fb={use_large_head_fallback} pa_usable={_pa_usable} "
+              f"-> {_branch}",
+              file=sys.stderr, flush=True)
+
         if (
             attn_metadata.attn_state in (AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding)
             and (self.sliding_window is None or self.kv_sharing_target_layer_name is not None)
@@ -1803,6 +1891,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
         if _kv_share_tgt is not None:
             print(f"[ATTENTION-KVSHARE] OUTPUT: mean={output.mean().item():.6f} std={output.std().item():.6f} shape={output.shape}", file=sys.stderr, flush=True)
+        if _is_draft:
+            print(f"[ATTENTION-OUTPUT] is_draft=True branch={_branch} "
+                  f"output mean={output[:num_tokens].mean().item():.6f} "
+                  f"std={output[:num_tokens].std().item():.6f} "
+                  f"shape={output.shape}",
+                  file=sys.stderr, flush=True)
 
         # ── DEBUG: attention dump for Gemma4 MTP (head_size==512) ──
         import os as _os
@@ -1864,6 +1958,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
         assert layer._k_scale_float == 1.0 and layer._v_scale_float == 1.0
         num_tokens = query.shape[0]
         if attn_metadata is None:
+            import sys
+            _is_draft = _EXTRA_CTX.is_draft_model
+            _kv_tgt = getattr(self, 'kv_sharing_target_layer_name', None)
+            print(f"[ATTENTION-NULL-META] is_draft={_is_draft} num_tokens={num_tokens} "
+                  f"head_size={self.head_size} kv_share={_kv_tgt} "
+                  f"layer_name={getattr(self, '_layer_name', 'N/A')} "
+                  f"-> RETURNING ZEROS",
+                  file=sys.stderr, flush=True)
             return output.fill_(0)
 
         # Initialize key_cache and value_cache from kv_cache if not already set.

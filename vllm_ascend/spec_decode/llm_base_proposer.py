@@ -910,6 +910,17 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 if self.method == "mtp":
                     model_kwargs["positions"] = model_positions
 
+        # Ensure forward_context.attn_metadata covers draft-model layer names
+        # during the merged forward.  The context was set by
+        # set_ascend_forward_context in _propose(), but model-internal
+        # context switches (e.g. Gemma4MTP creating a sub-context for its
+        # backbone hidden-state processing) can reset it before the draft
+        # attention layers run.  Without valid metadata the attention falls
+        # back to all-zeros output and the draft tokens become garbage.
+        _fc = get_forward_context()
+        if _fc is not None and multi_steps_attn_metadata and len(multi_steps_attn_metadata) > 0:
+            _fc.attn_metadata = multi_steps_attn_metadata[0]
+
         ret_hidden_states = self.model(**model_kwargs)
         if not self.model_returns_tuple():
             last_hidden_states = ret_hidden_states
@@ -993,7 +1004,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         hidden_states = hidden_states[token_indices_to_sample]
         token_indices_to_sample = self.arange[:batch_size]
 
-        input_batch_size = num_input_tokens if (self.method == "mtp" or self.use_cuda_graph) else batch_size
+        input_batch_size = num_input_tokens if self.use_cuda_graph else batch_size
 
         # ── DEBUG: MTP sequential loop pre-entry ──
         import sys
@@ -1089,9 +1100,16 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
             model_hidden_states, model_positions = self.maybe_pad_and_reduce(model_hidden_states, model_positions)
 
-            forward_context.attn_metadata = (
-                multi_steps_attn_metadata[draft_step + 1] if multi_steps_attn_metadata else None
-            )
+            _msteps = multi_steps_attn_metadata
+            _step_md = _msteps[draft_step + 1] if _msteps else None
+            forward_context.attn_metadata = _step_md
+            import sys
+            _num_keys = len(_step_md) if isinstance(_step_md, dict) else 'N/A'
+            _sample_keys = list(_step_md.keys())[:3] if isinstance(_step_md, dict) else 'N/A'
+            print(f"[MTP-ASCEND DEBUG] draft_step={draft_step} multi_steps_len={len(_msteps) if _msteps else 0} "
+                  f"step_md_type={type(_step_md).__name__} step_md_keys={_num_keys} "
+                  f"sample={_sample_keys}",
+                  file=sys.stderr, flush=True)
 
             model_kwargs = {
                 "input_ids": model_input_ids,
