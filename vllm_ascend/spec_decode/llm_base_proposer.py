@@ -736,7 +736,17 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # gpu_model_runner calls set_per_group_block_table() for each
             # group, so _per_group_block_tables[gid] is the target model's
             # block_table for this KV cache group.
-            if hasattr(self, '_per_group_block_tables') and gid in self._per_group_block_tables:
+            # DIAGNOSTIC: check per-group block_table assignment
+            import sys as _sys_bt2
+            _bt_found = hasattr(self, '_per_group_block_tables') and gid in self._per_group_block_tables
+            _bt_id0 = 'N/A'
+            if _bt_found:
+                _t = self._per_group_block_tables[gid]
+                _bt_id0 = int(_t[0,0].item()) if _t is not None and _t.numel() > 0 else 'empty'
+            _bt_default_id0 = int(common_attn_metadata.block_table_tensor[0,0].item()) if common_attn_metadata.block_table_tensor is not None and common_attn_metadata.block_table_tensor.numel() > 0 else 'empty'
+            _sys_bt2.stderr.write("[BLOCKTABLE-ASSIGN] gid=%d found=%s per_group_block0=%s default_block0=%s layers=%s\n" % (gid, str(_bt_found), str(_bt_id0), str(_bt_default_id0), str(attn_group.layer_names[:2])))
+            _sys_bt2.stderr.flush()
+            if _bt_found:
                 from copy import copy as _copy
                 cm = _copy(common_attn_metadata)
                 cm.block_table_tensor = self._per_group_block_tables[gid]
