@@ -2018,6 +2018,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
         assert layer._k_scale_float == 1.0 and layer._v_scale_float == 1.0
         num_tokens = query.shape[0]
+        # DIAGNOSTIC: check block_tables at forward() entry for head_size=512
+        import sys as _sys_fwe
+        if self.head_size == 512 and attn_metadata is not None:
+            _bt = attn_metadata.block_tables
+            _bt0 = int(_bt[0,0].item()) if _bt is not None and _bt.numel() > 0 else -1
+            _md_type = type(attn_metadata).__name__
+            _sys_fwe.stderr.write("[ATTENTION-FWD-META] head_size=%d layer=%s block_tables[0,0]=%d md_type=%s bt_shape=%s\n" % (self.head_size, str(getattr(self, '_layer_name', 'N/A')), _bt0, _md_type, str(_bt.shape if _bt is not None else 'None')))
+            _sys_fwe.stderr.flush()
         if attn_metadata is None:
             import sys
             _is_draft = _EXTRA_CTX.is_draft_model
