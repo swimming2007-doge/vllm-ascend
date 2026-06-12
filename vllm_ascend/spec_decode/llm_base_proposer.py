@@ -553,7 +553,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                         num_tokens=num_tokens,
                     )
             forward_context = get_forward_context()
-            if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL and not _EXTRA_CTX.capturing:
+            if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL and not _EXTRA_CTX.capturing and not in_graph_capturing:
                 self._update_full_graph_params(forward_context, num_tokens, multi_steps_attn_metadata)
 
     def _update_full_graph_params_if_needed(
