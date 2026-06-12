@@ -426,7 +426,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 pin_memory=self.runner.pin_memory,
             )
 
-        if (aclgraph_runtime_mode == CUDAGraphMode.FULL or is_profile) and len(self.runner.attn_groups) > 0:
+        if aclgraph_runtime_mode == CUDAGraphMode.FULL and len(self.runner.attn_groups) > 0:
             num_computed_tokens_cpu = self.runner.input_batch.num_computed_tokens_cpu_tensor[:num_reqs]
 
             # num_reqs is already the padded version
@@ -467,17 +467,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 for attn_group in self.draft_attn_groups:
                     builder = attn_group.get_metadata_builder()
                     common_attn_metadata = self.shallow_copy_metadata(common_attn_metadata)
-                    # Populate group tensors with actual values from the
-                    # current metadata.  During profile runs this gives
-                    # torch.compile meaningful seq_lens to trace; during
-                    # graph capture only the tensor *addresses* matter,
-                    # so writing values is harmless.
-                    self.seq_lens_group[draft_step][:num_reqs].copy_(
-                        common_attn_metadata.seq_lens
-                    )
-                    self.query_start_loc_group[draft_step][
-                        : num_reqs + 1
-                    ].copy_(common_attn_metadata.query_start_loc)
                     # Set the real slot_mapping.
                     common_attn_metadata.slot_mapping = self.slot_mapping_group[draft_step]
                     common_attn_metadata.seq_lens = self.seq_lens_group[draft_step][:num_reqs]
