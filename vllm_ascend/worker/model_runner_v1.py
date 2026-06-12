@@ -1281,10 +1281,12 @@ class NPUModelRunner(GPUModelRunner):
         # We assume it is the decode stage, where prefill occurs but only one token is not hit in cache.
         elif np.all(num_scheduled_tokens == 1):
             attn_state = AscendAttentionState.DecodeOnly
-            if self.speculative_config and self.speculative_config.method == "mtp":
-                # SpecDecoding now supports seq_len=1 and seq_len=2
-                # In Prefilling Decoding Disaggregation scenario, SpecDecoding need to supports seq_len=1
-                attn_state = AscendAttentionState.SpecDecoding
+            # NOTE: SpecDecoding state must NOT be used for the target model.
+            # It skips slot_mapping in _get_current_token_shared_kv (line 1870
+            # of attention_v1.py), forcing the block_table fallback path that is
+            # designed for draft model KV-sharing layers reading from the target
+            # cache.  The target model needs the normal DecodeOnly path with
+            # correct slot_mapping to produce valid logits for verification.
         # Speculative decoding.
         elif np.all(num_valid_tokens == 1):
             if self.speculative_config:
