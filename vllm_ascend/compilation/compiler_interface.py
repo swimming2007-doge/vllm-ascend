@@ -76,13 +76,14 @@ def npugraph_ex_compile(
     compile_range: Range,
     key: str | None = None,
 ) -> tuple[Callable | None, Any | None]:
-    import sys
     import torchair
 
-    if torch.npu.is_current_stream_capturing():
-        print("[NPUGRAPH-EX] stream is being captured — skipping "
-              "set_compile_mode (sync would crash)", file=sys.stderr, flush=True)
-    else:
+    # During NPU graph capture, synchronize() is illegal — it would fail
+    # with "stream is captured" (error 107027).  When the draft model
+    # triggers its first torch.compile inside a graph-capture region,
+    # skip set_compile_mode — the target model's compilation already
+    # called it earlier, so the mode is already correct.
+    if not torch.npu.is_current_stream_capturing():
         torch.npu.set_compile_mode(jit_compile=False)
     config = torchair.CompilerConfig()
     # use aclgraph mode, avoid the transformation from fx graph to Ascend IR.

@@ -426,12 +426,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 pin_memory=self.runner.pin_memory,
             )
 
-        import sys
-        print(f"[MTP-DEBUG] dummy_run: is_profile={is_profile}, "
-              f"aclgraph_runtime_mode={aclgraph_runtime_mode}, "
-              f"use_cuda_graph={self.use_cuda_graph}, "
-              f"len(attn_groups)={len(self.runner.attn_groups)}, "
-              f"len(draft_attn_groups)={len(self.draft_attn_groups)}", file=sys.stderr, flush=True)
         if (aclgraph_runtime_mode == CUDAGraphMode.FULL or is_profile) and len(self.runner.attn_groups) > 0:
             num_computed_tokens_cpu = self.runner.input_batch.num_computed_tokens_cpu_tensor[:num_reqs]
 
@@ -468,9 +462,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
             assert len(self.draft_attn_groups) > 0
             # update the tensor's address for each step.
-            print(f"[MTP-DEBUG] building multi_steps_attn_metadata: "
-                  f"is_profile={is_profile}, num_steps={self.num_speculative_tokens}, "
-                  f"num_reqs={num_reqs}", file=sys.stderr, flush=True)
             for draft_step in range(self.num_speculative_tokens):
                 per_layer_attn_metadata = dict()
                 for attn_group in self.draft_attn_groups:
@@ -545,10 +536,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # entirely in this case — the dummy_run warmup doesn't need
             # draft output in eager mode.
             if multi_steps_attn_metadata:
-                print(f"[MTP-DEBUG] calling _runnable: is_profile={is_profile}, "
-                      f"aclgraph_runtime_mode={aclgraph_runtime_mode}, "
-                      f"num_tokens={num_tokens}, batch_size={batch_size}",
-                      file=sys.stderr, flush=True)
                 self._runnable(
                     num_input_tokens=num_tokens,
                     batch_size=batch_size,
