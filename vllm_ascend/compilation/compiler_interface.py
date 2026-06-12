@@ -76,9 +76,14 @@ def npugraph_ex_compile(
     compile_range: Range,
     key: str | None = None,
 ) -> tuple[Callable | None, Any | None]:
+    import sys
     import torchair
 
-    torch.npu.set_compile_mode(jit_compile=False)
+    if torch.npu.is_current_stream_capturing():
+        print("[NPUGRAPH-EX] stream is being captured — skipping "
+              "set_compile_mode (sync would crash)", file=sys.stderr, flush=True)
+    else:
+        torch.npu.set_compile_mode(jit_compile=False)
     config = torchair.CompilerConfig()
     # use aclgraph mode, avoid the transformation from fx graph to Ascend IR.
     config.mode = "reduce-overhead"

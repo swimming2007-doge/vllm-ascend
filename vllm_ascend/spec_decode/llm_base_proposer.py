@@ -468,6 +468,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
             assert len(self.draft_attn_groups) > 0
             # update the tensor's address for each step.
+            print(f"[MTP-DEBUG] building multi_steps_attn_metadata: "
+                  f"is_profile={is_profile}, num_steps={self.num_speculative_tokens}, "
+                  f"num_reqs={num_reqs}", file=sys.stderr, flush=True)
             for draft_step in range(self.num_speculative_tokens):
                 per_layer_attn_metadata = dict()
                 for attn_group in self.draft_attn_groups:
@@ -542,6 +545,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # entirely in this case — the dummy_run warmup doesn't need
             # draft output in eager mode.
             if multi_steps_attn_metadata:
+                print(f"[MTP-DEBUG] calling _runnable: is_profile={is_profile}, "
+                      f"aclgraph_runtime_mode={aclgraph_runtime_mode}, "
+                      f"num_tokens={num_tokens}, batch_size={batch_size}",
+                      file=sys.stderr, flush=True)
                 self._runnable(
                     num_input_tokens=num_tokens,
                     batch_size=batch_size,
