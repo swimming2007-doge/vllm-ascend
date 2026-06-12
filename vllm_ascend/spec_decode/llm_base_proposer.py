@@ -426,6 +426,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 pin_memory=self.runner.pin_memory,
             )
 
+        import sys
+        print(f"[MTP-DEBUG] dummy_run: is_profile={is_profile}, "
+              f"aclgraph_runtime_mode={aclgraph_runtime_mode}, "
+              f"use_cuda_graph={self.use_cuda_graph}, "
+              f"len(attn_groups)={len(self.runner.attn_groups)}, "
+              f"len(draft_attn_groups)={len(self.draft_attn_groups)}", file=sys.stderr, flush=True)
         if (aclgraph_runtime_mode == CUDAGraphMode.FULL or is_profile) and len(self.runner.attn_groups) > 0:
             num_computed_tokens_cpu = self.runner.input_batch.num_computed_tokens_cpu_tensor[:num_reqs]
 
