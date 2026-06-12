@@ -13,10 +13,7 @@ import torch_npu
 import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphOptions
-from vllm.compilation.monitor import (
-    cudagraph_capturing_enabled,
-    validate_cudagraph_capturing_enabled,
-)
+from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import logger
@@ -131,7 +128,10 @@ class ACLGraphWrapper:
         entry = self.concrete_aclgraph_entries[batch_descriptor]
 
         if entry.aclgraph is None:
-            if not cudagraph_capturing_enabled():
+            # Check the live value of the module-level flag (it changes
+            # after capture_model completes).
+            from vllm.compilation import monitor as _monitor_mod
+            if not _monitor_mod.cudagraph_capturing_enabled:
                 # Capture was disabled (e.g. post-init inference).
                 # The draft model's graph was intentionally skipped
                 # during init to avoid nested captures.  Fall back
