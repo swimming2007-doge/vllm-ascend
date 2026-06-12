@@ -525,16 +525,33 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # entirely in this case — the dummy_run warmup doesn't need
             # draft output in eager mode.
             if multi_steps_attn_metadata:
-                self._runnable(
-                    num_input_tokens=num_tokens,
-                    batch_size=batch_size,
-                    token_indices_to_sample=self.token_indices_to_sample[: batch_size * self.extra_slots_per_request],
-                    # The target_position's address is same as the model_positions's
-                    target_positions=model_positions,
-                    inputs_embeds=inputs_embeds,
-                    multi_steps_attn_metadata=multi_steps_attn_metadata,
-                    num_tokens=num_tokens,
-                )
+                # During the outer NPU graph capture (target model),
+                # a nested NPU graph capture (draft model) corrupts the
+                # workspace allocation of the outer graph, causing
+                # aclnnFusedInferAttentionScoreV3 workspace errors.
+                # Run eagerly in that case; the draft model's own graph
+                # will be captured on the first inference request.
+                if in_graph_capturing:
+                    self._run_merged_draft(
+                        num_input_tokens=num_tokens,
+                        batch_size=batch_size,
+                        token_indices_to_sample=self.token_indices_to_sample[: batch_size * self.extra_slots_per_request],
+                        target_positions=model_positions,
+                        inputs_embeds=inputs_embeds,
+                        multi_steps_attn_metadata=multi_steps_attn_metadata,
+                        num_tokens=num_tokens,
+                    )
+                else:
+                    self._runnable(
+                        num_input_tokens=num_tokens,
+                        batch_size=batch_size,
+                        token_indices_to_sample=self.token_indices_to_sample[: batch_size * self.extra_slots_per_request],
+                        # The target_position's address is same as the model_positions's
+                        target_positions=model_positions,
+                        inputs_embeds=inputs_embeds,
+                        multi_steps_attn_metadata=multi_steps_attn_metadata,
+                        num_tokens=num_tokens,
+                    )
             forward_context = get_forward_context()
             if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL and not _EXTRA_CTX.capturing:
                 self._update_full_graph_params(forward_context, num_tokens, multi_steps_attn_metadata)
