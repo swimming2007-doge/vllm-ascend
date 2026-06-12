@@ -2078,10 +2078,24 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
         output_padded = None
         if key is not None and value is not None:
-            output_padded = output
-            query, key, value, output_padded = self.reshape_and_cache(
-                query, key, value, kv_cache, attn_metadata, output
+            # Gemma4 MTP draft layers are Q-only: K/V come from the shared
+            # target KV cache.  Gemma4MTPAttention.forward() creates a dummy
+            # K/V via torch.empty() and passes it as key/value to self.attn().
+            # Writing this uninitialized memory back via reshape_and_cache
+            # would corrupt the shared target KV cache, causing progressive
+            # degradation across sequential loop steps:
+            #   draft[0] fine (merged fwd), draft[1] occasionally OK (7-13%),
+            #   draft[2-4] always garbage.
+            # Skip the write for draft KV-shared layers — they only READ.
+            _is_draft_kv_share = (
+                getattr(self, 'kv_sharing_target_layer_name', None) is not None
+                and getattr(_EXTRA_CTX, 'is_draft_model', False)
             )
+            if not _is_draft_kv_share:
+                output_padded = output
+                query, key, value, output_padded = self.reshape_and_cache(
+                    query, key, value, kv_cache, attn_metadata, output
+                )
         # pooling model branch
         if attn_metadata.model_runner_type == "pooling" and not attn_metadata.causal:
             attn_output = self._forward_encoder_attention(query, key, value, attn_metadata, output)
