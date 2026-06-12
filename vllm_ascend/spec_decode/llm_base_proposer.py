@@ -517,16 +517,24 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             if forward_context is not None:
                 forward_context.moe_layer_index = 0
 
-            self._runnable(
-                num_input_tokens=num_tokens,
-                batch_size=batch_size,
-                token_indices_to_sample=self.token_indices_to_sample[: batch_size * self.extra_slots_per_request],
-                # The target_position's address is same as the model_positions's
-                target_positions=model_positions,
-                inputs_embeds=inputs_embeds,
-                multi_steps_attn_metadata=multi_steps_attn_metadata,
-                num_tokens=num_tokens,
-            )
+            # In eager mode, multi_steps_attn_metadata is empty because the
+            # FULL-graph metadata construction (lines 429-484) is skipped.
+            # Running the sequential loop with empty metadata would cause
+            # all attention layers to return zeros, corrupting the shared
+            # KV cache for subsequent requests.  Skip the draft model call
+            # entirely in this case — the dummy_run warmup doesn't need
+            # draft output in eager mode.
+            if multi_steps_attn_metadata:
+                self._runnable(
+                    num_input_tokens=num_tokens,
+                    batch_size=batch_size,
+                    token_indices_to_sample=self.token_indices_to_sample[: batch_size * self.extra_slots_per_request],
+                    # The target_position's address is same as the model_positions's
+                    target_positions=model_positions,
+                    inputs_embeds=inputs_embeds,
+                    multi_steps_attn_metadata=multi_steps_attn_metadata,
+                    num_tokens=num_tokens,
+                )
             forward_context = get_forward_context()
             if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL and not _EXTRA_CTX.capturing:
                 self._update_full_graph_params(forward_context, num_tokens, multi_steps_attn_metadata)
@@ -869,6 +877,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                             per_layer_attn_metadata[layer_name] = attn_metadata
                     multi_steps_attn_metadata.append(per_layer_attn_metadata)
 
+        # Trace multi_steps_attn_metadata passage to _run_merged_draft
+        import sys as _sys_ms
+        _sys_ms.stderr.write(f"[DBG-META-BUILT] _propose: multi_steps id={id(multi_steps_attn_metadata)} len={len(multi_steps_attn_metadata)}\n")
+        _sys_ms.stderr.flush()
+
         token_indices_to_sample_len = token_indices_to_sample.shape[0]
         self.token_indices_to_sample[:token_indices_to_sample_len].copy_(token_indices_to_sample)
 
@@ -919,6 +932,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         num_tokens,
         is_prefill=None,
     ) -> torch.Tensor:
+        # Trace multi_steps_attn_metadata at entry
+        import sys as _sys_me
+        _ms_id = id(multi_steps_attn_metadata) if multi_steps_attn_metadata else -1
+        _ms_len = len(multi_steps_attn_metadata) if multi_steps_attn_metadata else 0
+        _sys_me.stderr.write(f"[DBG-MERGE-ENTRY] _run_merged_draft: multi_steps id={_ms_id} len={_ms_len}\n")
+        _sys_me.stderr.flush()
+
         # The lifecycle of `input_ids`, `positions`, `hidden_states` runs through all
         # speculative tokens' proposings. `model_input_ids`, `model_positions` and
         # `model_hidden_states` represent the speculative model inputs.
@@ -1133,6 +1153,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
             _msteps = multi_steps_attn_metadata
             _step_md = _msteps[draft_step + 1] if _msteps else None
+            if _step_md is None:
+                import sys as _sys_skip
+                _sys_skip.stderr.write(f"[MTP-SKIP-STEP] draft_step={draft_step} multi_steps_len={len(_msteps) if _msteps else 0} — skipping step (no metadata)\n")
+                _sys_skip.stderr.flush()
+                # Fill remaining draft slots with the first draft token
+                draft_token_ids_tensor[draft_step + 1:] = draft_token_ids_tensor[draft_step].unsqueeze(0)
+                break
             forward_context.attn_metadata = _step_md
             import sys
             _num_keys = len(_step_md) if isinstance(_step_md, dict) else 'N/A'
