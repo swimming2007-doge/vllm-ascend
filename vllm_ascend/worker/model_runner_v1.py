@@ -2326,12 +2326,12 @@ class NPUModelRunner(GPUModelRunner):
         )
         # ── Diagnose: compare draft vs target greedy tokens ──
         _dt = spec_decode_metadata.draft_token_ids
-        if _dt is not None and logits is not None and _dt.numel() > 0 and _dt.ndim >= 2:
+        if _dt is not None and logits is not None and _dt.numel() > 0:
             import sys as _sys_vf
             _target_greedy = logits.argmax(dim=-1)  # [num_tokens]
-            _num_pos = min(_dt.shape[1], 5)
+            _num_pos = min(_dt.shape[1] if _dt.ndim >= 2 else _dt.shape[0], 5)
             for _pos in range(_num_pos):
-                _draft_tok = _dt[0, _pos].item()
+                _draft_tok = (_dt[0, _pos] if _dt.ndim >= 2 else _dt[_pos]).item()
                 # target greedy at the corresponding logits_indices position
                 _li = spec_decode_metadata.logits_indices
                 if _li is not None and _pos < len(_li):
