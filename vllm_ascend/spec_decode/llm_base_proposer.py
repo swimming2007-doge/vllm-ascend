@@ -730,31 +730,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 block_size=self.draft_attn_groups[0].kv_cache_spec.block_size,
             )
         per_layer_attn_metadata = dict()
-        import sys as _sys_bt
-        _tables = getattr(self, "_per_group_block_tables", {})
-        _bt_keys = list(_tables.keys())
-        _sys_bt.stderr.write("[BLOCKTABLE-FIRST-STEP] num_groups=%d bt_gids=%s num_tables=%d\n" % (len(self.draft_attn_groups), str(_bt_keys), len(_tables)))
-        for _gid, _bt in _tables.items():
-            _bt_id0 = int(_bt[0,0].item()) if _bt is not None and _bt.numel() > 0 else -1
-            _sys_bt.stderr.write("[BLOCKTABLE-FIRST-STEP] gid=%d block0=%d\n" % (_gid, _bt_id0))
-        _sys_bt.stderr.flush()
         for attn_group in self.draft_attn_groups:
             gid = attn_group.kv_cache_group_id
-            # Swap in the correct block_table for this group.
-            # gpu_model_runner calls set_per_group_block_table() for each
-            # group, so _per_group_block_tables[gid] is the target model's
-            # block_table for this KV cache group.
-            # DIAGNOSTIC: check per-group block_table assignment
-            import sys as _sys_bt2
-            _bt_found = hasattr(self, '_per_group_block_tables') and gid in self._per_group_block_tables
-            _bt_id0 = 'N/A'
-            if _bt_found:
-                _t = self._per_group_block_tables[gid]
-                _bt_id0 = int(_t[0,0].item()) if _t is not None and _t.numel() > 0 else 'empty'
-            _bt_default_id0 = int(common_attn_metadata.block_table_tensor[0,0].item()) if common_attn_metadata.block_table_tensor is not None and common_attn_metadata.block_table_tensor.numel() > 0 else 'empty'
-            _sys_bt2.stderr.write("[BLOCKTABLE-ASSIGN] gid=%d found=%s per_group_block0=%s default_block0=%s layers=%s\n" % (gid, str(_bt_found), str(_bt_id0), str(_bt_default_id0), str(attn_group.layer_names[:2])))
-            _sys_bt2.stderr.flush()
-            if _bt_found:
+            if hasattr(self, '_per_group_block_tables') and gid in self._per_group_block_tables:
                 from copy import copy as _copy
                 cm = _copy(common_attn_metadata)
                 cm.block_table_tensor = self._per_group_block_tables[gid]
@@ -877,11 +855,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                             per_layer_attn_metadata[layer_name] = attn_metadata
                     multi_steps_attn_metadata.append(per_layer_attn_metadata)
 
-        # Trace multi_steps_attn_metadata passage to _run_merged_draft
-        import sys as _sys_ms
-        _sys_ms.stderr.write(f"[DBG-META-BUILT] _propose: multi_steps id={id(multi_steps_attn_metadata)} len={len(multi_steps_attn_metadata)}\n")
-        _sys_ms.stderr.flush()
-
         token_indices_to_sample_len = token_indices_to_sample.shape[0]
         self.token_indices_to_sample[:token_indices_to_sample_len].copy_(token_indices_to_sample)
 
@@ -932,13 +905,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         num_tokens,
         is_prefill=None,
     ) -> torch.Tensor:
-        # Trace multi_steps_attn_metadata at entry
-        import sys as _sys_me
-        _ms_id = id(multi_steps_attn_metadata) if multi_steps_attn_metadata else -1
-        _ms_len = len(multi_steps_attn_metadata) if multi_steps_attn_metadata else 0
-        _sys_me.stderr.write(f"[DBG-MERGE-ENTRY] _run_merged_draft: multi_steps id={_ms_id} len={_ms_len}\n")
-        _sys_me.stderr.flush()
-
         # The lifecycle of `input_ids`, `positions`, `hidden_states` runs through all
         # speculative tokens' proposings. `model_input_ids`, `model_positions` and
         # `model_hidden_states` represent the speculative model inputs.
@@ -1057,21 +1023,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         input_batch_size = num_input_tokens if self.use_cuda_graph else batch_size
 
-        # ── DEBUG: MTP sequential loop pre-entry ──
-        import sys
-        _hs_buf = self.hidden_states.shape
-        _tgt_hs = hidden_states.shape  # backbone hidden from merged forward
-        _hs_shape = hidden_states.shape
-        print(f"[MTP-ASCEND DEBUG] === ENTERING SEQUENTIAL LOOP ===", file=sys.stderr, flush=True)
-        print(f"[MTP-ASCEND DEBUG] method={self.method} use_cuda_graph={self.use_cuda_graph} constant_draft_positions={getattr(self, 'constant_draft_positions', False)}", file=sys.stderr, flush=True)
-        print(f"[MTP-ASCEND DEBUG] num_input_tokens={num_input_tokens} batch_size={batch_size} input_batch_size={input_batch_size}", file=sys.stderr, flush=True)
-        print(f"[MTP-ASCEND DEBUG] target_hidden_states.shape={_tgt_hs} hidden_states.shape={_hs_shape}", file=sys.stderr, flush=True)
-        print(f"[MTP-ASCEND DEBUG] self.hidden_states.buffer.shape={_hs_buf} self.hidden_size={self.hidden_size}", file=sys.stderr, flush=True)
-        print(f"[MTP-ASCEND DEBUG] positions after sample={positions.tolist() if positions.numel() <= 5 else positions[:5].tolist()}", file=sys.stderr, flush=True)
-        print(f"[MTP-ASCEND DEBUG] draft[0]={draft_token_ids_tensor[0].tolist()}", file=sys.stderr, flush=True)
-        if _hs_shape[-1] != _hs_buf[-1]:
-            print(f"[MTP-ASCEND DEBUG] ** WARNING ** hidden_states dim {_hs_shape[-1]} != buffer dim {_hs_buf[-1]}", file=sys.stderr, flush=True)
-
         forward_context = get_forward_context()
         _EXTRA_CTX.num_tokens = input_batch_size
         _EXTRA_CTX.num_accept_tokens = batch_size
@@ -1124,13 +1075,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 self._set_positions(batch_size, clamped_positions)
                 self.hidden_states[:batch_size] = hidden_states.view(batch_size, -1)
 
-            # ── DEBUG: loop iteration inputs ──
-            import sys
-            _dbg_pos = self._get_positions(input_batch_size)
-            _dbg_hs = self.hidden_states[:input_batch_size]
-            print(f"[MTP-ASCEND DEBUG] --- loop iter {draft_step} --- token={input_ids.tolist()}", file=sys.stderr, flush=True)
-            print(f"[MTP-ASCEND DEBUG]   positions={_dbg_pos.tolist() if _dbg_pos.numel()<=5 else _dbg_pos[:5].tolist()}", file=sys.stderr, flush=True)
-            print(f"[MTP-ASCEND DEBUG]   input hidden_states mean={_dbg_hs.mean().item():.6f} std={_dbg_hs.std().item():.6f} shape={_dbg_hs.shape}", file=sys.stderr, flush=True)
             if self.supports_mm_inputs:
                 self.inputs_embeds[:batch_size] = self.model.embed_input_ids(input_ids)
 
@@ -1154,20 +1098,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             _msteps = multi_steps_attn_metadata
             _step_md = _msteps[draft_step + 1] if _msteps else None
             if _step_md is None:
-                import sys as _sys_skip
-                _sys_skip.stderr.write(f"[MTP-SKIP-STEP] draft_step={draft_step} multi_steps_len={len(_msteps) if _msteps else 0} — skipping step (no metadata)\n")
-                _sys_skip.stderr.flush()
                 # Fill remaining draft slots with the first draft token
                 draft_token_ids_tensor[draft_step + 1:] = draft_token_ids_tensor[draft_step].unsqueeze(0)
                 break
             forward_context.attn_metadata = _step_md
-            import sys
-            _num_keys = len(_step_md) if isinstance(_step_md, dict) else 'N/A'
-            _sample_keys = list(_step_md.keys())[:3] if isinstance(_step_md, dict) else 'N/A'
-            print(f"[MTP-ASCEND DEBUG] draft_step={draft_step} multi_steps_len={len(_msteps) if _msteps else 0} "
-                  f"step_md_type={type(_step_md).__name__} step_md_keys={_num_keys} "
-                  f"sample={_sample_keys}",
-                  file=sys.stderr, flush=True)
 
             model_kwargs = {
                 "input_ids": model_input_ids,
@@ -1209,17 +1143,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             hidden_states = hidden_states[:batch_size]
             draft_token_ids = logits.argmax(dim=-1)
             draft_token_ids_tensor[draft_step + 1] = draft_token_ids
-
-            # ── DEBUG: loop iteration output ──
-            import sys
-            _topk = min(5, logits.shape[-1])
-            _topk_vals, _topk_ids = torch.topk(logits, _topk, dim=-1)
-            print(f"[MTP-ASCEND DEBUG]   output hidden_states mean={hidden_states.mean().item():.6f} std={hidden_states.std().item():.6f} shape={hidden_states.shape}", file=sys.stderr, flush=True)
-            print(f"[MTP-ASCEND DEBUG]   draft[{draft_step+1}]={draft_token_ids.tolist()}", file=sys.stderr, flush=True)
-            if _topk_vals.numel() <= 5:
-                print(f"[MTP-ASCEND DEBUG]   logits top-{_topk}: vals={_topk_vals.tolist()} ids={_topk_ids.tolist()}", file=sys.stderr, flush=True)
-            else:
-                print(f"[MTP-ASCEND DEBUG]   logits top-{_topk}: vals={_topk_vals[0].tolist()} ids={_topk_ids[0].tolist()}", file=sys.stderr, flush=True)
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = draft_token_ids_tensor.swapaxes(0, 1)
