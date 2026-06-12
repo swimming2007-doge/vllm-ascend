@@ -2326,11 +2326,11 @@ class NPUModelRunner(GPUModelRunner):
         )
         # ── Diagnose: compare draft vs target greedy tokens ──
         _dt = spec_decode_metadata.draft_token_ids
-        if _dt is not None and logits is not None and _dt.numel() > 0:
+        if _dt is not None and logits is not None and _dt.numel() > 0 and _dt.ndim >= 2:
             import sys as _sys_vf
             _target_greedy = logits.argmax(dim=-1)  # [num_tokens]
-            _dt_flat = _dt.reshape(-1)  # [batch * num_spec_tokens]
-            for _pos in range(min(_dt.shape[1], 5)):
+            _num_pos = min(_dt.shape[1], 5)
+            for _pos in range(_num_pos):
                 _draft_tok = _dt[0, _pos].item()
                 # target greedy at the corresponding logits_indices position
                 _li = spec_decode_metadata.logits_indices
@@ -2338,7 +2338,7 @@ class NPUModelRunner(GPUModelRunner):
                     _tgt_idx = _li[_pos].item()
                     if _tgt_idx < len(_target_greedy):
                         _tgt_tok = _target_greedy[_tgt_idx].item()
-                        _match = "✓" if _draft_tok == _tgt_tok else "✗"
+                        _match = "ACCEPT" if _draft_tok == _tgt_tok else "REJECT"
                     else:
                         _tgt_tok = -1
                         _match = "?"
@@ -2346,7 +2346,7 @@ class NPUModelRunner(GPUModelRunner):
                     _tgt_tok = -1
                     _match = "?"
                 _sys_vf.stderr.write(
-                    f"[VERIFY] pos={_pos} draft={_draft_tok} target_greedy={_tgt_tok} match={_match}\n")
+                    f"[VERIFY] pos={_pos} draft={_draft_tok} target={_tgt_tok} {_match}\n")
             _sys_vf.stderr.flush()
         return sampler_output
 
