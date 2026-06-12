@@ -1287,10 +1287,18 @@ class NPUModelRunner(GPUModelRunner):
             # designed for draft model KV-sharing layers reading from the target
             # cache.  The target model needs the normal DecodeOnly path with
             # correct slot_mapping to produce valid logits for verification.
-        # Speculative decoding.
+        # Speculative decoding: target model processes accepted tokens +
+        # draft slots.  num_valid_tokens==1 means only one token has new
+        # data; the rest are already in KV cache → ChunkedPrefill.
+        # SpecDecoding must NOT be used for the target model because it
+        # skips slot_mapping (attention_v1.py:1870) — the target needs
+        # normal slot_mapping for correct logits during verification.
         elif np.all(num_valid_tokens == 1):
             if self.speculative_config:
-                attn_state = AscendAttentionState.SpecDecoding
+                if self.speculative_config.method == "mtp":
+                    attn_state = AscendAttentionState.ChunkedPrefill
+                else:
+                    attn_state = AscendAttentionState.SpecDecoding
             else:
                 attn_state = AscendAttentionState.ChunkedPrefill
         # splitfuse
