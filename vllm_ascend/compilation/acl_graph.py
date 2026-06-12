@@ -3,6 +3,7 @@
 
 import dataclasses
 from collections.abc import Callable
+import contextlib
 from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import Any
@@ -128,20 +129,7 @@ class ACLGraphWrapper:
         entry = self.concrete_aclgraph_entries[batch_descriptor]
 
         if entry.aclgraph is None:
-            # Check the live value of the module-level flag (it changes
-            # after capture_model completes).
-            from vllm.compilation import monitor as _monitor_mod
-            if not _monitor_mod.cudagraph_capturing_enabled:
-                # Capture was disabled (e.g. post-init inference).
-                # The draft model's graph was intentionally skipped
-                # during init to avoid nested captures.  Fall back
-                # to eager execution for this call.
-                return self.runnable(*args, **kwargs)
             if self.aclgraph_options.debug_log_enable:
-                # Since we capture aclgraph for many different shapes and
-                # capturing is fast, we don't need to log it for every
-                # shape. E.g. we only log it for the first subgraph in
-                # piecewise mode.
                 logger.debug("Capturing a aclgraph on (%s,%s)", self.runtime_mode.name, entry.batch_descriptor)
             # validate that aclgraph capturing is legal at this point.
             validate_cudagraph_capturing_enabled()
@@ -150,19 +138,28 @@ class ACLGraphWrapper:
             entry.input_addresses = input_addresses
             aclgraph = torch.npu.NPUGraph()
 
+            # On Ascend, nested graph captures on the same stream
+            # corrupt the outer graph's workspace allocation.  When
+            # the current stream is already being captured (e.g.
+            # target model's FDO graph), capture the draft model's
+            # graph on a *separate* stream, with a wait event for
+            # proper ordering.
+            _outer_capturing = torch.npu.is_current_stream_capturing()
+            if _outer_capturing:
+                _capture_stream = torch.npu.Stream()
+                _capture_stream.wait_stream(torch.npu.current_stream())
+                _capture_ctx = torch.npu.stream(_capture_stream)
+            else:
+                _capture_ctx = contextlib.nullcontext()
+
             with ExitStack() as stack:
                 if self.aclgraph_options.gc_disable:
-                    # during every model forward for piecewise aclgraph
-                    # mode, we will capture many pieces of aclgraphs
-                    # (roughly one per layer). running gc again and again
-                    # across layers will make the aclgraph capture very slow.
-                    # therefore, we only run gc for the first graph,
-                    # and disable gc for the rest of the graphs.
                     stack.enter_context(patch("gc.collect", lambda: None))
                     stack.enter_context(patch("torch.npu.empty_cache", lambda: None))
 
                 # mind-exploding: carefully manage the reference and memory.
                 forward_context.capturing = True
+                stack.enter_context(_capture_ctx)
                 with torch.npu.graph(aclgraph, pool=self.graph_pool):
                     # `output` is managed by pytorch's aclgraph pool
                     output = self.runnable(*args, **kwargs)
