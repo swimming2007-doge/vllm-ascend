@@ -2505,13 +2505,23 @@ class NPUModelRunner(GPUModelRunner):
             if self.enable_enpu:
                 torch.npu.current_stream().synchronize()
 
-            # TODO: FIA during graph param update crashes with error 507000
-            # when MTP is active (num_tokens includes spec tokens).  Skip
-            # the update for now — the captured graph params from capture
-            # time will be used directly during replay.
+            # FIA update for large-head sliding-window layers with
+            # multi-token (MTP) is skipped inside update_graph_params;
+            # all other layers update normally.
             if self.speculative_config is not None:
-                print(f"[FULL-GRAPH-UPDATE] SKIPPED — MTP spec active",
+                print(f"[FULL-GRAPH-UPDATE] MTP active, selective FIA skip enabled",
                       file=sys.stderr, flush=True)
+
+            assert positions is not None
+            update_full_graph_params(
+                self.attn_backend,
+                self.update_stream,
+                forward_context,
+                num_tokens_padded,
+                self.vllm_config,
+                self.speculative_config,
+                positions.shape[0],
+            )
                 return
 
     def _model_forward(
