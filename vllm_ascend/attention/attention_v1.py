@@ -648,6 +648,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         print(f"[FIA-UPDATE] PA fallback layer={key} "
                               f"num_tokens={num_tokens} head_dim={_head_dim}",
                               file=sys.stderr, flush=True)
+                        # _npu_paged_attention expects tensors for
+                        # context_lens.  seq_lens from attn_metadata
+                        # may be a list.
+                        _pa_seq_lens = torch.tensor(
+                            seq_lens, dtype=torch.int32, device=query.device
+                        ) if not isinstance(seq_lens, torch.Tensor) else seq_lens
                         torch.npu.graph_task_update_begin(update_stream, handle)
                         torch_npu._npu_paged_attention(
                             query=query,
@@ -657,7 +663,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                             num_heads=num_heads,
                             scale_value=scale,
                             block_table=block_tables,
-                            context_lens=seq_lens,
+                            context_lens=_pa_seq_lens,
                             out=attn_output,
                             workspace=_ws,
                         )
