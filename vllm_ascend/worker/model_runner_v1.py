@@ -2506,15 +2506,21 @@ class NPUModelRunner(GPUModelRunner):
                 torch.npu.current_stream().synchronize()
 
             assert positions is not None
-            update_full_graph_params(
-                self.attn_backend,
-                self.update_stream,
-                forward_context,
-                num_tokens_padded,
-                self.vllm_config,
-                self.speculative_config,
-                positions.shape[0],
-            )
+            try:
+                update_full_graph_params(
+                    self.attn_backend,
+                    self.update_stream,
+                    forward_context,
+                    num_tokens_padded,
+                    self.vllm_config,
+                    self.speculative_config,
+                    positions.shape[0],
+                )
+            except Exception as e:
+                import sys
+                print(f"[FULL-GRAPH-UPDATE-ERROR] update_full_graph_params "
+                      f"failed for num_tokens={num_tokens_padded}: {e}",
+                      file=sys.stderr, flush=True)
 
     def _model_forward(
         self,
