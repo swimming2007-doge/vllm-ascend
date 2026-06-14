@@ -2505,22 +2505,14 @@ class NPUModelRunner(GPUModelRunner):
             if self.enable_enpu:
                 torch.npu.current_stream().synchronize()
 
-            assert positions is not None
-            try:
-                update_full_graph_params(
-                    self.attn_backend,
-                    self.update_stream,
-                    forward_context,
-                    num_tokens_padded,
-                    self.vllm_config,
-                    self.speculative_config,
-                    positions.shape[0],
-                )
-            except Exception as e:
-                import sys
-                print(f"[FULL-GRAPH-UPDATE-ERROR] update_full_graph_params "
-                      f"failed for num_tokens={num_tokens_padded}: {e}",
+            # TODO: FIA during graph param update crashes with error 507000
+            # when MTP is active (num_tokens includes spec tokens).  Skip
+            # the update for now — the captured graph params from capture
+            # time will be used directly during replay.
+            if self.speculative_config is not None:
+                print(f"[FULL-GRAPH-UPDATE] SKIPPED — MTP spec active",
                       file=sys.stderr, flush=True)
+                return
 
     def _model_forward(
         self,
