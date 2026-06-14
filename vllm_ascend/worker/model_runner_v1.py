@@ -2522,7 +2522,6 @@ class NPUModelRunner(GPUModelRunner):
                 self.speculative_config,
                 positions.shape[0],
             )
-                return
 
     def _model_forward(
         self,
