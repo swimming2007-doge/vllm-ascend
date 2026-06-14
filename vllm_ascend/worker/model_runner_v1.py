@@ -2497,6 +2497,11 @@ class NPUModelRunner(GPUModelRunner):
             and not forward_context.capturing
             and not self.use_sparse and not self.use_compress
         ):
+            import sys
+            print(f"[FULL-GRAPH-UPDATE] num_tokens_padded={num_tokens_padded} "
+                  f"capture_sizes={self.vllm_config.compilation_config.cudagraph_capture_sizes} "
+                  f"has_spec={self.speculative_config is not None}",
+                  file=sys.stderr, flush=True)
             if self.enable_enpu:
                 torch.npu.current_stream().synchronize()
 

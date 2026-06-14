@@ -648,20 +648,32 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         }
                         input_layout = "BNSD"
                         sparse_mode = 0
+                    import sys
+                    _ws = graph_params.workspaces.get(num_tokens)
+                    print(f"[FIA-UPDATE] layer={key} num_tokens={num_tokens} "
+                          f"query_shape={query.shape} kv_shape={(key_cache.shape if key_cache is not None else None)} "
+                          f"has_ws={_ws is not None} ws_type={type(_ws).__name__ if _ws is not None else 'None'} "
+                          f"num_kv_heads={num_kv_heads} num_heads={num_heads} block_size={block_size} "
+                          f"sparse_mode={sparse_mode}",
+                          file=sys.stderr, flush=True)
                     torch.npu.graph_task_update_begin(update_stream, handle)
-                    torch_npu.npu_fused_infer_attention_score.out(
-                        query=query, key=key_cache, value=value,
-                        block_table=block_tables, atten_mask=attn_mask,
-                        input_layout=input_layout, block_size=block_size,
-                        actual_seq_lengths=actual_seq_lengths_q,
-                        actual_seq_lengths_kv=seq_lens,
-                        num_key_value_heads=num_kv_heads, num_heads=num_heads,
-                        scale=scale, sparse_mode=sparse_mode,
-                        pre_tokens=pre_tokens, next_tokens=next_tokens,
-                        **extra_args,
-                        workspace=graph_params.workspaces.get(num_tokens),
-                        out=[attn_output, softmax_lse],
-                    )
+                    try:
+                        torch_npu.npu_fused_infer_attention_score.out(
+                            query=query, key=key_cache, value=value,
+                            block_table=block_tables, atten_mask=attn_mask,
+                            input_layout=input_layout, block_size=block_size,
+                            actual_seq_lengths=actual_seq_lengths_q,
+                            actual_seq_lengths_kv=seq_lens,
+                            num_key_value_heads=num_kv_heads, num_heads=num_heads,
+                            scale=scale, sparse_mode=sparse_mode,
+                            pre_tokens=pre_tokens, next_tokens=next_tokens,
+                            **extra_args,
+                            workspace=_ws,
+                            out=[attn_output, softmax_lse],
+                        )
+                    except Exception as e:
+                        print(f"[FIA-UPDATE-ERROR] layer={key}: {e}", file=sys.stderr, flush=True)
+                        raise
                     torch.npu.graph_task_update_end(update_stream)
                     event.record(update_stream)
                 attn_count += 1
