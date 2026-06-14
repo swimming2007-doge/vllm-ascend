@@ -138,19 +138,24 @@ class ACLGraphWrapper:
             entry.input_addresses = input_addresses
             aclgraph = torch.npu.NPUGraph()
 
-            # On Ascend, nested graph captures on the same stream
-            # corrupt the outer graph's workspace allocation.  When
-            # the current stream is already being captured (e.g.
-            # target model's FDO graph), capture the draft model's
-            # graph on a *separate* stream, with a wait event for
-            # proper ordering.
+            # On Ascend, nested NPU graph captures corrupt the outer
+            # graph's workspace allocation, even when using a separate
+            # stream.  The separate-stream approach was tested and also
+            # crashes at inference time (aclnnFusedInferAttentionScoreV3).
+            #
+            # When the current stream is already being captured (e.g.
+            # target model's FDO graph), skip this wrapper's capture
+            # entirely and run the runnable in eager mode.  The
+            # individual ops inside the runnable are already compiled
+            # via torch.compile (see _warmup_draft_model_compile()), so
+            # they replay correct NPU graphs within the outer capture.
             _outer_capturing = torch.npu.is_current_stream_capturing()
             if _outer_capturing:
-                _capture_stream = torch.npu.Stream()
-                _capture_stream.wait_stream(torch.npu.current_stream())
-                _capture_ctx = torch.npu.stream(_capture_stream)
-            else:
-                _capture_ctx = contextlib.nullcontext()
+                import sys
+                print(f"[ACLGraph] SKIP nested capture — running eagerly "
+                      f"(outer capture detected, runtime_mode={self.runtime_mode})",
+                      file=sys.stderr, flush=True)
+                return self.runnable(*args, **kwargs)
 
             with ExitStack() as stack:
                 if self.aclgraph_options.gc_disable:
@@ -159,7 +164,6 @@ class ACLGraphWrapper:
 
                 # mind-exploding: carefully manage the reference and memory.
                 forward_context.capturing = True
-                stack.enter_context(_capture_ctx)
                 with torch.npu.graph(aclgraph, pool=self.graph_pool):
                     # `output` is managed by pytorch's aclgraph pool
                     output = self.runnable(*args, **kwargs)
