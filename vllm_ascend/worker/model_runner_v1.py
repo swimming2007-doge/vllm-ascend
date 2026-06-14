@@ -3509,6 +3509,13 @@ class NPUModelRunner(GPUModelRunner):
                 self.drafter.initialize_attn_backend(kv_cache_config, block_size)
 
         _log_npu_mem("after drafter attn_backend init")
+        # Pre-compile the draft model so that torch.compile does not
+        # run inside graph_capture() later (which would either crash
+        # on synchronize or produce incorrect compiled code when
+        # set_compile_mode is skipped).
+        if (self.speculative_config and self.drafter is not None
+                and self._use_aclgraph()):
+            self._warmup_draft_model_compile()
         if has_kv_transfer_group():
             get_kv_transfer_group().register_kv_caches(kv_caches)
 
@@ -3529,6 +3536,41 @@ class NPUModelRunner(GPUModelRunner):
         for module in self.compilation_config.static_forward_context.values():
             if isinstance(module, FusedMoE):
                 module._ascend_routed_experts_capturer = capturer
+
+    def _warmup_draft_model_compile(self) -> None:
+        """Trigger torch.compile on the draft model so it doesn't
+        run inside graph_capture() later, where set_compile_mode's
+        synchronize would crash."""
+        import sys
+        try:
+            draft_model = self.drafter.get_model()
+            draft_device = next(draft_model.parameters()).device
+            num_spec = self.speculative_config.num_speculative_tokens
+            num_tokens = num_spec + 1  # minimum batch for one request
+            with torch.no_grad():
+                dummy_ids = torch.zeros(num_tokens, dtype=torch.int32, device=draft_device)
+                dummy_pos = torch.zeros(num_tokens, dtype=torch.int64, device=draft_device)
+                dummy_hidden = torch.zeros(
+                    num_tokens,
+                    draft_model.model.config.hidden_size,
+                    dtype=torch.bfloat16,
+                    device=draft_device,
+                )
+                try:
+                    draft_model(
+                        input_ids=dummy_ids,
+                        positions=dummy_pos,
+                        inputs_embeds=None,
+                        hidden_states=dummy_hidden,
+                    )
+                except Exception:
+                    # The forward may fail due to missing attention
+                    # metadata — that's fine, torch.compile only
+                    # needs to trace the graph structure.
+                    pass
+            print(f"[MTP-WARMUP] Draft model warmup complete", file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f"[MTP-WARMUP] Draft model warmup failed: {e}", file=sys.stderr, flush=True)
 
     def _align_memory(self, tensor: torch.Tensor, alignment: int) -> torch.Tensor:
         data_ptr = tensor.data_ptr()
