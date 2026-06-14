@@ -636,19 +636,16 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         actual_seq_lengths_q = attn_metadata[key].actual_seq_lengths_q
                     import sys
                     _head_dim = query.shape[2] if query.dim() >= 3 else 0
-                    # FIA V1 crashes with error 507000 (MODEL_EXECUTE_FAIL)
-                    # on Ascend 910B4 when num_tokens > 1 AND sparse_mode=4
-                    # (sliding window) AND head_dim > 128.  Large-head
-                    # sliding-window layers use PA during capture, so skip
-                    # the FIA update — the graph replay will use the
-                    # captured PA params directly.
-                    if num_tokens > 1 and sparse_mode == 4 and _head_dim > 128:
-                        print(f"[FIA-UPDATE] SKIP layer={key} num_tokens={num_tokens} "
-                              f"head_dim={_head_dim} sparse_mode={sparse_mode} "
-                              f"(large-head SWA with multi-token, FIA unsupported)",
+                    # FIA V1 crashes with error 507000 on Ascend 910B4
+                    # when num_tokens > 1 AND sparse_mode=4 (sliding window)
+                    # AND head_dim > 128.  Fall back to FIA-V2 for these
+                    # layers, which supports the combination.
+                    use_v2 = (num_tokens > 1 and sparse_mode == 4
+                              and _head_dim > 128)
+                    if use_v2:
+                        print(f"[FIA-UPDATE] V2 fallback layer={key} "
+                              f"num_tokens={num_tokens} head_dim={_head_dim}",
                               file=sys.stderr, flush=True)
-                        attn_count += 1
-                        continue
 
                     input_layout = "TND"
                     extra_args = {}
@@ -666,23 +663,42 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         sparse_mode = 0
                     _ws = graph_params.workspaces.get(num_tokens)
                     print(f"[FIA-UPDATE] layer={key} num_tokens={num_tokens} "
-                          f"query_shape={query.shape} head_dim={_head_dim} "
-                          f"sparse_mode={sparse_mode} block_size={block_size}",
+                          f"head_dim={_head_dim} "
+                          f"sparse_mode={sparse_mode} block_size={block_size} "
+                          f"v2={use_v2}",
                           file=sys.stderr, flush=True)
                     torch.npu.graph_task_update_begin(update_stream, handle)
-                    torch_npu.npu_fused_infer_attention_score.out(
-                        query=query, key=key_cache, value=value,
-                        block_table=block_tables, atten_mask=attn_mask,
-                        input_layout=input_layout, block_size=block_size,
-                        actual_seq_lengths=actual_seq_lengths_q,
-                        actual_seq_lengths_kv=seq_lens,
-                        num_key_value_heads=num_kv_heads, num_heads=num_heads,
-                        scale=scale, sparse_mode=sparse_mode,
-                        pre_tokens=pre_tokens, next_tokens=next_tokens,
-                        **extra_args,
-                        workspace=_ws,
-                        out=[attn_output, softmax_lse],
-                    )
+                    if use_v2:
+                        torch_npu.npu_fused_infer_attention_score_v2.out(
+                            query=query, key=key_cache, value=value,
+                            block_table=block_tables, atten_mask=attn_mask,
+                            input_layout=input_layout, block_size=block_size,
+                            actual_seq_qlen=actual_seq_lengths_q,
+                            actual_seq_kvlen=seq_lens,
+                            num_key_value_heads=num_kv_heads,
+                            num_query_heads=num_heads,
+                            softmax_scale=scale,
+                            sparse_mode=sparse_mode,
+                            pre_tokens=pre_tokens,
+                            next_tokens=next_tokens,
+                            learnable_sink=None,
+                            workspace=_ws,
+                            out=[attn_output, softmax_lse],
+                        )
+                    else:
+                        torch_npu.npu_fused_infer_attention_score.out(
+                            query=query, key=key_cache, value=value,
+                            block_table=block_tables, atten_mask=attn_mask,
+                            input_layout=input_layout, block_size=block_size,
+                            actual_seq_lengths=actual_seq_lengths_q,
+                            actual_seq_lengths_kv=seq_lens,
+                            num_key_value_heads=num_kv_heads, num_heads=num_heads,
+                            scale=scale, sparse_mode=sparse_mode,
+                            pre_tokens=pre_tokens, next_tokens=next_tokens,
+                            **extra_args,
+                            workspace=_ws,
+                            out=[attn_output, softmax_lse],
+                        )
                     torch.npu.graph_task_update_end(update_stream)
                     event.record(update_stream)
                 attn_count += 1
