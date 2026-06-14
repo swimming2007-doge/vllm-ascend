@@ -654,6 +654,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         _pa_seq_lens = torch.tensor(
                             seq_lens, dtype=torch.int32, device=query.device
                         ) if not isinstance(seq_lens, torch.Tensor) else seq_lens
+                        _pa_workspace = torch_npu._npu_paged_attention_get_workspace(
+                            query.shape[0],
+                            num_heads,
+                            block_size,
+                            query.dtype,
+                            key_cache.dtype,
+                        )
                         torch.npu.graph_task_update_begin(update_stream, handle)
                         torch_npu._npu_paged_attention(
                             query=query,
@@ -665,7 +672,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                             block_table=block_tables,
                             context_lens=_pa_seq_lens,
                             out=attn_output,
-                            workspace=_ws,
+                            workspace=_pa_workspace,
                         )
                         torch.npu.graph_task_update_end(update_stream)
                         event.record(update_stream)
