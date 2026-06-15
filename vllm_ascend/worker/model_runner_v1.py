@@ -1281,14 +1281,19 @@ class NPUModelRunner(GPUModelRunner):
         # We assume it is the decode stage, where prefill occurs but only one token is not hit in cache.
         elif np.all(num_scheduled_tokens == 1):
             attn_state = AscendAttentionState.DecodeOnly
-            if self.speculative_config and self.speculative_config.method == "mtp":
-                # SpecDecoding now supports seq_len=1 and seq_len=2
-                # In Prefilling Decoding Disaggregation scenario, SpecDecoding need to supports seq_len=1
-                attn_state = AscendAttentionState.SpecDecoding
+            # NOTE: SpecDecoding state must NOT be used for the target model.
+            # It skips slot_mapping in _get_current_token_shared_kv (line 1730
+            # of attention_v1.py), forcing the block_table fallback path that is
+            # designed for draft model KV-sharing layers reading from the target
+            # cache.  The target model needs the normal DecodeOnly path with
+            # correct slot_mapping to produce valid logits for verification.
         # Speculative decoding.
         elif np.all(num_valid_tokens == 1):
             if self.speculative_config:
-                attn_state = AscendAttentionState.SpecDecoding
+                if self.speculative_config.method == "mtp":
+                    attn_state = AscendAttentionState.ChunkedPrefill
+                else:
+                    attn_state = AscendAttentionState.SpecDecoding
             else:
                 attn_state = AscendAttentionState.ChunkedPrefill
         # splitfuse
@@ -2324,6 +2329,29 @@ class NPUModelRunner(GPUModelRunner):
             logits,
             sampling_metadata,
         )
+        # Diagnose: compare draft vs target greedy tokens
+        _dt = spec_decode_metadata.draft_token_ids
+        if _dt is not None and logits is not None and _dt.numel() > 0:
+            import sys as _sys_vf
+            _target_greedy = logits.argmax(dim=-1)
+            _num_pos = min(_dt.shape[1] if _dt.ndim >= 2 else _dt.shape[0], 5)
+            for _pos in range(_num_pos):
+                _draft_tok = (_dt[0, _pos] if _dt.ndim >= 2 else _dt[_pos]).item()
+                _li = spec_decode_metadata.logits_indices
+                if _li is not None and _pos < len(_li):
+                    _tgt_idx = _li[_pos].item()
+                    if _tgt_idx < len(_target_greedy):
+                        _tgt_tok = _target_greedy[_tgt_idx].item()
+                        _match = "ACCEPT" if _draft_tok == _tgt_tok else "REJECT"
+                    else:
+                        _tgt_tok = -1
+                        _match = "?"
+                else:
+                    _tgt_tok = -1
+                    _match = "?"
+                _sys_vf.stderr.write(
+                    f"[VERIFY] pos={_pos} draft={_draft_tok} target={_tgt_tok} {_match}\n")
+            _sys_vf.stderr.flush()
         return sampler_output
 
     # TODO: remove this func after eagle_proposer is refactored and
@@ -2984,6 +3012,11 @@ class NPUModelRunner(GPUModelRunner):
                         spec_decode_common_attn_metadata = cm
                 else:
                     spec_decode_common_attn_metadata = cm
+            # Capture per-group block tables for multi-group proposers (Gemma4 MTP).
+            # Each KV cache group (sliding vs full attention) has its own block_table;
+            # the draft model needs all of them to read the correct KV cache.
+            if self.speculative_config and isinstance(self.drafter, AscendGemma4Proposer):
+                self.drafter.set_per_group_block_table(kv_cache_gid, cm.block_table_tensor)
             if self.enable_hamming_sparse is True:
                 from vllm_ascend.attention.kvcomp_attn.attention_utils import build_kvcomp_metadata
                 build_kvcomp_metadata(self.kvcomp_meta_data, cm)
