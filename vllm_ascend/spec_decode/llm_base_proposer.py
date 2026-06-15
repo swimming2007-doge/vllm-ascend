@@ -349,14 +349,25 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     layer_module.shared_head.head = model.lm_head
 
         if self.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs() and self.use_cuda_graph:
+            # VLLM_ASCEND_MTP_MODE: see model_runner_v1.py load_model() for docs
+            import os
+            mtp_mode = os.environ.get("VLLM_ASCEND_MTP_MODE", "target_eager")
+            self._mtp_draft_fdo = mtp_mode in ("target_eager", "both_fdo")
+
+            if not self._mtp_draft_fdo:
+                # Draft runs eager — disable graph mode for the proposer so
+                # forward context uses NONE mode and skips graph dispatch.
+                self.use_cuda_graph = False
+
             self.update_stream = torch.npu.Stream()
-            self._runnable = ACLGraphWrapper(
-                self._run_merged_draft,
-                self.vllm_config,
-                runtime_mode=CUDAGraphMode.FULL,
-                use_eagle=self.use_eagle,
-                enable_enpu=self.enable_enpu,
-            )
+            if self._mtp_draft_fdo:
+                self._runnable = ACLGraphWrapper(
+                    self._run_merged_draft,
+                    self.vllm_config,
+                    runtime_mode=CUDAGraphMode.FULL,
+                    use_eagle=self.use_eagle,
+                    enable_enpu=self.enable_enpu,
+                )
 
     def _maybe_share_topk_indices(self, target_language_model: nn.Module) -> None:
         if hasattr(target_language_model.model, "topk_indices_buffer"):
@@ -517,24 +528,16 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             if forward_context is not None:
                 forward_context.moe_layer_index = 0
 
-            # In eager mode, multi_steps_attn_metadata is empty because the
-            # FULL-graph metadata construction (lines 429-484) is skipped.
-            # Running the sequential loop with empty metadata would cause
-            # all attention layers to return zeros, corrupting the shared
-            # KV cache for subsequent requests.  Skip the draft model call
-            # entirely in this case — the dummy_run warmup doesn't need
-            # draft output in eager mode.
-            if multi_steps_attn_metadata:
-                self._runnable(
-                    num_input_tokens=num_tokens,
-                    batch_size=batch_size,
-                    token_indices_to_sample=self.token_indices_to_sample[: batch_size * self.extra_slots_per_request],
-                    # The target_position's address is same as the model_positions's
-                    target_positions=model_positions,
-                    inputs_embeds=inputs_embeds,
-                    multi_steps_attn_metadata=multi_steps_attn_metadata,
-                    num_tokens=num_tokens,
-                )
+            self._runnable(
+                num_input_tokens=num_tokens,
+                batch_size=batch_size,
+                token_indices_to_sample=self.token_indices_to_sample[: batch_size * self.extra_slots_per_request],
+                # The target_position's address is same as the model_positions's
+                target_positions=model_positions,
+                inputs_embeds=inputs_embeds,
+                multi_steps_attn_metadata=multi_steps_attn_metadata,
+                num_tokens=num_tokens,
+            )
             forward_context = get_forward_context()
             if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL and not _EXTRA_CTX.capturing:
                 self._update_full_graph_params(forward_context, num_tokens, multi_steps_attn_metadata)
@@ -716,11 +719,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         common_attn_metadata.query_start_loc = self.query_start_loc_group[0][: num_reqs_padded + 1]
 
         common_attn_metadata.num_input_tokens = num_input_tokens
-        # Build per-group attention metadata for the first speculative step.
-        # Gemma4 has multiple KV cache groups (sliding vs full attention) with
-        # different block tables.  Each draft attention group must receive its
-        # own block_table to read the correct KV cache.
+        # FIXME(woosuk): The below two ops cause synchronization. Optimize.
         assert len(self.draft_attn_groups) > 0
+        builder = self.draft_attn_groups[0].get_metadata_builder()
         extra_attn_metadata_args: dict = {}
         if self.use_compress:
             extra_attn_metadata_args = dict(
@@ -729,26 +730,19 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 common_ratio_to_sas_metadata=dict(),
                 block_size=self.draft_attn_groups[0].kv_cache_spec.block_size,
             )
-        per_layer_attn_metadata = dict()
-        for attn_group in self.draft_attn_groups:
-            gid = attn_group.kv_cache_group_id
-            if hasattr(self, '_per_group_block_tables') and gid in self._per_group_block_tables:
-                from copy import copy as _copy
-                cm = _copy(common_attn_metadata)
-                cm.block_table_tensor = self._per_group_block_tables[gid]
-            else:
-                cm = common_attn_metadata
-            builder = attn_group.get_metadata_builder()
-            attn_metadata = builder.build(0, cm, self.runner.get_model(), **extra_attn_metadata_args)
-            if hasattr(attn_metadata, "causal") and not attn_metadata.causal:
-                attn_metadata.attn_mask = None
-            for layer_name in attn_group.layer_names:
-                per_layer_attn_metadata[layer_name] = attn_metadata
+        attn_metadata = builder.build(0, common_attn_metadata, self.runner.get_model(), **extra_attn_metadata_args)
+
+        if hasattr(attn_metadata, "causal") and not attn_metadata.causal:
+            attn_metadata.attn_mask = None
 
         if self.uses_mrope:
             used_update_positions = self.mrope_positions[:, token_indices_to_sample]
         else:
             used_update_positions = self.positions[token_indices_to_sample]
+        per_layer_attn_metadata = dict()
+        # The first step of speculative.
+        for layer_name in self.attn_layer_names:
+            per_layer_attn_metadata[layer_name] = attn_metadata
         multi_steps_attn_metadata = [per_layer_attn_metadata]
 
         # Copy the old attn_metadata and update
@@ -927,17 +921,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 if self.method == "mtp":
                     model_kwargs["positions"] = model_positions
 
-        # Ensure forward_context.attn_metadata covers draft-model layer names
-        # during the merged forward.  The context was set by
-        # set_ascend_forward_context in _propose(), but model-internal
-        # context switches (e.g. Gemma4MTP creating a sub-context for its
-        # backbone hidden-state processing) can reset it before the draft
-        # attention layers run.  Without valid metadata the attention falls
-        # back to all-zeros output and the draft tokens become garbage.
-        _fc = get_forward_context()
-        if _fc is not None and multi_steps_attn_metadata and len(multi_steps_attn_metadata) > 0:
-            _fc.attn_metadata = multi_steps_attn_metadata[0]
-
         ret_hidden_states = self.model(**model_kwargs)
         if not self.model_returns_tuple():
             last_hidden_states = ret_hidden_states
@@ -1021,7 +1004,25 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         hidden_states = hidden_states[token_indices_to_sample]
         token_indices_to_sample = self.arange[:batch_size]
 
-        input_batch_size = num_input_tokens if self.use_cuda_graph else batch_size
+        input_batch_size = num_input_tokens if (self.method == "mtp" or self.use_cuda_graph) else batch_size
+
+        # ── DEBUG: MTP sequential loop pre-entry ──
+        # Guard tensor value access (.tolist(), .item()) during NPU graph
+        # capture — D2H memcpy is not allowed on a captured stream.
+        if not _EXTRA_CTX.capturing:
+            import sys
+            _hs_buf = self.hidden_states.shape
+            _tgt_hs = self.hidden_states.shape
+            _hs_shape = hidden_states.shape
+            print(f"[MTP-ASCEND DEBUG] === ENTERING SEQUENTIAL LOOP ===", file=sys.stderr, flush=True)
+            print(f"[MTP-ASCEND DEBUG] method={self.method} use_cuda_graph={self.use_cuda_graph} constant_draft_positions={getattr(self, 'constant_draft_positions', False)}", file=sys.stderr, flush=True)
+            print(f"[MTP-ASCEND DEBUG] num_input_tokens={num_input_tokens} batch_size={batch_size} input_batch_size={input_batch_size}", file=sys.stderr, flush=True)
+            print(f"[MTP-ASCEND DEBUG] self.hidden_states.shape={_tgt_hs} hidden_states.shape={_hs_shape}", file=sys.stderr, flush=True)
+            print(f"[MTP-ASCEND DEBUG] self.hidden_states.buffer.shape={_hs_buf} self.hidden_size={self.hidden_size}", file=sys.stderr, flush=True)
+            print(f"[MTP-ASCEND DEBUG] positions after sample={positions.tolist() if positions.numel() <= 5 else positions[:5].tolist()}", file=sys.stderr, flush=True)
+            print(f"[MTP-ASCEND DEBUG] draft[0]={draft_token_ids_tensor[0].tolist()}", file=sys.stderr, flush=True)
+            if _hs_shape[-1] != _hs_buf[-1]:
+                print(f"[MTP-ASCEND DEBUG] ** WARNING ** hidden_states dim {_hs_shape[-1]} != buffer dim {_hs_buf[-1]}", file=sys.stderr, flush=True)
 
         forward_context = get_forward_context()
         _EXTRA_CTX.num_tokens = input_batch_size
@@ -1059,22 +1060,17 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
             # copy inputs to buffer for cudagraph
             self.input_ids[:batch_size] = input_ids
-            if self.method == "mtp" and getattr(self, 'constant_draft_positions', False):
-                # MTP with constant positions: ALL input tokens share
-                # the same position and backbone hidden states.
-                # _set_positions(batch_size, ...) only sets batch_size
-                # slots, but the model reads input_batch_size slots
-                # (and attn_metadata is pre-computed for that many).
-                # Broadcast so every slot has valid data.
-                pos0 = clamped_positions[0].expand(input_batch_size)
-                self._set_positions(input_batch_size, pos0)
-                self.hidden_states[:input_batch_size] = (
-                    hidden_states[:1].expand(input_batch_size, -1)
-                )
-            else:
-                self._set_positions(batch_size, clamped_positions)
-                self.hidden_states[:batch_size] = hidden_states.view(batch_size, -1)
+            self._set_positions(batch_size, clamped_positions)
+            self.hidden_states[:batch_size] = hidden_states.view(batch_size, -1)
 
+            # ── DEBUG: loop iteration inputs ──
+            if not _EXTRA_CTX.capturing:
+                import sys
+                _dbg_pos = self._get_positions(input_batch_size)
+                _dbg_hs = self.hidden_states[:input_batch_size]
+                print(f"[MTP-ASCEND DEBUG] --- loop iter {draft_step} --- token={input_ids.tolist()}", file=sys.stderr, flush=True)
+                print(f"[MTP-ASCEND DEBUG]   positions={_dbg_pos.tolist() if _dbg_pos.numel()<=5 else _dbg_pos[:5].tolist()}", file=sys.stderr, flush=True)
+                print(f"[MTP-ASCEND DEBUG]   input hidden_states mean={_dbg_hs.mean().item():.6f} std={_dbg_hs.std().item():.6f} shape={_dbg_hs.shape}", file=sys.stderr, flush=True)
             if self.supports_mm_inputs:
                 self.inputs_embeds[:batch_size] = self.model.embed_input_ids(input_ids)
 
@@ -1095,13 +1091,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
             model_hidden_states, model_positions = self.maybe_pad_and_reduce(model_hidden_states, model_positions)
 
-            _msteps = multi_steps_attn_metadata
-            _step_md = _msteps[draft_step + 1] if _msteps else None
-            if _step_md is None:
-                # Fill remaining draft slots with the first draft token
-                draft_token_ids_tensor[draft_step + 1:] = draft_token_ids_tensor[draft_step].unsqueeze(0)
-                break
-            forward_context.attn_metadata = _step_md
+            forward_context.attn_metadata = (
+                multi_steps_attn_metadata[draft_step + 1] if multi_steps_attn_metadata else None
+            )
 
             model_kwargs = {
                 "input_ids": model_input_ids,
@@ -1143,6 +1135,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             hidden_states = hidden_states[:batch_size]
             draft_token_ids = logits.argmax(dim=-1)
             draft_token_ids_tensor[draft_step + 1] = draft_token_ids
+
+            # ── DEBUG: loop iteration output ──
+            if not _EXTRA_CTX.capturing:
+                import sys
+                print(f"[MTP-ASCEND DEBUG]   output hidden_states mean={hidden_states.mean().item():.6f} std={hidden_states.std().item():.6f} shape={hidden_states.shape}", file=sys.stderr, flush=True)
+                print(f"[MTP-ASCEND DEBUG]   draft[{draft_step+1}]={draft_token_ids.tolist()}", file=sys.stderr, flush=True)
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = draft_token_ids_tensor.swapaxes(0, 1)

@@ -1281,24 +1281,14 @@ class NPUModelRunner(GPUModelRunner):
         # We assume it is the decode stage, where prefill occurs but only one token is not hit in cache.
         elif np.all(num_scheduled_tokens == 1):
             attn_state = AscendAttentionState.DecodeOnly
-            # NOTE: SpecDecoding state must NOT be used for the target model.
-            # It skips slot_mapping in _get_current_token_shared_kv (line 1870
-            # of attention_v1.py), forcing the block_table fallback path that is
-            # designed for draft model KV-sharing layers reading from the target
-            # cache.  The target model needs the normal DecodeOnly path with
-            # correct slot_mapping to produce valid logits for verification.
-        # Speculative decoding: target model processes accepted tokens +
-        # draft slots.  num_valid_tokens==1 means only one token has new
-        # data; the rest are already in KV cache → ChunkedPrefill.
-        # SpecDecoding must NOT be used for the target model because it
-        # skips slot_mapping (attention_v1.py:1870) — the target needs
-        # normal slot_mapping for correct logits during verification.
+            if self.speculative_config and self.speculative_config.method == "mtp":
+                # SpecDecoding now supports seq_len=1 and seq_len=2
+                # In Prefilling Decoding Disaggregation scenario, SpecDecoding need to supports seq_len=1
+                attn_state = AscendAttentionState.SpecDecoding
+        # Speculative decoding.
         elif np.all(num_valid_tokens == 1):
             if self.speculative_config:
-                if self.speculative_config.method == "mtp":
-                    attn_state = AscendAttentionState.ChunkedPrefill
-                else:
-                    attn_state = AscendAttentionState.SpecDecoding
+                attn_state = AscendAttentionState.SpecDecoding
             else:
                 attn_state = AscendAttentionState.ChunkedPrefill
         # splitfuse
@@ -2497,20 +2487,8 @@ class NPUModelRunner(GPUModelRunner):
             and not forward_context.capturing
             and not self.use_sparse and not self.use_compress
         ):
-            import sys
-            print(f"[FULL-GRAPH-UPDATE] num_tokens_padded={num_tokens_padded} "
-                  f"capture_sizes={self.vllm_config.compilation_config.cudagraph_capture_sizes} "
-                  f"has_spec={self.speculative_config is not None}",
-                  file=sys.stderr, flush=True)
             if self.enable_enpu:
                 torch.npu.current_stream().synchronize()
-
-            # FIA update for large-head sliding-window layers with
-            # multi-token (MTP) is skipped inside update_graph_params;
-            # all other layers update normally.
-            if self.speculative_config is not None:
-                print(f"[FULL-GRAPH-UPDATE] MTP active, selective FIA skip enabled",
-                      file=sys.stderr, flush=True)
 
             assert positions is not None
             update_full_graph_params(
@@ -2556,15 +2534,17 @@ class NPUModelRunner(GPUModelRunner):
 
         if self.enable_enpu:
             # The soft segmentation scenario requires event.record first, then event.wait
-            self._update_full_graph_params_if_needed(
-                forward_context, num_tokens_padded, positions
-            )
+            if isinstance(self.model, ACLGraphWrapper):
+                self._update_full_graph_params_if_needed(
+                    forward_context, num_tokens_padded, positions
+                )
             hidden_states = run_model()
         else:
             hidden_states = run_model()
-            self._update_full_graph_params_if_needed(
-                forward_context, num_tokens_padded, positions
-            )
+            if isinstance(self.model, ACLGraphWrapper):
+                self._update_full_graph_params_if_needed(
+                    forward_context, num_tokens_padded, positions
+                )
 
         if forward_context.flash_comm_v1_enabled and not isinstance(hidden_states, IntermediateTensors):
             hidden_states = self._all_gather_hidden_states_and_aux(hidden_states)
@@ -3004,11 +2984,6 @@ class NPUModelRunner(GPUModelRunner):
                         spec_decode_common_attn_metadata = cm
                 else:
                     spec_decode_common_attn_metadata = cm
-            # Capture per-group block tables for multi-group proposers (Gemma4 MTP).
-            # Each KV cache group (sliding vs full attention) has its own block_table;
-            # the draft model needs all of them to read the correct KV cache.
-            if self.speculative_config and isinstance(self.drafter, AscendGemma4Proposer):
-                self.drafter.set_per_group_block_table(kv_cache_gid, cm.block_table_tensor)
             if self.enable_hamming_sparse is True:
                 from vllm_ascend.attention.kvcomp_attn.attention_utils import build_kvcomp_metadata
                 build_kvcomp_metadata(self.kvcomp_meta_data, cm)
@@ -3447,13 +3422,40 @@ class NPUModelRunner(GPUModelRunner):
         # wrap the model with full graph wrapper if needed.
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             self.update_stream: torch.npu.Stream = torch.npu.Stream()
-            self.model = ACLGraphWrapper(
-                self.model,
-                self.vllm_config,
-                runtime_mode=CUDAGraphMode.FULL,
-                use_eagle=self.use_eagle,
-                enable_enpu=self.enable_enpu,
+
+            has_spec = (
+                self.speculative_config is not None
+                and (self.speculative_config.use_eagle()
+                     or self.speculative_config.uses_draft_model())
             )
+
+            # VLLM_ASCEND_MTP_MODE controls which model gets FDO graph capture:
+            #   "target_eager" (default): Target eager, Draft FDO   (Phase 1)
+            #   "draft_eager":           Target FDO,   Draft eager  (Phase 2)
+            #   "both_fdo":              Target FDO,   Draft FDO    (Phase 3)
+            import os
+            mtp_mode = os.environ.get("VLLM_ASCEND_MTP_MODE", "target_eager")
+            if mtp_mode == "draft_eager":
+                self._mtp_target_fdo = True
+                self._mtp_draft_fdo = False
+            elif mtp_mode == "both_fdo":
+                self._mtp_target_fdo = True
+                self._mtp_draft_fdo = True
+            else:  # "target_eager" (default)
+                self._mtp_target_fdo = False
+                self._mtp_draft_fdo = True
+
+            # Wrap target model with ACLGraphWrapper when:
+            # - No speculative decoding active (normal FDO), OR
+            # - Mode is draft_eager or both_fdo (target should be FDO)
+            if self._mtp_target_fdo or not has_spec:
+                self.model = ACLGraphWrapper(
+                    self.model,
+                    self.vllm_config,
+                    runtime_mode=CUDAGraphMode.FULL,
+                    use_eagle=self.use_eagle,
+                    enable_enpu=self.enable_enpu,
+                )
 
         if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
             self._start_dump_data()
@@ -3521,13 +3523,6 @@ class NPUModelRunner(GPUModelRunner):
                 self.drafter.initialize_attn_backend(kv_cache_config, block_size)
 
         _log_npu_mem("after drafter attn_backend init")
-        # Pre-compile the draft model so that torch.compile does not
-        # run inside graph_capture() later (which would either crash
-        # on synchronize or produce incorrect compiled code when
-        # set_compile_mode is skipped).
-        if (self.speculative_config and self.drafter is not None
-                and self._use_aclgraph()):
-            self._warmup_draft_model_compile()
         if has_kv_transfer_group():
             get_kv_transfer_group().register_kv_caches(kv_caches)
 
@@ -3548,41 +3543,6 @@ class NPUModelRunner(GPUModelRunner):
         for module in self.compilation_config.static_forward_context.values():
             if isinstance(module, FusedMoE):
                 module._ascend_routed_experts_capturer = capturer
-
-    def _warmup_draft_model_compile(self) -> None:
-        """Trigger torch.compile on the draft model so it doesn't
-        run inside graph_capture() later, where set_compile_mode's
-        synchronize would crash."""
-        import sys
-        try:
-            draft_model = self.drafter.get_model()
-            draft_device = next(draft_model.parameters()).device
-            num_spec = self.speculative_config.num_speculative_tokens
-            num_tokens = num_spec + 1  # minimum batch for one request
-            with torch.no_grad():
-                dummy_ids = torch.zeros(num_tokens, dtype=torch.int32, device=draft_device)
-                dummy_pos = torch.zeros(num_tokens, dtype=torch.int64, device=draft_device)
-                dummy_hidden = torch.zeros(
-                    num_tokens,
-                    draft_model.model.config.hidden_size,
-                    dtype=torch.bfloat16,
-                    device=draft_device,
-                )
-                try:
-                    draft_model(
-                        input_ids=dummy_ids,
-                        positions=dummy_pos,
-                        inputs_embeds=None,
-                        hidden_states=dummy_hidden,
-                    )
-                except Exception:
-                    # The forward may fail due to missing attention
-                    # metadata — that's fine, torch.compile only
-                    # needs to trace the graph structure.
-                    pass
-            print(f"[MTP-WARMUP] Draft model warmup complete", file=sys.stderr, flush=True)
-        except Exception as e:
-            print(f"[MTP-WARMUP] Draft model warmup failed: {e}", file=sys.stderr, flush=True)
 
     def _align_memory(self, tensor: torch.Tensor, alignment: int) -> torch.Tensor:
         data_ptr = tensor.data_ptr()
