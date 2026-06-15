@@ -1467,11 +1467,21 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 mask[i, start:end] = 0
             attn_mask = mask
 
+        # Handle GQA: expand KV heads to match Q heads.
+        # Ascend NPU's scaled_dot_product_attention does not broadcast
+        # head dimension, so we must explicitly repeat KV heads.
+        # Use repeat_interleave (not expand+reshape) to preserve the
+        # correct head mapping: Q head i -> KV head i//n_rep.
+        if q.shape[1] != k.shape[1]:
+            n_rep = q.shape[1] // k.shape[1]
+            k = k.repeat_interleave(n_rep, dim=1)  # [S, Hkv, D] -> [S, Hq, D]
+            v = v.repeat_interleave(n_rep, dim=1)  # [S, Hkv, D] -> [S, Hq, D]
+
         if is_cross_attn:
             # 4D format for cross-attention: [B=1, H, L, D]
             q_4d = q.unsqueeze(0).transpose(1, 2)   # [1, H, T, D]
-            k_4d = k.unsqueeze(0).transpose(1, 2)   # [1, Hkv, S, D]
-            v_4d = v.unsqueeze(0).transpose(1, 2)   # [1, Hkv, S, D]
+            k_4d = k.unsqueeze(0).transpose(1, 2)   # [1, H, S, D]
+            v_4d = v.unsqueeze(0).transpose(1, 2)   # [1, H, S, D]
             if attn_mask is not None:
                 attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, T, S]
             attn_output = F.scaled_dot_product_attention(
