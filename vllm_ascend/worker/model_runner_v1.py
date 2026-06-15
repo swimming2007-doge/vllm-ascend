@@ -2331,8 +2331,10 @@ class NPUModelRunner(GPUModelRunner):
         )
         # Diagnose: compare draft vs target greedy tokens
         _dt = spec_decode_metadata.draft_token_ids
-        if _dt is not None and logits is not None and _dt.numel() > 0:
-            import sys as _sys_vf
+        import sys as _sys_vf
+        _sys_vf.stderr.write(f"[VERIFY-DBG] _sample called, _dt is None={_dt is None}, logits is None={logits is None}\n")
+        if _dt is not None and logits is not None:
+            _sys_vf.stderr.write(f"[VERIFY-DBG] _dt.shape={_dt.shape}, _dt.numel()={_dt.numel()}\n")
             _target_greedy = logits.argmax(dim=-1)
             _num_pos = min(_dt.shape[1] if _dt.ndim >= 2 else _dt.shape[0], 5)
             for _pos in range(_num_pos):
