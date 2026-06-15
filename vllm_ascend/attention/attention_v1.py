@@ -1456,7 +1456,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # attention when the KV length is smaller than the window.
         sliding_window = self.sliding_window
         attn_mask = None
-        is_cross_attn = (q.shape[0] != k.shape[0])
         if sliding_window is not None and k.shape[0] > sliding_window:
             S = k.shape[0]
             mask = torch.ones(num_tokens, S, dtype=q.dtype, device=q.device) * float('-inf')
@@ -1477,26 +1476,20 @@ class AscendAttentionBackendImpl(AttentionImpl):
             k = k.repeat_interleave(n_rep, dim=1)  # [S, Hkv, D] -> [S, Hq, D]
             v = v.repeat_interleave(n_rep, dim=1)  # [S, Hkv, D] -> [S, Hq, D]
 
-        if is_cross_attn:
-            # 4D format for cross-attention: [B=1, H, L, D]
-            q_4d = q.unsqueeze(0).transpose(1, 2)   # [1, H, T, D]
-            k_4d = k.unsqueeze(0).transpose(1, 2)   # [1, H, S, D]
-            v_4d = v.unsqueeze(0).transpose(1, 2)   # [1, H, S, D]
-            if attn_mask is not None:
-                attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, T, S]
-            attn_output = F.scaled_dot_product_attention(
-                q_4d, k_4d, v_4d,
-                attn_mask=attn_mask,
-                scale=self.scale,
-            )  # [1, H, T, D]
-            attn_output = attn_output.squeeze(0).transpose(0, 1)  # [T, H, D]
-        else:
-            # 3D format ok for self-attention (same Q/KV length)
-            attn_output = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=attn_mask,
-                scale=self.scale,
-            )  # [T, H, D]
+        # Always use 4D format [B, H, L, D] for Ascend NPU.
+        # 3D format [T, H, D] causes inplace_add shape mismatch in
+        # Ascend's SDPA kernel when num_tokens is large (e.g. >2000).
+        q_4d = q.unsqueeze(0).transpose(1, 2)   # [T, H, D] -> [1, H, T, D]
+        k_4d = k.unsqueeze(0).transpose(1, 2)   # [S, H, D] -> [1, H, S, D]
+        v_4d = v.unsqueeze(0).transpose(1, 2)   # [S, H, D] -> [1, H, S, D]
+        if attn_mask is not None:
+            attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)  # [T, S] -> [1, 1, T, S]
+        attn_output = F.scaled_dot_product_attention(
+            q_4d, k_4d, v_4d,
+            attn_mask=attn_mask,
+            scale=self.scale,
+        )  # [1, H, T, D]
+        attn_output = attn_output.squeeze(0).transpose(0, 1)  # [T, H, D]
 
         output[:num_tokens] = attn_output
         return output
