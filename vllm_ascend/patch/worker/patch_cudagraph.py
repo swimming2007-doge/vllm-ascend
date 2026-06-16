@@ -20,8 +20,16 @@ def _create_padded_batch_descriptor(
         and self.cudagraph_mode.has_mode(CUDAGraphMode.FULL)
         and self.cudagraph_mode != CUDAGraphMode.FULL
     ):
+        # Round num_tokens_padded up to a multiple of uniform_decode_query_len
+        # when it isn't already.  This can happen on Ascend NPU when
+        # adjust_cudagraph_sizes_for_spec_decode is skipped (some capture
+        # sizes are unsupported by PA/FIA kernels, so we keep original sizes
+        # which may not be multiples of num_spec_tokens + 1).
+        if num_tokens_padded % uniform_decode_query_len != 0:
+            num_tokens_padded = (
+                (num_tokens_padded // uniform_decode_query_len) + 1
+            ) * uniform_decode_query_len
         num_reqs = min(num_tokens_padded // uniform_decode_query_len, max_num_seqs)
-        assert num_tokens_padded % uniform_decode_query_len == 0
     else:
         uniform_decode = False
         num_reqs = min(num_tokens_padded, max_num_seqs)
