@@ -1120,7 +1120,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 )
             )
 
-            torch.npu.graph_task_group_begin(stream)
+            # NOTE: PagedAttention (PA) fails with "task group status error"
+            # (CANN 107033) when wrapped in graph_task_group_begin/end during
+            # FULL_DECODE_ONLY graph capture. The NPU PA kernel appears to be
+            # incompatible with task group capture in full-graph mode.
+            # Call PA directly without task group wrapping; the op is still
+            # captured by the outer graph via stream capture.
+            # PIECEWISE mode is NOT affected — PA works correctly in that path.
             torch_npu._npu_paged_attention(
                 query=query,
                 key_cache=self.key_cache,
@@ -1133,8 +1139,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 out=output,
                 workspace=workspace,
             )
-            handle = torch.npu.graph_task_group_end(stream)
-            graph_params.handles[num_tokens].append(handle)
+            # Use a dummy handle so the handles list stays aligned with
+            # attn_params for downstream indexing.
+            graph_params.handles[num_tokens].append(None)
 
             # Store by key for order-independent replay lookup.
             # Skip for draft model: each layer appears multiple
@@ -1146,7 +1153,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     and num_tokens in graph_params.attn_params_by_key):
                 graph_params.attn_params_by_key[num_tokens][layer_name] = {
                     "params": graph_params.attn_params[num_tokens][-1],
-                    "handle": handle,
+                    "handle": None,
                     "event": event,
                 }
 
