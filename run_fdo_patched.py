@@ -21,6 +21,9 @@ def _main():
     # Use both_fdo mode: two separate FDO graphs (target 60 layers + draft 4 layers),
     # each with its own capture, keeping total task groups per graph under CANN limit.
     os.environ["VLLM_ASCEND_MTP_MODE"] = "both_fdo"
+    # Ascend NPU device selection uses ASCEND_RT_VISIBLE_DEVICES, not CUDA_VISIBLE_DEVICES
+    if "ASCEND_RT_VISIBLE_DEVICES" not in os.environ:
+        os.environ["ASCEND_RT_VISIBLE_DEVICES"] = "2,3"
 
     sys.argv = [
         "vllm", "serve",
@@ -34,7 +37,7 @@ def _main():
         "--max-model-len", "16384",
         "--max-num-batched-tokens", "16384",
         "--max-num-seqs", "32",
-        "--gpu_memory_utilization", "0.85",
+        "--gpu_memory_utilization", "0.70",
         "--enable-auto-tool-choice",
         "--tool-call-parser", "gemma4",
         "--reasoning-parser", "gemma4",
