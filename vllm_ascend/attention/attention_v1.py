@@ -1121,28 +1121,68 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 )
             )
 
-            # NOTE: PagedAttention (PA) fails with "task group status error"
-            # (CANN 107033) when wrapped in graph_task_group_begin/end during
-            # FULL_DECODE_ONLY graph capture. The NPU PA kernel appears to be
-            # incompatible with task group capture in full-graph mode.
-            # Call PA directly without task group wrapping; the op is still
-            # captured by the outer graph via stream capture.
-            # PIECEWISE mode is NOT affected — PA works correctly in that path.
-            torch_npu._npu_paged_attention(
-                query=query,
-                key_cache=self.key_cache,
-                value_cache=self.value_cache,
-                num_kv_heads=self.num_kv_heads,
-                num_heads=self.num_heads,
-                scale_value=self.scale,
-                block_table=attn_metadata.block_tables,
-                context_lens=attn_metadata.seq_lens,
-                out=output,
-                workspace=workspace,
+            # PIECEWISE: PA with task groups works correctly.
+            # FULL_DECODE_ONLY: PA fails both with and without task groups
+            # (Inner error during capture, setup failed during replay).
+            # Use PyTorch SDPA which decomposes into capturable ops.
+            _is_fdo = (
+                get_forward_context().cudagraph_runtime_mode
+                == CUDAGraphMode.FULL
             )
-            # Use a dummy handle so the handles list stays aligned with
-            # attn_params for downstream indexing.
-            graph_params.handles[num_tokens].append(None)
+            if _is_fdo:
+                import torch.nn.functional as F
+                # Gather KV from paged cache → dense [num_tokens, heads, dim]
+                _block_size = self.key_cache.shape[1]
+                _num_kv_heads = self.num_kv_heads
+                _num_heads = self.num_heads
+                _head_dim = self.head_size
+                # Use block_table to gather: [num_reqs, max_blocks] → flat
+                _bt = attn_metadata.block_tables.long()
+                _num_reqs = _bt.shape[0]
+                _max_blocks = _bt.shape[1]
+                _flat_ids = _bt.reshape(-1)
+                _k = self.key_cache.index_select(0, _flat_ids)
+                _k = _k.view(_num_reqs, _max_blocks, _block_size, _num_kv_heads, _head_dim)
+                _k = _k.permute(0, 3, 1, 2, 4).reshape(_num_reqs, _num_kv_heads, _max_blocks * _block_size, _head_dim)
+                # Slice to actual seq lens
+                _max_len = int(_bt.shape[1] * _block_size)
+                _k = _k[:, :, :_max_len, :].reshape(_num_reqs * _max_len, _num_kv_heads, _head_dim)[:num_tokens]
+                _v = self.value_cache.index_select(0, _flat_ids)
+                _v = _v.view(_num_reqs, _max_blocks, _block_size, _num_kv_heads, _head_dim)
+                _v = _v.permute(0, 3, 1, 2, 4).reshape(_num_reqs, _num_kv_heads, _max_blocks * _block_size, _head_dim)
+                _v = _v[:, :, :_max_len, :].reshape(_num_reqs * _max_len, _num_kv_heads, _head_dim)[:num_tokens]
+                # GQA: repeat KV heads
+                if _num_heads != _num_kv_heads:
+                    _rep = _num_heads // _num_kv_heads
+                    _k = _k.repeat_interleave(_rep, dim=1)
+                    _v = _v.repeat_interleave(_rep, dim=1)
+                _q = query[:num_tokens]
+                _attn_out = F.scaled_dot_product_attention(
+                    _q.unsqueeze(0).transpose(1, 2),
+                    _k.unsqueeze(0).transpose(1, 2),
+                    _v.unsqueeze(0).transpose(1, 2),
+                    is_causal=True,
+                    scale=self.scale,
+                )
+                output[:num_tokens] = _attn_out.squeeze(0).transpose(0, 1)[:num_tokens]
+                # Keep handles aligned with attn_params for downstream indexing
+                graph_params.handles[num_tokens].append(None)
+            else:
+                torch.npu.graph_task_group_begin(stream)
+                torch_npu._npu_paged_attention(
+                    query=query,
+                    key_cache=self.key_cache,
+                    value_cache=self.value_cache,
+                    num_kv_heads=self.num_kv_heads,
+                    num_heads=self.num_heads,
+                    scale_value=self.scale,
+                    block_table=attn_metadata.block_tables,
+                    context_lens=attn_metadata.seq_lens,
+                    out=output,
+                    workspace=workspace,
+                )
+                handle = torch.npu.graph_task_group_end(stream)
+                graph_params.handles[num_tokens].append(handle)
 
             # Store by key for order-independent replay lookup.
             # Skip for draft model: each layer appears multiple
@@ -1154,7 +1194,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     and num_tokens in graph_params.attn_params_by_key):
                 graph_params.attn_params_by_key[num_tokens][layer_name] = {
                     "params": graph_params.attn_params[num_tokens][-1],
-                    "handle": None,
+                    "handle": graph_params.handles[num_tokens][-1] if graph_params.handles.get(num_tokens) else None,
                     "event": event,
                 }
 
