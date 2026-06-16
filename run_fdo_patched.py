@@ -18,6 +18,10 @@ import patch_fdo_adjust  # noqa: E402
 
 def _main():
     """Entry point — only executed when run as __main__, not by workers."""
+    # Use both_fdo mode: two separate FDO graphs (target 60 layers + draft 4 layers),
+    # each with its own capture, keeping total task groups per graph under CANN limit.
+    os.environ["VLLM_ASCEND_MTP_MODE"] = "both_fdo"
+
     sys.argv = [
         "vllm", "serve",
         "/data/gemma4/gemma-4-31b-it",
