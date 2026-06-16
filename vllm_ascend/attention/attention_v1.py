@@ -1391,6 +1391,53 @@ class AscendAttentionBackendImpl(AttentionImpl):
             actual_seq_kvlen=attn_metadata.actual_seq_lengths_q,
         )[0]
 
+    def _fdo_safe_large_head_attention(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor,
+        kv_cache=None,
+    ) -> torch.Tensor:
+        """FDO-capturable attention for large head_dim layers (>192).
+
+        PA and FIA v2 both fail during FULL_DECODE_ONLY capture for
+        head_dim >= 512.  Use PyTorch native SDPA which decomposes into
+        basic ops (matmul, softmax) that are graph-capturable.
+
+        For capture (dummy run), K/V tensors are provided directly
+        (ChunkedPrefill mode) — no paged cache gathering is needed.
+        """
+        import torch.nn.functional as F
+        num_tokens = query.shape[0]
+        num_heads = self.num_heads
+        num_kv_heads = self.num_kv_heads
+        head_size = self.head_size
+
+        q = query[:num_tokens].view(num_tokens, num_heads, head_size)
+        k = key[:num_tokens]
+        v = value[:num_tokens]
+
+        # GQA: repeat KV heads to match Q heads
+        if num_heads != num_kv_heads:
+            n_repeat = num_heads // num_kv_heads
+            k = k.repeat_interleave(n_repeat, dim=1)
+            v = v.repeat_interleave(n_repeat, dim=1)
+
+        # PyTorch native SDPA — uses optimal backend (flash/mem_efficient/math)
+        # and decomposes into capturable ops on Ascend.
+        attn_out = F.scaled_dot_product_attention(
+            q.unsqueeze(0).transpose(1, 2),   # [1, H, T, D]
+            k.unsqueeze(0).transpose(1, 2),   # [1, H, T_kv, D]
+            v.unsqueeze(0).transpose(1, 2),   # [1, H, T_kv, D]
+            is_causal=attn_metadata.causal,
+            scale=self.scale,
+        )
+        attn_out = attn_out.squeeze(0).transpose(0, 1)  # [T, H, D]
+        output[:num_tokens] = attn_out[:num_tokens]
+        return output
+
     def _forward_large_head_prefill_attention(
         self,
         query: torch.Tensor,
@@ -1792,10 +1839,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
             output = self._forward_large_head_prefill_attention(query, key, value, attn_metadata, output)
         elif use_large_head_fallback:
             # Large head_dim + non-DecodeOnly, non-prefill edge case.
-            # During FDO capture, PA fails — route to FIA v2 instead.
+            # During FDO capture, PA and FIA v2 both fail for head_dim=512.
+            # Use PyTorch native SDPA (scaled_dot_product_attention) which
+            # decomposes into capturable ops and supports any head_dim.
             # PIECEWISE capture is not affected (PA works there).
             if _is_fdo_capture:
-                output = self.forward_fused_infer_attention(
+                output = self._fdo_safe_large_head_attention(
                     query, key, value, attn_metadata, output, kv_cache)
             else:
                 output = self.forward_paged_attention(query, attn_metadata, output)
