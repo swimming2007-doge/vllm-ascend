@@ -22,7 +22,8 @@ from typing import Literal, NamedTuple
 import torch
 import torch_npu
 import vllm.envs as envs_vllm
-from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config
+from vllm.forward_context import get_forward_context
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import (  # type: ignore
@@ -1763,6 +1764,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
         use_large_head_fallback = self._should_use_large_head_attention_fallback()
         _pa_usable = using_paged_attention(num_tokens, self.vllm_config)
 
+        # PagedAttention fails during FULL_DECODE_ONLY graph capture even
+        # without task group wrapping (CANN Inner error).  PIECEWISE capture
+        # is NOT affected — PA works correctly there.
+        _is_fdo_capture = (
+            _EXTRA_CTX.capturing
+            and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL
+        )
+
         if (
             attn_metadata.attn_state in (AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding)
             and (self.sliding_window is None or self.kv_sharing_target_layer_name is not None)
@@ -1783,7 +1792,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
             output = self._forward_large_head_prefill_attention(query, key, value, attn_metadata, output)
         elif use_large_head_fallback:
             # Large head_dim + non-DecodeOnly, non-prefill edge case.
-            output = self.forward_paged_attention(query, attn_metadata, output)
+            # During FDO capture, PA fails — route to FIA v2 instead.
+            # PIECEWISE capture is not affected (PA works there).
+            if _is_fdo_capture:
+                output = self.forward_fused_infer_attention(
+                    query, key, value, attn_metadata, output, kv_cache)
+            else:
+                output = self.forward_paged_attention(query, attn_metadata, output)
         else:
             output = self.forward_fused_infer_attention(query, key, value, attn_metadata, output, kv_cache)
 
