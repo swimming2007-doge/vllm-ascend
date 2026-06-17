@@ -643,8 +643,15 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     # AND head_dim > 128.  These layers use
                     # forward_paged_attention during capture.  Use
                     # _npu_paged_attention for the update to match.
+                    # NOTE: In FULL_DECODE_ONLY mode, FIA IS used
+                    # for sliding window layers (head_dim=256) during
+                    # capture (PA fails during FDO capture).  The
+                    # update must match — skip the PA fallback during
+                    # FDO replay.
                     use_pa = (num_tokens > 1 and sparse_mode == 4
-                              and _head_dim > 128)
+                              and _head_dim > 128
+                              and get_forward_context().cudagraph_runtime_mode
+                              != CUDAGraphMode.FULL)
                     if use_pa:
                         print(f"[FIA-UPDATE] PA fallback layer={key} "
                               f"num_tokens={num_tokens} head_dim={_head_dim}",
@@ -1494,27 +1501,86 @@ class AscendAttentionBackendImpl(AttentionImpl):
             attn_metadata,
             num_tokens,
         )
-        sparse_mode = 4 if self.sliding_window is not None else 3 if attn_metadata.causal else 0
-        pre_tokens = self.sliding_window if self.sliding_window is not None else SWA_INT_MAX
-        next_tokens = 0 if attn_metadata.causal or self.sliding_window is not None else SWA_INT_MAX
-        attn_mask = attn_metadata.attn_mask
-        if attn_mask is not None and attn_mask.dtype not in (torch.bool, torch.uint8):
-            attn_mask = attn_mask.bool()
-        attn_output = torch_npu.npu_fusion_attention(
-            query=query,
-            key=key,
-            value=value,
-            head_num=self.num_heads,
-            input_layout="TND",
-            atten_mask=attn_mask,
-            scale=self.scale,
-            pre_tockens=pre_tokens,
-            next_tockens=next_tokens,
-            actual_seq_qlen=attn_metadata.actual_seq_lengths_q,
-            actual_seq_kvlen=actual_seq_lengths_kv,
-            sparse_mode=sparse_mode,
-        )[0]
-        output[:num_tokens] = attn_output[:num_tokens]
+
+        # Ascend FIA (npu_fusion_attention) cannot handle cross-attention
+        # where actual_seq_qlen differs from actual_seq_kvlen — it either
+        # crashes or produces zero / garbage output.  When KV was gathered
+        # from the paged cache (ChunkedPrefill / SpecDecoding), the KV
+        # length exceeds the query length.  Use PyTorch native SDPA for
+        # correct cross-attention; otherwise keep FIA for self-attention.
+        if key.shape[0] != num_tokens:
+            # Cross-attention: K/V gathered from cache is longer than Q.
+            import sys as _sys_lh
+            _sys_lh.stderr.write(f"[LARGE-HEAD-SDPA] layer={self._layer_name} "
+                                 f"q_len={num_tokens} kv_len={key.shape[0]} "
+                                 f"causal={attn_metadata.causal}\n")
+            _sys_lh.stderr.flush()
+            import torch.nn.functional as F_sdpa
+            num_heads = self.num_heads
+            num_kv_heads = self.num_kv_heads
+            head_size = self.head_size
+
+            q = query.view(num_tokens, num_heads, head_size)
+            k = key
+            v = value
+
+            # GQA: repeat KV heads to match Q heads
+            if num_heads != num_kv_heads:
+                n_rep = num_heads // num_kv_heads
+                k = k.repeat_interleave(n_rep, dim=1)
+                v = v.repeat_interleave(n_rep, dim=1)
+
+            # PyTorch SDPA in 4D format [B, H, L, D].
+            # When Q/KV lengths differ, is_causal=True is invalid
+            # (PyTorch raises an error).  Build the correct causal
+            # cross-attention mask: query position i can attend to
+            # KV positions [0, kv_len - q_len + i].
+            is_causal = attn_metadata.causal
+            if is_causal and q.shape[0] != k.shape[0]:
+                q_len = q.shape[0]
+                kv_len = k.shape[0]
+                attn_mask = torch.full(
+                    (q_len, kv_len), float('-inf'),
+                    dtype=q.dtype, device=q.device)
+                offset = kv_len - q_len
+                for i_ in range(q_len):
+                    attn_mask[i_, :offset + i_ + 1] = 0
+                is_causal = False
+            else:
+                attn_mask = None
+            attn_out = F_sdpa.scaled_dot_product_attention(
+                q.unsqueeze(0).transpose(1, 2),   # [1, H, T_q, D]
+                k.unsqueeze(0).transpose(1, 2),   # [1, H, T_kv, D]
+                v.unsqueeze(0).transpose(1, 2),   # [1, H, T_kv, D]
+                attn_mask=attn_mask,
+                is_causal=is_causal,
+                scale=self.scale,
+            )
+            attn_out = attn_out.squeeze(0).transpose(0, 1)  # [T_q, H, D]
+            output[:num_tokens] = attn_out[:num_tokens]
+        else:
+            # Self-attention: Q length == KV length, FIA handles correctly.
+            sparse_mode = 4 if self.sliding_window is not None else 3 if attn_metadata.causal else 0
+            pre_tokens = self.sliding_window if self.sliding_window is not None else SWA_INT_MAX
+            next_tokens = 0 if attn_metadata.causal or self.sliding_window is not None else SWA_INT_MAX
+            attn_mask = attn_metadata.attn_mask
+            if attn_mask is not None and attn_mask.dtype not in (torch.bool, torch.uint8):
+                attn_mask = attn_mask.bool()
+            attn_output = torch_npu.npu_fusion_attention(
+                query=query,
+                key=key,
+                value=value,
+                head_num=self.num_heads,
+                input_layout="TND",
+                atten_mask=attn_mask,
+                scale=self.scale,
+                pre_tockens=pre_tokens,
+                next_tockens=next_tokens,
+                actual_seq_qlen=attn_metadata.actual_seq_lengths_q,
+                actual_seq_kvlen=actual_seq_lengths_kv,
+                sparse_mode=sparse_mode,
+            )[0]
+            output[:num_tokens] = attn_output[:num_tokens]
         return output
 
     def _forward_shared_kv_prefill_attention(
@@ -1545,21 +1611,19 @@ class AscendAttentionBackendImpl(AttentionImpl):
         k = shared_key           # [S, Hkv, D]
         v = shared_value         # [S, Hkv, D]
 
-        # For sliding-window layers: create an attention mask that limits
-        # each query to its pre_tokens preceding KV positions.  Since all
-        # KV entries are past target tokens, this is effectively full
-        # attention when the KV length is smaller than the window.
-        sliding_window = self.sliding_window
-        attn_mask = None
-        if sliding_window is not None and k.shape[0] > sliding_window:
-            S = k.shape[0]
-            mask = torch.ones(num_tokens, S, dtype=q.dtype, device=q.device) * float('-inf')
-            offset = S - num_tokens
-            for i in range(num_tokens):
-                start = max(0, i + offset - sliding_window + 1)
-                end = i + offset + 1
-                mask[i, start:end] = 0
-            attn_mask = mask
+        # Create causal cross-attention mask.  Query position i can attend
+        # to KV positions [0, kv_len - q_len + i].  For sliding-window
+        # layers, additionally restrict to the last `sliding_window` tokens.
+        S = k.shape[0]
+        offset = S - num_tokens
+        mask = torch.ones(num_tokens, S, dtype=q.dtype, device=q.device) * float('-inf')
+        for i in range(num_tokens):
+            window_start = max(0, i + offset - self.sliding_window + 1) \
+                if self.sliding_window is not None and S > self.sliding_window \
+                else 0
+            causal_end = i + offset + 1
+            mask[i, window_start:causal_end] = 0
+        attn_mask = mask
 
         # Handle GQA: expand KV heads to match Q heads.
         # Ascend NPU's scaled_dot_product_attention does not broadcast
@@ -1825,7 +1889,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
             # cache.  _get_current_token_shared_kv would then return
             # a tiny K/V slice instead of None, preventing the
             # block-table fallback below.  Skip it for SpecDecoding.
-            if attn_metadata.attn_state != AscendAttentionState.SpecDecoding:
+            # Draft model layers do not write KV to the cache (they read
+            # from the target's shared cache).  Their slot_mapping points to
+            # empty/wrong positions, always fall through to the block_table
+            # gather instead.
+            if (attn_metadata.attn_state != AscendAttentionState.SpecDecoding
+                    and not getattr(_EXTRA_CTX, 'is_draft_model', False)):
                 shared_key, shared_value = self._get_current_token_shared_kv(attn_metadata)
             else:
                 shared_key, shared_value = None, None
