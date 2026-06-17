@@ -3448,7 +3448,7 @@ class NPUModelRunner(GPUModelRunner):
             try:
                 import sys as _sys
                 _sys.path.insert(0, "/workspace")
-                from mtp_fp16_fallback import apply_fp16_fallback
+                from mtp_fp16_fallback_v2 import apply_fp16_fallback
                 self.model = apply_fp16_fallback(self.model, _fallback_k)
             except Exception as _e:
                 logger.error(
