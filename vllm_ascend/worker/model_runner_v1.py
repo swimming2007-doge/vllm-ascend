@@ -437,6 +437,7 @@ class NPUModelRunner(GPUModelRunner):
         )
         self._seq_lens_cpu_event: torch.npu.Event | None = None
         self._seq_lens_cpu_event_pending = False
+        self._last_run_was_fdo_graph = False
 
         # kv role
         self.is_kv_producer = False
@@ -693,6 +694,10 @@ class NPUModelRunner(GPUModelRunner):
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
         self.input_batch.block_table.commit_block_table(num_reqs)
+        import sys as _sys_pi1
+        _sys_pi1.stderr.write(f"[PI] step={getattr(self, '_step_counter', '?')} "
+                              f"commit_block_table done, num_reqs={num_reqs}\n")
+        _sys_pi1.stderr.flush()
 
         req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
 
@@ -889,7 +894,14 @@ class NPUModelRunner(GPUModelRunner):
         self.query_start_loc.gpu[num_reqs + 1 :].fill_(-1)
 
         # Copy the tensors to the NPU.
+        import sys as _sys_pi_togpu
+        _sys_pi_togpu.stderr.write(f"[PI] step={getattr(self, '_step_counter', '?')} "
+                                    f"about to copy tensors to NPU...\n")
+        _sys_pi_togpu.stderr.flush()
         self._prepare_input_ids(scheduler_output, num_reqs, total_num_scheduled_tokens, cu_num_tokens)
+        _sys_pi_togpu.stderr.write(f"[PI] step={getattr(self, '_step_counter', '?')} "
+                                    f"tensors copied to NPU\n")
+        _sys_pi_togpu.stderr.flush()
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
         if self.uses_mrope:
@@ -1014,6 +1026,10 @@ class NPUModelRunner(GPUModelRunner):
         self.seq_lens[:num_reqs] = (
             self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
         )
+        import sys as _sys_pi_seq
+        _sys_pi_seq.stderr.write(f"[PI] step={getattr(self, '_step_counter', '?')} "
+                                  f"seq_lens computed on GPU\n")
+        _sys_pi_seq.stderr.flush()
         self.seq_lens[num_reqs:].fill_(0)
 
         # In async spec decode mode, num_computed_tokens was corrected on GPU
@@ -1028,14 +1044,22 @@ class NPUModelRunner(GPUModelRunner):
             and self.use_async_spec_decode
             and self.valid_sampled_token_count_gpu is not None
             and prev_req_id_to_index
+            and not self._last_run_was_fdo_graph
         ):
+            # FDO graph replay on Ascend can leave the NPU stream in a state
+            # where Event-based synchronization hangs.  Use a blocking copy
+            # instead of non_blocking + Event + later synchronize.
+            import sys as _sys_pi_blk
+            _sys_pi_blk.stderr.write(f"[PI] step={getattr(self, '_step_counter', '?')} "
+                                      f"BLOCKING seq_lens copy about to start...\n")
+            _sys_pi_blk.stderr.flush()
             self.optimistic_seq_lens_cpu[:num_reqs].copy_(
-                self.seq_lens[:num_reqs], non_blocking=True
+                self.seq_lens[:num_reqs]
             )
-            if self._seq_lens_cpu_event is None:
-                self._seq_lens_cpu_event = torch.npu.Event()
-            self._seq_lens_cpu_event.record()
-            self._seq_lens_cpu_event_pending = True
+            _sys_pi_blk.stderr.write(f"[PI] step={getattr(self, '_step_counter', '?')} "
+                                      f"BLOCKING seq_lens copy DONE\n")
+            _sys_pi_blk.stderr.flush()
+            self._seq_lens_cpu_event_pending = False
         else:
             self._seq_lens_cpu_event_pending = False
 
@@ -1189,6 +1213,13 @@ class NPUModelRunner(GPUModelRunner):
     ]:
         restore_state = None
 
+        import sys as _sys_pp2
+        _sys_pp2.stderr.write(f"[PP] step={getattr(self, '_step_counter', '?')} "
+                              f"_preprocess ENTRY, supports_mm={self.supports_mm_inputs}, "
+                              f"first_rank={get_pp_group().is_first_rank}, "
+                              f"encoder_decoder={self.model_config.is_encoder_decoder}\n")
+        _sys_pp2.stderr.flush()
+
         # For PCP, local worker token count can differ from scheduler global count.
         # Multimodal preprocessing must use local scheduled token count.
         if (
@@ -1213,10 +1244,18 @@ class NPUModelRunner(GPUModelRunner):
                 encoder_cache=self.encoder_cache,
             )
 
+        import sys as _sys_pp3
+        _sys_pp3.stderr.write(f"[PP] step={getattr(self, '_step_counter', '?')} "
+                              f"about to call super()._preprocess\n")
+        _sys_pp3.stderr.flush()
         try:
-            return super()._preprocess(
+            result = super()._preprocess(
                 scheduler_output, num_input_tokens, intermediate_tensors
             )
+            _sys_pp3.stderr.write(f"[PP] step={getattr(self, '_step_counter', '?')} "
+                                  f"super()._preprocess returned\n")
+            _sys_pp3.stderr.flush()
+            return result
         finally:
             if (
                 self.pcp_size > 1
@@ -1678,6 +1717,15 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        import sys as _sys_em
+        _total_tok = sum(scheduler_output.num_scheduled_tokens.values())
+        _n_reqs = scheduler_output.num_scheduled_tokens
+        _as = self.attn_state
+        _ts = getattr(self, '_step_counter', 0)
+        self._step_counter = _ts + 1
+        _sys_em.stderr.write(f"[EXEC] step={_ts} n_reqs={len(_n_reqs)} "
+                             f"total_tokens={_total_tok} attn_state={_as}\n")
+        _sys_em.stderr.flush()
         if self.vllm_config.model_config.enable_return_routed_experts:
             if vllm_version_is("0.20.2"):
                 capturer = RoutedExpertsCapturer.get_instance()
@@ -1798,6 +1846,10 @@ class NPUModelRunner(GPUModelRunner):
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
                 max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
 
+                import sys as _sys_pre_pi
+                _sys_pre_pi.stderr.write(f"[EXEC] step={getattr(self, '_step_counter', '?')} "
+                                          f"about to call _prepare_inputs\n")
+                _sys_pre_pi.stderr.flush()
                 (
                     logits_indices,
                     spec_decode_metadata,
@@ -1807,6 +1859,11 @@ class NPUModelRunner(GPUModelRunner):
                     scheduler_output,
                     num_scheduled_tokens_np,
                 )
+
+                import sys as _sys_pi
+                _sys_pi.stderr.write(f"[EXEC] step={getattr(self, '_step_counter', '?')} "
+                                      f"_prepare_inputs DONE, attn_state={self.attn_state}\n")
+                _sys_pi.stderr.flush()
 
                 num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
                 if self.pcp_size > 1:
@@ -1836,6 +1893,12 @@ class NPUModelRunner(GPUModelRunner):
                     force_eager=self.model_config.enforce_eager,
                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
                 )
+
+                import sys as _sys_dbp
+                _sys_dbp.stderr.write(f"[EXEC] step={getattr(self, '_step_counter', '?')} "
+                                       f"_determine_batch: cudagraph_mode={cudagraph_mode}, "
+                                       f"batch_desc.num_tokens={batch_desc.num_tokens}\n")
+                _sys_dbp.stderr.flush()
 
                 logger.debug(
                     "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
@@ -1933,6 +1996,11 @@ class NPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens_compressed_list=num_scheduled_tokens_compressed_list,
                 )
 
+                import sys as _sys_bam
+                _sys_bam.stderr.write(f"[EXEC] step={getattr(self, '_step_counter', '?')} "
+                                       f"_build_attention_metadata DONE\n")
+                _sys_bam.stderr.flush()
+
             (
                 input_ids,
                 inputs_embeds,
@@ -1950,6 +2018,11 @@ class NPUModelRunner(GPUModelRunner):
 
             # update global cos, sin
             update_cos_sin(positions)
+
+            import sys as _sys_pp
+            _sys_pp.stderr.write(f"[EXEC] step={getattr(self, '_step_counter', '?')} "
+                                  f"_preprocess DONE, entering forward context\n")
+            _sys_pp.stderr.flush()
 
         if self.dynamic_eplb:
             with record_function_or_nullcontext("EPLB weight D2D"):
@@ -1999,6 +2072,10 @@ class NPUModelRunner(GPUModelRunner):
                 ),
             ) as kv_connector_output,
         ):
+            import sys as _sys_premf
+            _sys_premf.stderr.write(f"[EXEC] step={getattr(self, '_step_counter', '?')} "
+                                     f"calling _model_forward (tokens={num_tokens_padded})\n")
+            _sys_premf.stderr.flush()
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
@@ -2073,6 +2150,22 @@ class NPUModelRunner(GPUModelRunner):
                 batch_desc,
             )
             self.kv_connector_output = kv_connector_output
+
+        import sys as _sys_em2
+        _sys_em2.stderr.write(f"[EXEC] step={getattr(self, '_step_counter', '?')} "
+                              f"execute_model DONE, state stored\n")
+        _sys_em2.stderr.flush()
+
+        # After FDO graph replay, the default NPU stream is corrupted:
+        # synchronize, Events, and certain GPU operations hang.  Replace
+        # the stream so the next step starts with a clean stream.
+        if self._last_run_was_fdo_graph:
+            import torch as _torch_ns
+            _torch_ns.npu.set_stream(_torch_ns.npu.Stream())
+            import sys as _sys_ns
+            _sys_ns.stderr.write(f"[STREAM] step={getattr(self, '_step_counter', '?')} "
+                                 f"replaced corrupted stream after FDO\n")
+            _sys_ns.stderr.flush()
 
         # Now the batch has been launched we can wait for corrections from the
         # previous model forward without breaking async scheduling.
@@ -2519,6 +2612,10 @@ class NPUModelRunner(GPUModelRunner):
             and not forward_context.capturing
             and not self.use_sparse and not self.use_compress
         ):
+            import sys as _sys_up
+            _sys_up.stderr.write(f"[EXEC] step={getattr(self, '_step_counter', '?')} "
+                                  f"_update_full_graph_params ENTRY\n")
+            _sys_up.stderr.flush()
             if self.enable_enpu:
                 torch.npu.current_stream().synchronize()
 
@@ -2532,6 +2629,10 @@ class NPUModelRunner(GPUModelRunner):
                 self.speculative_config,
                 positions.shape[0],
             )
+            import sys as _sys_up2
+            _sys_up2.stderr.write(f"[EXEC] step={getattr(self, '_step_counter', '?')} "
+                                   f"_update_full_graph_params DONE\n")
+            _sys_up2.stderr.flush()
 
     def _model_forward(
         self,
@@ -2545,6 +2646,16 @@ class NPUModelRunner(GPUModelRunner):
         assert self.model is not None
         forward_context = get_forward_context()
         assert forward_context is not None
+
+        import sys as _sys_mf2
+        _sys_mf2.stderr.write(f"[EXEC] step={getattr(self, '_step_counter', '?')} "
+                              f"_model_forward ENTRY (tokens={num_tokens_padded}, "
+                              f"cudagraph_mode={forward_context.cudagraph_runtime_mode})\n")
+        _sys_mf2.stderr.flush()
+
+        # Reset the FDO flag at start of each forward. It gets set back to True
+        # below iff this step actually replays an FDO graph.
+        self._last_run_was_fdo_graph = False
 
         model_inputs: dict[str, Any] = {
             "input_ids": input_ids,
@@ -2570,13 +2681,32 @@ class NPUModelRunner(GPUModelRunner):
                 self._update_full_graph_params_if_needed(
                     forward_context, num_tokens_padded, positions
                 )
+            import sys as _sys_mf
+            _sys_mf.stderr.write(f"[EXEC] step={getattr(self, '_step_counter', '?')} "
+                                 f"_model_forward: replaying graph (tokens={num_tokens_padded})\n")
+            _sys_mf.stderr.flush()
             hidden_states = run_model()
+            # NOTE: Do NOT synchronize the stream after FDO graph replay.
+            # Stream sync / Events / blocking D2H copies all hang.  Mark so
+            # _prepare_inputs can skip the GPU→CPU seq_lens copy.
+            self._last_run_was_fdo_graph = True
+            _sys_mf.stderr.write(f"[EXEC] step={getattr(self, '_step_counter', '?')} "
+                                 f"_model_forward: graph replay DONE\n")
+            _sys_mf.stderr.flush()
         else:
             hidden_states = run_model()
+            # NOTE: Do NOT synchronize the stream after FDO graph replay.
+            # The graph replay on Ascend leaves the default stream in a state
+            # where synchronize() / Event.synchronize() / blocking D2H copies
+            # all hang indefinitely.  Mark so _prepare_inputs can skip the
+            # GPU→CPU seq_lens copy.
             if isinstance(self.model, ACLGraphWrapper):
                 self._update_full_graph_params_if_needed(
                     forward_context, num_tokens_padded, positions
                 )
+                if (forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+                        and not forward_context.capturing):
+                    self._last_run_was_fdo_graph = True
 
         if forward_context.flash_comm_v1_enabled and not isinstance(hidden_states, IntermediateTensors):
             hidden_states = self._all_gather_hidden_states_and_aux(hidden_states)
@@ -2749,6 +2879,10 @@ class NPUModelRunner(GPUModelRunner):
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
         """
+        import sys as _sys_bam2
+        _sys_bam2.stderr.write(f"[EXEC] _bam ENTRY use_spec_decode={use_spec_decode} "
+                                f"num_tokens={num_tokens} num_tokens_padded={num_tokens_padded}\n")
+        _sys_bam2.stderr.flush()
         # Attention metadata is not needed for attention free models
         if len(self.kv_cache_config.kv_cache_groups) == 0:
             return {}, None
@@ -2760,10 +2894,19 @@ class NPUModelRunner(GPUModelRunner):
 
         # Ensure the async GPU→CPU copy of corrected seq_lens (launched in
         # _prepare_inputs) has completed before we read optimistic_seq_lens_cpu.
+        import sys as _sys_bam_pre
+        _sys_bam_pre.stderr.write(f"[EXEC] _bam pre-sync: event_pending="
+                                   f"{self._seq_lens_cpu_event_pending} "
+                                   f"event_is_none={self._seq_lens_cpu_event is None}\n")
+        _sys_bam_pre.stderr.flush()
         if self._seq_lens_cpu_event_pending and self._seq_lens_cpu_event is not None:
-            self._seq_lens_cpu_event.synchronize()
+            import torch as _torch_sync
+            _torch_sync.npu.current_stream().synchronize()
             self._seq_lens_cpu_event_pending = False
 
+        import sys as _sys_bam_msl
+        _sys_bam_msl.stderr.write(f"[EXEC] _bam computing max_seq_len...\n")
+        _sys_bam_msl.stderr.flush()
         if for_cudagraph_capture:
             # For some attention backends (e.g. FA) with sliding window models we need
             # to make sure the backend see a max_seq_len that is larger to the sliding
@@ -2986,7 +3129,12 @@ class NPUModelRunner(GPUModelRunner):
         decode_ratio_to_sas_metadata: dict[Any, Any] = {}
         common_ratio_to_sas_metadata: dict[Any, Any] = {}
         spec_decode_common_attn_metadata = None
+        import sys as _sys_bam_loop
+        _sys_bam_loop.stderr.write(f"[EXEC] _bam loop start: {len(self.kv_cache_config.kv_cache_groups)} groups\n")
+        _sys_bam_loop.stderr.flush()
         for kv_cache_gid, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
+            _sys_bam_loop.stderr.write(f"[EXEC] _bam loop gid={kv_cache_gid} layers={len(kv_cache_group.layer_names)}\n")
+            _sys_bam_loop.stderr.flush()
             cm = copy(cm_base)  # shallow copy
             # Basically only the encoder seq_lens, block_table and slot_mapping change
             # for each kv_cache_group.
@@ -3056,6 +3204,9 @@ class NPUModelRunner(GPUModelRunner):
             # the attention metadata in directly), and therefore does not want to use
             # padded attention metadata.
             spec_decode_common_attn_metadata = spec_decode_common_attn_metadata.unpadded(num_tokens, num_reqs)
+        import sys as _sys_bam3
+        _sys_bam3.stderr.write(f"[EXEC] _bam RETURN\n")
+        _sys_bam3.stderr.flush()
         return attn_metadata, spec_decode_common_attn_metadata
 
     def _should_build_dummy_attn_metadata(
