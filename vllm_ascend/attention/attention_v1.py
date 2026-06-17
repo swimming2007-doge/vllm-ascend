@@ -1510,11 +1510,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # correct cross-attention; otherwise keep FIA for self-attention.
         if key.shape[0] != num_tokens:
             # Cross-attention: K/V gathered from cache is longer than Q.
-            import sys as _sys_lh
-            _sys_lh.stderr.write(f"[LARGE-HEAD-SDPA] layer={self._layer_name} "
-                                 f"q_len={num_tokens} kv_len={key.shape[0]} "
-                                 f"causal={attn_metadata.causal}\n")
-            _sys_lh.stderr.flush()
+            # Ascend FIA cannot handle different Q/KV lengths; use PyTorch
+            # SDPA with a correct causal cross-attention mask.
             import torch.nn.functional as F_sdpa
             num_heads = self.num_heads
             num_kv_heads = self.num_kv_heads

@@ -2329,29 +2329,6 @@ class NPUModelRunner(GPUModelRunner):
             logits,
             sampling_metadata,
         )
-        # Diagnose: compare draft vs target greedy tokens
-        _dt = spec_decode_metadata.draft_token_ids
-        if _dt is not None and logits is not None and _dt.numel() > 0:
-            import sys as _sys_vf
-            _target_greedy = logits.argmax(dim=-1)
-            _num_pos = min(_dt.shape[1] if _dt.ndim >= 2 else _dt.shape[0], 5)
-            for _pos in range(_num_pos):
-                _draft_tok = (_dt[0, _pos] if _dt.ndim >= 2 else _dt[_pos]).item()
-                _li = spec_decode_metadata.logits_indices
-                if _li is not None and _pos < len(_li):
-                    _tgt_idx = _li[_pos].item()
-                    if _tgt_idx < len(_target_greedy):
-                        _tgt_tok = _target_greedy[_tgt_idx].item()
-                        _match = "ACCEPT" if _draft_tok == _tgt_tok else "REJECT"
-                    else:
-                        _tgt_tok = -1
-                        _match = "?"
-                else:
-                    _tgt_tok = -1
-                    _match = "?"
-                _sys_vf.stderr.write(
-                    f"[VERIFY] pos={_pos} draft={_draft_tok} target={_tgt_tok} {_match}\n")
-            _sys_vf.stderr.flush()
         return sampler_output
 
     # TODO: remove this func after eagle_proposer is refactored and
