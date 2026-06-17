@@ -3429,6 +3429,33 @@ class NPUModelRunner(GPUModelRunner):
         logger.info("Loading model weights took %.4f GB", m.consumed_memory / float(2**30))
         _log_npu_mem("after load_model complete")
 
+        # ── Phase 0: FP16 fallback for W8A8 MTP ──
+        # When VLLM_ASCEND_MTP_FP16_FALLBACK=K, convert the last K
+        # layers from W8A8 quantized weights back to FP16, so that
+        # backbone_hidden_states consumed by the draft model aren't
+        # corrupted by quantization error.
+        import os as _os
+        _fallback_k_str = _os.environ.get("VLLM_ASCEND_MTP_FP16_FALLBACK", "0")
+        try:
+            _fallback_k = int(_fallback_k_str)
+        except ValueError:
+            _fallback_k = 0
+        if _fallback_k > 0 and self.speculative_config is not None:
+            logger.info(
+                "Applying FP16 fallback to last %d layers for W8A8 MTP...",
+                _fallback_k,
+            )
+            try:
+                import sys as _sys
+                _sys.path.insert(0, "/workspace")
+                from mtp_fp16_fallback import apply_fp16_fallback
+                self.model = apply_fp16_fallback(self.model, _fallback_k)
+            except Exception as _e:
+                logger.error(
+                    "FP16 fallback failed: %s. Continuing with full W8A8.",
+                    _e,
+                )
+
         # wrap the model with full graph wrapper if needed.
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             self.update_stream: torch.npu.Stream = torch.npu.Stream()
