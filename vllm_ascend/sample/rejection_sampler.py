@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+
 import torch
 from vllm.triton_utils import HAS_TRITON, triton
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -18,6 +20,11 @@ from vllm_ascend.ops.triton.reject_sample import (
     rejection_random_sample_kernel,
     sample_recovered_tokens_kernel,
 )
+
+# VLLM_ASCEND_GREEDY_SLACK: slack ratio for greedy rejection sampling.
+# 1.0 = strict argmax match (default). 0.95 = accept draft token if its
+# target logit >= 0.95 * max_logit. Lower values = more lenient acceptance.
+_GREEDY_SLACK_RATIO = float(os.environ.get("VLLM_ASCEND_GREEDY_SLACK", "1.0"))
 from vllm_ascend.sample.sampler import apply_top_k_top_p
 
 
@@ -141,11 +148,13 @@ def rejection_sample(
                 cu_num_draft_tokens,
                 draft_token_ids,
                 target_argmax,
+                target_logits,
                 bonus_token_ids,
                 is_greedy,
                 max_spec_len,
                 grid,
                 block_size,
+                slack_ratio=_GREEDY_SLACK_RATIO,
             )
         else:
             if min(num_draft_tokens) == 1 and max(num_draft_tokens) == 1 and sampling_metadata.all_greedy:

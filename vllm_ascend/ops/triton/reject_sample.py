@@ -41,13 +41,16 @@ def bonus_renew_1(
     tl.store(output_token_ids_ptr + position * 2 + 1, bonus_token_id)
 
 
-@triton.jit(do_not_specialize=["max_spec_len"])
+@triton.jit(do_not_specialize=["max_spec_len", "vocab_size"])
 def rejection_greedy_sample_spec_len_1_triton(
     output_token_ids_ptr,  # [batch_size, 2]
     draft_token_ids_ptr,  # [num_tokens]
     target_argmax_ptr,  # [num_tokens]
+    target_logits_ptr,  # [num_tokens, vocab_size] or None
     bonus_token_ids_ptr,
     vec_len,
+    vocab_size,
+    SLACK_RATIO: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     block_idx = tl.program_id(0)
@@ -58,6 +61,8 @@ def rejection_greedy_sample_spec_len_1_triton(
     target_argmax_id = tl.load(target_argmax_ptr + offset, mask)
     tl.store(output_token_ids_ptr + offset * 2, target_argmax_id, mask)
 
+    use_slack = target_logits_ptr is not None and SLACK_RATIO < 1.0
+
     # Add validity check for pos within the loop
     for pos in tl.range(0, BLOCK_SIZE):
         # Calculate the global position of the current token
@@ -65,7 +70,16 @@ def rejection_greedy_sample_spec_len_1_triton(
         if global_pos < vec_len:
             draft_token_id1 = get_element(draft_token_id, (pos,))
             target_argmax1 = get_element(target_argmax_id, (pos,))
-            if draft_token_id1 == target_argmax1:
+            accepted = False
+            if use_slack:
+                draft_logit = tl.load(target_logits_ptr + global_pos * vocab_size + draft_token_id1)
+                max_logit = tl.load(target_logits_ptr + global_pos * vocab_size + target_argmax1)
+                if draft_logit >= max_logit * SLACK_RATIO:
+                    accepted = True
+            else:
+                if draft_token_id1 == target_argmax1:
+                    accepted = True
+            if accepted:
                 bonus_renew_1(
                     bonus_token_ids_ptr,
                     global_pos,
@@ -85,16 +99,19 @@ def bonus_renew(
     tl.store(output_token_ids_ptr + position * (max_spec_len + 1) + num_tokens1, bonus_token_id)
 
 
-@triton.jit(do_not_specialize=["vec_len", "max_spec_len"])
+@triton.jit(do_not_specialize=["vec_len", "max_spec_len", "vocab_size"])
 def rejection_greedy_sample_triton(
     output_token_ids_ptr,  # [batch_size, max_spec_len + 1]
     cu_num_draft_tokens_ptr,  # [batch_size]
     draft_token_ids_ptr,  # [num_tokens]
     target_argmax_ptr,  # [num_tokens]
+    target_logits_ptr,  # [num_tokens, vocab_size] or None (None = strict mode)
     bonus_token_ids_ptr,  # [batch_size]
     is_greedy_ptr,  # [batch_size] or None
     vec_len,
     max_spec_len,
+    vocab_size,
+    SLACK_RATIO: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     block_idx = tl.program_id(0)
@@ -111,6 +128,8 @@ def rejection_greedy_sample_triton(
     end_idx = tl.load(cu_num_draft_tokens_ptr + offset, is_greedy_mask)
     num_draft_tokens = end_idx - start_idx
 
+    use_slack = target_logits_ptr is not None and SLACK_RATIO < 1.0
+
     for pos in tl.range(0, BLOCK_SIZE):
         num_tokens1 = get_element(num_draft_tokens, (pos,))
         rejected = False
@@ -119,15 +138,22 @@ def rejection_greedy_sample_triton(
         position = block_idx * BLOCK_SIZE + pos
         for i in range(num_tokens1):
             if not rejected:
-                draft_token_id = tl.load(draft_token_ids_ptr + start_idx1 + i)
-                target_argmax_id = tl.load(target_argmax_ptr + start_idx1 + i)
+                token_idx = start_idx1 + i
+                draft_token_id = tl.load(draft_token_ids_ptr + token_idx)
+                target_argmax_id = tl.load(target_argmax_ptr + token_idx)
                 tl.store(
                     output_token_ids_ptr + position * (max_spec_len + 1) + i,
                     target_argmax_id,
                 )
-                if draft_token_id != target_argmax_id:
-                    # Reject.
-                    rejected = True
+                if use_slack:
+                    # Accept if target_logit[draft_token] >= max_logit * SLACK_RATIO
+                    draft_logit = tl.load(target_logits_ptr + token_idx * vocab_size + draft_token_id)
+                    max_logit = tl.load(target_logits_ptr + token_idx * vocab_size + target_argmax_id)
+                    if draft_logit < max_logit * SLACK_RATIO:
+                        rejected = True
+                else:
+                    if draft_token_id != target_argmax_id:
+                        rejected = True
 
         if not rejected and is_greedy_mask1:
             bonus_renew(
@@ -311,21 +337,27 @@ def rejection_greedy_sample_with_triton(
     cu_num_draft_tokens,
     draft_token_ids,
     target_argmax,
+    target_logits,
     bonus_token_ids,
     is_greedy,
     max_spec_len,
     grid,
     block_size,
+    slack_ratio=1.0,
 ):
     vec_len = output_token_ids.shape[0]
+    vocab_size = target_logits.shape[-1] if target_logits is not None else 0
 
     if min(num_draft_tokens) == 1 and max(num_draft_tokens) == 1 and is_greedy is None:
         rejection_greedy_sample_spec_len_1_triton[(grid,)](
             output_token_ids,
             draft_token_ids,
             target_argmax,
+            target_logits,
             bonus_token_ids,
             vec_len,
+            vocab_size,
+            SLACK_RATIO=slack_ratio,
             BLOCK_SIZE=block_size,
         )
     else:
@@ -334,10 +366,13 @@ def rejection_greedy_sample_with_triton(
             cu_num_draft_tokens,
             draft_token_ids,
             target_argmax,
+            target_logits,
             bonus_token_ids,
             is_greedy,
             vec_len,
             max_spec_len,
+            vocab_size,
+            SLACK_RATIO=slack_ratio,
             BLOCK_SIZE=block_size,
         )
 
