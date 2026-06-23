@@ -352,6 +352,15 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # VLLM_ASCEND_MTP_MODE: see model_runner_v1.py load_model() for docs
             import os
             mtp_mode = os.environ.get("VLLM_ASCEND_MTP_MODE", "target_eager")
+            # SD² override: MLP patches need Python-level draft execution
+            # (no ACL graph capture on draft). Force draft_eager mode.
+            if (os.environ.get("VLLM_ASCEND_SD2_COLLECT", "") == "1"
+                    or os.environ.get("VLLM_ASCEND_SD2_WEIGHTS", "") != ""):
+                if mtp_mode != "draft_eager":
+                    logger.info(
+                        "SD² active: overriding VLLM_ASCEND_MTP_MODE %s -> draft_eager "
+                        "(MLP steering patches need eager draft execution)", mtp_mode)
+                mtp_mode = "draft_eager"
             self._mtp_draft_fdo = mtp_mode in ("target_eager", "both_fdo")
 
             if not self._mtp_draft_fdo:
@@ -914,6 +923,33 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 "inputs_embeds": inputs_embeds,
             }
 
+            # SD²: compute steering biases from target intermediate-layer
+            # hidden states collected during the target model forward.
+            # Biases are computed once (target hidden states don't change
+            # across draft steps) and cached on self for the loop below.
+            self._sd2_steering_biases = None
+            _sd2_aux = getattr(self, "_sd2_aux_hidden_states", None)
+            _sd2_runtime = getattr(self, "_sd2", None)
+            if not getattr(self, '_sd2_aux_logged', False):
+                import sys
+                print(f"[SD2_DRAFT] _sd2_aux is not None: {_sd2_aux is not None}, "
+                      f"_sd2_runtime is not None: {_sd2_runtime is not None}, "
+                      f"collect={getattr(_sd2_runtime, 'collect', 'N/A')}",
+                      file=sys.stderr, flush=True)
+                self._sd2_aux_logged = True
+            if _sd2_aux is not None:
+                # Record full backbone hidden states for calibration
+                # (before any steering is applied — raw target features).
+                from vllm_ascend.ops.sd2_patch import record_full_backbone
+                record_full_backbone(torch.cat(_sd2_aux, dim=-1))
+
+                if _sd2_runtime is not None and not _sd2_runtime.collect:
+                    # Inference mode: compute and inject trained biases.
+                    self._sd2_steering_biases = _sd2_runtime.compute_biases(_sd2_aux)
+                    model_kwargs["steering_biases"] = self._sd2_steering_biases
+                # Collection mode: skip bias injection (steering module
+                # has random weights — would distort captured up_proj).
+
             if self.pass_hidden_states_to_model:
                 model_hidden_states = self.hidden_states[:num_input_tokens]
                 model_hidden_states, model_positions = self.maybe_pad_and_reduce(model_hidden_states, model_positions)
@@ -1077,6 +1113,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             }
             if self.pass_hidden_states_to_model:
                 model_kwargs["hidden_states"] = model_hidden_states
+            if self._sd2_steering_biases is not None:
+                model_kwargs["steering_biases"] = self._sd2_steering_biases
 
             ret_hidden_states = self.model(**model_kwargs)
             if not self.model_returns_tuple():
@@ -1113,6 +1151,28 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = draft_token_ids_tensor.swapaxes(0, 1)
+
+        # SD² collection: flush captured tensors to CPU after real inference
+        # (only when _sd2_aux_hidden_states was set, i.e. real inference,
+        # not dummy_run).  Save every 100 samples.
+        if (getattr(self, "_sd2_aux_hidden_states", None) is not None
+                and getattr(self, "_sd2", None) is not None
+                and self._sd2.collect):
+            import sys
+            print("[SD2_FLUSH] entering flush", file=sys.stderr, flush=True)
+            from vllm_ascend.ops.sd2_patch import (
+                _flush_to_cpu, save_collected_data, _COLLECTED_BACKBONE, _SAVE_PATH,
+            )
+            _flush_to_cpu()
+            n = len(_COLLECTED_BACKBONE)
+            print(f"[SD2_FLUSH] n={n} after flush", file=sys.stderr, flush=True)
+            if n > 0 and n % 100 == 0:
+                save_collected_data(_SAVE_PATH)
+
+        # Clear SD² state to prevent stale data from leaking into graph capture
+        # (dummy_run calls _run_merged_draft without setting _sd2_aux_hidden_states).
+        self._sd2_aux_hidden_states = None
+        self._sd2_steering_biases = None
         return draft_token_ids
 
     def set_inputs_first_pass(

@@ -573,6 +573,11 @@ class NPUModelRunner(GPUModelRunner):
                 elif self.speculative_config.method == "extract_hidden_states":
                     assert isinstance(self.drafter, AscendExtractHiddenStatesProposer)
                     self.use_aux_hidden_state_outputs = True
+                elif (self.speculative_config.method == "mtp"
+                      and self.speculative_config.uses_draft_model()):
+                    from vllm_ascend.spec_decode.sd2 import is_sd2_enabled
+                    if is_sd2_enabled():
+                        self.use_aux_hidden_state_outputs = True
                 self.rejection_sampler = RejectionSampler(self.sampler)
         self.discard_request_indices = self._make_buffer(self.max_num_reqs, dtype=torch.int64)
         self.num_discarded_requests = 0
@@ -1565,6 +1570,17 @@ class NPUModelRunner(GPUModelRunner):
             if mtp_hidden_states is not None:
                 hidden_states = mtp_hidden_states
 
+            # SD²: when enabled, do NOT overwrite target_hidden_states with
+            # concatenated aux hidden states.  Keep final-layer hidden states
+            # for the draft model's pre_projection, and pass aux_hidden_states
+            # separately (they reach the proposer via the existing parameter).
+            from vllm_ascend.spec_decode.sd2 import is_sd2_enabled as _sd2_check
+            _sd2_active = _sd2_check()
+            import sys
+            print(f"[SD2_PROPOSE] _sd2_active={_sd2_active} aux_hidden_states_is_None={aux_hidden_states is None} "
+                  f"use_aux_hs_outputs={getattr(self, 'use_aux_hidden_state_outputs', 'N/A')}",
+                  file=sys.stderr, flush=True)
+
             num_rejected_tokens_gpu = None
             if spec_decode_metadata is None:
                 # update pcp related params
@@ -1573,14 +1589,14 @@ class NPUModelRunner(GPUModelRunner):
                     target_token_ids = input_ids_pcp_full[:num_scheduled_tokens]
                     target_positions = self._get_positions(num_scheduled_tokens)
                     target_hidden_states = hidden_states
-                    if self.use_aux_hidden_state_outputs:
+                    if self.use_aux_hidden_state_outputs and not _sd2_active:
                         target_hidden_states = torch.cat([h for h in aux_hidden_states], dim=-1)
                 else:
                     token_indices_to_sample = None
                     # input_ids can be None for multimodal models.
                     target_token_ids = self.input_ids.gpu[:num_scheduled_tokens]
                     target_positions = self._get_positions(num_scheduled_tokens)
-                    if self.use_aux_hidden_state_outputs:
+                    if self.use_aux_hidden_state_outputs and not _sd2_active:
                         target_hidden_states = torch.cat([h[:num_scheduled_tokens] for h in aux_hidden_states], dim=-1)
                     else:
                         target_hidden_states = hidden_states[:num_scheduled_tokens]
@@ -1610,16 +1626,26 @@ class NPUModelRunner(GPUModelRunner):
                     target_token_ids = input_ids_pcp_full[token_indices]
                     target_positions = positions
                     target_hidden_states = hidden_states
-                    if self.use_aux_hidden_state_outputs:
+                    if self.use_aux_hidden_state_outputs and not _sd2_active:
                         target_hidden_states = torch.cat([h for h in aux_hidden_states], dim=-1)
                 else:
                     target_token_ids = self.input_ids.gpu[token_indices]
                     target_positions = self._get_positions(token_indices)
-                    if self.use_aux_hidden_state_outputs:
+                    if self.use_aux_hidden_state_outputs and not _sd2_active:
                         target_hidden_states = torch.cat([h[token_indices] for h in aux_hidden_states], dim=-1)
                     else:
                         target_hidden_states = hidden_states[token_indices]
             assert self.drafter is not None
+            # SD²: stash aux_hidden_states on the drafter so _run_merged_draft
+            # can compute steering biases from target intermediate layers.
+            if _sd2_active and aux_hidden_states is not None:
+                self.drafter._sd2_aux_hidden_states = aux_hidden_states
+            else:
+                if _sd2_active:
+                    import sys
+                    print(f"[SD2_STASH] SKIP: aux_hidden_states IS NONE (use_aux_hs={getattr(self, 'use_aux_hidden_state_outputs', '?')})",
+                          file=sys.stderr, flush=True)
+                self.drafter._sd2_aux_hidden_states = None
             draft_token_ids = self.drafter._propose(
                 target_token_ids=target_token_ids,
                 target_positions=target_positions,
@@ -3412,16 +3438,23 @@ class NPUModelRunner(GPUModelRunner):
                 with get_tp_context(self.drafter):
                     self.drafter.load_model(self.model)
                 if self.use_aux_hidden_state_outputs:
-                    from vllm.model_executor.models.interfaces import supports_eagle3
-                    if not supports_eagle3(self.model):
-                        raise RuntimeError(
-                            "Model does not support EAGLE3 interface but "
-                            "aux_hidden_state_outputs was requested"
-                        )
-                    aux_layers = self._get_eagle3_aux_layers_from_config()
-                    if not aux_layers:
-                        aux_layers = self.model.get_eagle3_default_aux_hidden_state_layers()
-                    self.model.set_aux_hidden_state_layers(aux_layers)
+                    from vllm_ascend.spec_decode.sd2 import is_sd2_enabled, get_sd2_layers
+                    if is_sd2_enabled() and self.speculative_config.method == "mtp":
+                        # SD²: set user-specified target layers for steering
+                        aux_layers = get_sd2_layers()
+                        self.model.set_aux_hidden_state_layers(aux_layers)
+                    else:
+                        # EAGLE-3 / extract_hidden_states path
+                        from vllm.model_executor.models.interfaces import supports_eagle3
+                        if not supports_eagle3(self.model):
+                            raise RuntimeError(
+                                "Model does not support EAGLE3 interface but "
+                                "aux_hidden_state_outputs was requested"
+                            )
+                        aux_layers = self._get_eagle3_aux_layers_from_config()
+                        if not aux_layers:
+                            aux_layers = self.model.get_eagle3_default_aux_hidden_state_layers()
+                        self.model.set_aux_hidden_state_layers(aux_layers)
 
             if self.lora_config:
                 self.model = self.load_lora_model(self.model, self.vllm_config, self.device)
@@ -3445,6 +3478,15 @@ class NPUModelRunner(GPUModelRunner):
             #   "both_fdo":              Target FDO,   Draft FDO    (Phase 3)
             import os
             mtp_mode = os.environ.get("VLLM_ASCEND_MTP_MODE", "target_eager")
+            # SD² override: MLP patches need Python-level draft execution
+            # (no ACL graph capture on draft). Force draft_eager mode.
+            if (os.environ.get("VLLM_ASCEND_SD2_COLLECT", "") == "1"
+                    or os.environ.get("VLLM_ASCEND_SD2_WEIGHTS", "") != ""):
+                if mtp_mode != "draft_eager":
+                    logger.info(
+                        "SD² active: overriding VLLM_ASCEND_MTP_MODE %s -> draft_eager "
+                        "(MLP steering patches need eager draft execution)", mtp_mode)
+                mtp_mode = "draft_eager"
             if mtp_mode == "draft_eager":
                 self._mtp_target_fdo = True
                 self._mtp_draft_fdo = False
