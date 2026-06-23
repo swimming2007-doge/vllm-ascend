@@ -2078,6 +2078,17 @@ class AscendAttentionBackendImpl(AttentionImpl):
             attn_output = self._forward_encoder_attention(query, key, value, attn_metadata, output)
             output[:num_tokens] = attn_output[:num_tokens]
             return output
+        # ── FORWARD DIAG (draft layers, once) ──
+        if (getattr(self, 'kv_sharing_target_layer_name', None) is not None
+                and not getattr(self, '_fwd_logged', False)):
+            object.__setattr__(self, '_fwd_logged', True)
+            import sys
+            print(f"[ATTN_FORWARD] layer={self._layer_name} head_dim={self.head_size} "
+                  f"kv_share={self.kv_sharing_target_layer_name} "
+                  f"key_is_None={key is None} value_is_None={value is None} "
+                  f"num_tokens={num_tokens}",
+                  file=sys.stderr, flush=True)
+
         if output_padded is not None:
             attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output_padded)
         else:

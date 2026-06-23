@@ -2341,6 +2341,20 @@ class NPUModelRunner(GPUModelRunner):
 
         if lmhead_tp_enable() and logits is not None:
             logits = logits[: len(spec_decode_metadata.logits_indices)]
+
+        # ── TARGET LOGITS DIAGNOSTIC (once) ──
+        if not getattr(self, '_target_logits_diag', False):
+            self._target_logits_diag = True
+            import sys
+            _tgt_idx = spec_decode_metadata.target_logits_indices
+            if _tgt_idx is not None and len(_tgt_idx) > 0 and logits is not None:
+                _t_logits = logits[_tgt_idx[0]:_tgt_idx[0]+1]  # first target logit
+                _t_topk = torch.topk(_t_logits[0].float(), k=20, dim=-1)
+                print(f"[TARGET_LOGITS_POS0] top20_ids: {_t_topk.indices.tolist()}", file=sys.stderr, flush=True)
+                _t_probs = torch.softmax(_t_logits[0].float(), dim=-1)
+                _t_top_probs = _t_probs[_t_topk.indices].tolist()
+                print(f"[TARGET_LOGITS_POS0] top20_probs: {[f'{p:.4f}' for p in _t_top_probs]}", file=sys.stderr, flush=True)
+
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
             None,  # draft_probs
