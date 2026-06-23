@@ -1872,11 +1872,21 @@ class AscendAttentionBackendImpl(AttentionImpl):
         ):
             self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
 
+        # Large-head fallback: head_dim not in {64,128,192,256}.
+        # FIA writes KV cache in TND layout, but _forward_shared_kv_prefill_attention
+        # uses PyTorch SDPA which expects standard [B,H,L,D] layout.  When the
+        # gathered KV data is in TND layout, SDPA misinterprets the bytes, producing
+        # garbage attention output.  Skip the SDPA prefill path for large-head layers;
+        # they will fall through to Condition A which uses PA (Ascend native op that
+        # understands TND layout and reads directly from paged cache).
+        use_large_head_fallback = self._should_use_large_head_attention_fallback()
+
         if (
             self.kv_sharing_target_layer_name is not None
             and key is not None
             and value is not None
             and query.shape[0] == key.shape[0]
+            and not use_large_head_fallback
             and attn_metadata.attn_state in (AscendAttentionState.PrefillNoCache, AscendAttentionState.ChunkedPrefill, AscendAttentionState.SpecDecoding)
         ):
             # Try slot_mapping-based lookup first (needed when the
@@ -1914,7 +1924,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     output,
                 )
 
-        use_large_head_fallback = self._should_use_large_head_attention_fallback()
         _pa_usable = using_paged_attention(num_tokens, self.vllm_config)
 
         # PagedAttention fails during FULL_DECODE_ONLY graph capture even
