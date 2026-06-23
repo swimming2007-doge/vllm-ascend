@@ -1576,10 +1576,6 @@ class NPUModelRunner(GPUModelRunner):
             # separately (they reach the proposer via the existing parameter).
             from vllm_ascend.spec_decode.sd2 import is_sd2_enabled as _sd2_check
             _sd2_active = _sd2_check()
-            import sys
-            print(f"[SD2_PROPOSE] _sd2_active={_sd2_active} aux_hidden_states_is_None={aux_hidden_states is None} "
-                  f"use_aux_hs_outputs={getattr(self, 'use_aux_hidden_state_outputs', 'N/A')}",
-                  file=sys.stderr, flush=True)
 
             num_rejected_tokens_gpu = None
             if spec_decode_metadata is None:
@@ -1641,10 +1637,6 @@ class NPUModelRunner(GPUModelRunner):
             if _sd2_active and aux_hidden_states is not None:
                 self.drafter._sd2_aux_hidden_states = aux_hidden_states
             else:
-                if _sd2_active:
-                    import sys
-                    print(f"[SD2_STASH] SKIP: aux_hidden_states IS NONE (use_aux_hs={getattr(self, 'use_aux_hidden_state_outputs', '?')})",
-                          file=sys.stderr, flush=True)
                 self.drafter._sd2_aux_hidden_states = None
             draft_token_ids = self.drafter._propose(
                 target_token_ids=target_token_ids,

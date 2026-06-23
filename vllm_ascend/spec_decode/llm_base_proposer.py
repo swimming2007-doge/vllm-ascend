@@ -930,13 +930,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             self._sd2_steering_biases = None
             _sd2_aux = getattr(self, "_sd2_aux_hidden_states", None)
             _sd2_runtime = getattr(self, "_sd2", None)
-            if not getattr(self, '_sd2_aux_logged', False):
-                import sys
-                print(f"[SD2_DRAFT] _sd2_aux is not None: {_sd2_aux is not None}, "
-                      f"_sd2_runtime is not None: {_sd2_runtime is not None}, "
-                      f"collect={getattr(_sd2_runtime, 'collect', 'N/A')}",
-                      file=sys.stderr, flush=True)
-                self._sd2_aux_logged = True
             if _sd2_aux is not None:
                 # Record full backbone hidden states for calibration
                 # (before any steering is applied — raw target features).
@@ -1007,6 +1000,23 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             token_indices_to_sample = token_indices_to_sample[:num_indices]
 
         draft_token_ids = logits.argmax(dim=-1)
+
+        # ── DRAFT LOGITS DIAGNOSTIC (Pos0) ──
+        _diag = not getattr(self, '_logits_diag_done', False)
+        if _diag:
+            self._logits_diag_done = True
+            import sys
+            _topk = torch.topk(logits[0], k=20, dim=-1)
+            _top_ids = _topk.indices.tolist()
+            _top_vals = _topk.values.tolist()
+            print(f"[DRAFT_LOGITS_POS0] top-20 ids: {_top_ids}",
+                  file=sys.stderr, flush=True)
+            print(f"[DRAFT_LOGITS_POS0] top-20 vals: {[f'{v:.2f}' for v in _top_vals]}",
+                  file=sys.stderr, flush=True)
+            _probs = torch.softmax(logits[0], dim=-1)
+            _top_probs = _probs[_topk.indices].tolist()
+            print(f"[DRAFT_LOGITS_POS0] top-20 probs={[f'{p:.4f}' for p in _top_probs]}",
+                  file=sys.stderr, flush=True)
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:

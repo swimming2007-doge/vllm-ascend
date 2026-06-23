@@ -1916,6 +1916,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 )
 
             if shared_key is not None and shared_value is not None:
+                # ── ATTENTION PATH DIAGNOSTIC ──
+                if not getattr(self, '_attn_path_logged', False):
+                    self._attn_path_logged = True
+                    import sys
+                    print(f"[ATTN_PATH] layer={self._layer_name} head_dim={self.head_size} "
+                          f"path=KV_SHARED_SDPA attn_state={attn_metadata.attn_state} "
+                          f"num_tokens={num_tokens}",
+                          file=sys.stderr, flush=True)
                 return self._forward_shared_kv_prefill_attention(
                     query,
                     shared_key,
@@ -1934,6 +1942,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL
         )
 
+        _path = "FIA"  # default
         if (
             attn_metadata.attn_state in (AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding)
             and (self.sliding_window is None or self.kv_sharing_target_layer_name is not None)
@@ -1942,6 +1951,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             # PA works for all head_dims on this Ascend device;
             # the large-head fallback flag just means we skip FIA.
             output = self.forward_paged_attention(query, attn_metadata, output)
+            _path = "PA"
         elif (
             not _EXTRA_CTX.capturing
             and use_large_head_fallback
@@ -1952,6 +1962,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             and attn_metadata.attn_state in (AscendAttentionState.PrefillNoCache, AscendAttentionState.ChunkedPrefill, AscendAttentionState.SpecDecoding)
         ):
             output = self._forward_large_head_prefill_attention(query, key, value, attn_metadata, output)
+            _path = "LARGE_HEAD_PREFILL"
         elif use_large_head_fallback:
             # Large head_dim + non-DecodeOnly, non-prefill edge case.
             # During FDO capture, PA and FIA v2 both fail for head_dim=512.
@@ -1961,10 +1972,24 @@ class AscendAttentionBackendImpl(AttentionImpl):
             if _is_fdo_capture:
                 output = self._fdo_safe_large_head_attention(
                     query, key, value, attn_metadata, output, kv_cache)
+                _path = "FDO_SDPA"
             else:
                 output = self.forward_paged_attention(query, attn_metadata, output)
+                _path = "PA_FALLBACK"
         else:
             output = self.forward_fused_infer_attention(query, key, value, attn_metadata, output, kv_cache)
+            _path = "FIA"
+
+        # ── ATTENTION PATH LOG (draft layers only, once) ──
+        if (self.kv_sharing_target_layer_name is not None
+                and not getattr(self, '_attn_path_logged', False)):
+            self._attn_path_logged = True
+            import sys
+            print(f"[ATTN_PATH] layer={self._layer_name} head_dim={self.head_size} "
+                  f"path={_path} attn_state={attn_metadata.attn_state} "
+                  f"num_tokens={num_tokens} large_head={use_large_head_fallback} "
+                  f"sliding={self.sliding_window}",
+                  file=sys.stderr, flush=True)
 
         return output
 
