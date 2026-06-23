@@ -1857,6 +1857,17 @@ class AscendAttentionBackendImpl(AttentionImpl):
     ):
         num_tokens = query.shape[0]
 
+        # ── FORWARD_IMPL ENTRY (draft layers, once) ──
+        if (self.kv_sharing_target_layer_name is not None
+                and not getattr(self, '_entry_logged', False)):
+            object.__setattr__(self, '_entry_logged', True)
+            import sys
+            print(f"[ATTN_ENTRY] layer={self._layer_name} head_dim={self.head_size} "
+                  f"kv_share={self.kv_sharing_target_layer_name} "
+                  f"key_is_None={key is None} value_is_None={value is None} "
+                  f"num_tokens={num_tokens} attn_state={attn_metadata.attn_state}",
+                  file=sys.stderr, flush=True)
+
         # KV-sharing layers (e.g., Gemma4 MTP draft) read K/V from the
         # target layer's cache.  Ensure self.key_cache / self.value_cache
         # are initialised from the kv_cache tuple BEFORE calling
