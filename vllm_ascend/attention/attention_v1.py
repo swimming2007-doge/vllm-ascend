@@ -2067,6 +2067,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 )
         # pooling model branch
         if attn_metadata.model_runner_type == "pooling" and not attn_metadata.causal:
+            if getattr(self, 'kv_sharing_target_layer_name', None) is not None:
+                with open('/tmp/attn_path_debug.log', 'a') as _f:
+                    _f.write(f"[ATTN_POOLING_RETURN] layer={self._layer_name} early_return!\n")
             attn_output = self._forward_encoder_attention(query, key, value, attn_metadata, output)
             output[:num_tokens] = attn_output[:num_tokens]
             return output
