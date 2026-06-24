@@ -1859,9 +1859,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
         # ── FORWARD_IMPL ENTRY (draft layers, every call) ──
         if self.kv_sharing_target_layer_name is not None:
-            import torch as _torch
-            if not _torch.compiler.is_compiling():
-                with open('/tmp/attn_path_debug.log', 'a') as _f:
+            with open('/tmp/attn_path_debug.log', 'a') as _f:
                     _f.write(f"[ATTN_ENTRY] layer={self._layer_name} head_dim={self.head_size} "
                              f"key_is_None={key is None} value_is_None={value is None} "
                              f"num_tokens={num_tokens} attn_state={attn_metadata.attn_state}\n")
@@ -1990,9 +1988,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
         # ── ATTENTION PATH LOG (draft layers only, once) ──
         if self.kv_sharing_target_layer_name is not None:
-            import torch as _torch
-            if not _torch.compiler.is_compiling():
-                with open('/tmp/attn_path_debug.log', 'a') as _f:
+            with open('/tmp/attn_path_debug.log', 'a') as _f:
                     _f.write(f"[ATTN_PATH] layer={self._layer_name} head_dim={self.head_size} "
                              f"path={_path} attn_state={attn_metadata.attn_state} "
                              f"num_tokens={num_tokens} large_head={use_large_head_fallback} "
@@ -2076,9 +2072,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             return output
         # ── FORWARD DIAG (draft layers, every call) ──
         if getattr(self, 'kv_sharing_target_layer_name', None) is not None:
-            import torch as _torch
-            if not _torch.compiler.is_compiling():
-                with open('/tmp/attn_path_debug.log', 'a') as _f:
+            with open('/tmp/attn_path_debug.log', 'a') as _f:
                     _f.write(f"[ATTN_FORWARD] layer={self._layer_name} head_dim={self.head_size} "
                              f"key_is_None={key is None} value_is_None={value is None} "
                              f"num_tokens={num_tokens}\n")
