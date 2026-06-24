@@ -1857,15 +1857,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
     ):
         num_tokens = query.shape[0]
 
-        # ── FORWARD_IMPL ENTRY (draft layers, once) ──
-        if (self.kv_sharing_target_layer_name is not None
-                and not getattr(self, '_entry_logged', False)):
-            object.__setattr__(self, '_entry_logged', True)
-            with open('/tmp/attn_path_debug.log', 'a') as _f:
-                _f.write(f"[ATTN_ENTRY] layer={self._layer_name} head_dim={self.head_size} "
-                         f"kv_share={self.kv_sharing_target_layer_name} "
-                         f"key_is_None={key is None} value_is_None={value is None} "
-                         f"num_tokens={num_tokens} attn_state={attn_metadata.attn_state}\n")
+        # ── FORWARD_IMPL ENTRY (draft layers, every call) ──
+        if self.kv_sharing_target_layer_name is not None:
+            import torch as _torch
+            if not _torch.compiler.is_compiling():
+                with open('/tmp/attn_path_debug.log', 'a') as _f:
+                    _f.write(f"[ATTN_ENTRY] layer={self._layer_name} head_dim={self.head_size} "
+                             f"key_is_None={key is None} value_is_None={value is None} "
+                             f"num_tokens={num_tokens} attn_state={attn_metadata.attn_state}\n")
 
         # KV-sharing layers (e.g., Gemma4 MTP draft) read K/V from the
         # target layer's cache.  Ensure self.key_cache / self.value_cache
@@ -1927,8 +1926,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
             if shared_key is not None and shared_value is not None:
                 # ── ATTENTION PATH DIAGNOSTIC ──
-                if not getattr(self, '_attn_path_logged', False):
-                    self._attn_path_logged = True
+                import torch as _torch
+                if not _torch.compiler.is_compiling():
                     with open('/tmp/attn_path_debug.log', 'a') as _f:
                         _f.write(f"[ATTN_PATH] layer={self._layer_name} head_dim={self.head_size} "
                                  f"path=KV_SHARED_SDPA attn_state={attn_metadata.attn_state} "
@@ -1990,14 +1989,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
             _path = "FIA"
 
         # ── ATTENTION PATH LOG (draft layers only, once) ──
-        if (self.kv_sharing_target_layer_name is not None
-                and not getattr(self, '_attn_path_logged', False)):
-            self._attn_path_logged = True
-            with open('/tmp/attn_path_debug.log', 'a') as _f:
-                _f.write(f"[ATTN_PATH] layer={self._layer_name} head_dim={self.head_size} "
-                         f"path={_path} attn_state={attn_metadata.attn_state} "
-                         f"num_tokens={num_tokens} large_head={use_large_head_fallback} "
-                         f"sliding={self.sliding_window}\n")
+        if self.kv_sharing_target_layer_name is not None:
+            import torch as _torch
+            if not _torch.compiler.is_compiling():
+                with open('/tmp/attn_path_debug.log', 'a') as _f:
+                    _f.write(f"[ATTN_PATH] layer={self._layer_name} head_dim={self.head_size} "
+                             f"path={_path} attn_state={attn_metadata.attn_state} "
+                             f"num_tokens={num_tokens} large_head={use_large_head_fallback} "
+                             f"sliding={self.sliding_window}\n")
 
         return output
 
@@ -2075,15 +2074,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
             attn_output = self._forward_encoder_attention(query, key, value, attn_metadata, output)
             output[:num_tokens] = attn_output[:num_tokens]
             return output
-        # ── FORWARD DIAG (draft layers, once) ──
-        if (getattr(self, 'kv_sharing_target_layer_name', None) is not None
-                and not getattr(self, '_fwd_logged', False)):
-            object.__setattr__(self, '_fwd_logged', True)
-            with open('/tmp/attn_path_debug.log', 'a') as _f:
-                _f.write(f"[ATTN_FORWARD] layer={self._layer_name} head_dim={self.head_size} "
-                         f"kv_share={self.kv_sharing_target_layer_name} "
-                         f"key_is_None={key is None} value_is_None={value is None} "
-                         f"num_tokens={num_tokens}\n")
+        # ── FORWARD DIAG (draft layers, every call) ──
+        if getattr(self, 'kv_sharing_target_layer_name', None) is not None:
+            import torch as _torch
+            if not _torch.compiler.is_compiling():
+                with open('/tmp/attn_path_debug.log', 'a') as _f:
+                    _f.write(f"[ATTN_FORWARD] layer={self._layer_name} head_dim={self.head_size} "
+                             f"key_is_None={key is None} value_is_None={value is None} "
+                             f"num_tokens={num_tokens}\n")
 
         if output_padded is not None:
             attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output_padded)
