@@ -1398,12 +1398,29 @@ class AscendAttentionBackendImpl(AttentionImpl):
             return self.full_graph_pa(query, attn_metadata, output)
         # KV sharing: swap to target's key_cache
         _target_impl = getattr(self, '_kv_share_target_impl', None)
-        if _target_impl is not None and getattr(_target_impl, 'key_cache', None) is not None:
+        _has_tgt_cache = (
+            _target_impl is not None
+            and getattr(_target_impl, 'key_cache', None) is not None
+        )
+        if _has_tgt_cache:
             _kc = _target_impl.key_cache
             _vc = _target_impl.value_cache
         else:
             _kc = self.key_cache
             _vc = self.value_cache
+
+        _kv_share = getattr(self, 'kv_sharing_target_layer_name', None)
+        if _kv_share is not None:
+            _bt_shape = attn_metadata.block_tables.shape if attn_metadata.block_tables is not None else None
+            with open('/tmp/attn_path_debug.log', 'a') as _f:
+                _f.write(f"[PA_ENTRY] layer={self._layer_name} head_dim={self.head_size} "
+                         f"has_tgt_impl={_target_impl is not None} "
+                         f"has_tgt_cache={_has_tgt_cache} "
+                         f"using_target_cache={_has_tgt_cache} "
+                         f"self_key_cache_shape={self.key_cache.shape if self.key_cache is not None else None} "
+                         f"tgt_key_cache_shape={_kc.shape} "
+                         f"block_tables_shape={_bt_shape} "
+                         f"seq_lens={attn_metadata.seq_lens}\n")
 
         torch_npu._npu_paged_attention(
             query=query,
@@ -1856,13 +1873,16 @@ class AscendAttentionBackendImpl(AttentionImpl):
         output: torch.Tensor,
     ):
         num_tokens = query.shape[0]
+        _kv_share = getattr(self, 'kv_sharing_target_layer_name', None)
 
-        # ── FORWARD_IMPL ENTRY (draft layers, every call) ──
-        if self.kv_sharing_target_layer_name is not None:
+        # ── DIAG: forward_impl entry ──
+        if _kv_share is not None:
             with open('/tmp/attn_path_debug.log', 'a') as _f:
-                    _f.write(f"[ATTN_ENTRY] layer={self._layer_name} head_dim={self.head_size} "
-                             f"key_is_None={key is None} value_is_None={value is None} "
-                             f"num_tokens={num_tokens} attn_state={attn_metadata.attn_state}\n")
+                _f.write(f"[IMPL_ENTRY] layer={self._layer_name} head_dim={self.head_size} "
+                         f"num_tokens={num_tokens} attn_state={attn_metadata.attn_state} "
+                         f"key_is_None={key is None} value_is_None={value is None} "
+                         f"self.key_cache_is_None={self.key_cache is None} "
+                         f"kv_cache_is_None={kv_cache is None}\n")
 
         # KV-sharing layers (e.g., Gemma4 MTP draft) read K/V from the
         # target layer's cache.  Ensure self.key_cache / self.value_cache
@@ -1878,6 +1898,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
             and len(kv_cache) >= 2
         ):
             self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
+            if _kv_share is not None:
+                with open('/tmp/attn_path_debug.log', 'a') as _f:
+                    _f.write(f"[IMPL_KCACHE_INIT] layer={self._layer_name} "
+                             f"self.key_cache_shape={self.key_cache.shape}\n")
 
         # Large-head fallback: head_dim not in {64,128,192,256}.
         # FIA writes KV cache in TND layout, but _forward_shared_kv_prefill_attention
@@ -1888,14 +1912,27 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # understands TND layout and reads directly from paged cache).
         use_large_head_fallback = self._should_use_large_head_attention_fallback()
 
-        if (
+        _kv_prefill_eligible = (
             self.kv_sharing_target_layer_name is not None
             and key is not None
             and value is not None
             and query.shape[0] == key.shape[0]
             and not use_large_head_fallback
             and attn_metadata.attn_state in (AscendAttentionState.PrefillNoCache, AscendAttentionState.ChunkedPrefill, AscendAttentionState.SpecDecoding)
-        ):
+        )
+
+        if _kv_share is not None:
+            with open('/tmp/attn_path_debug.log', 'a') as _f:
+                _f.write(f"[IMPL_SDPA_CHECK] layer={self._layer_name} "
+                         f"kv_prefill_eligible={_kv_prefill_eligible} "
+                         f"kv_share_not_None={self.kv_sharing_target_layer_name is not None} "
+                         f"key_not_None={key is not None} value_not_None={value is not None} "
+                         f"Qlen_eq_Klen={query.shape[0] == key.shape[0]} "
+                         f"not_large_head={not use_large_head_fallback} "
+                         f"attn_state_ok={attn_metadata.attn_state in (AscendAttentionState.PrefillNoCache, AscendAttentionState.ChunkedPrefill, AscendAttentionState.SpecDecoding)} "
+                         f"large_head={use_large_head_fallback} sliding={self.sliding_window}\n")
+
+        if _kv_prefill_eligible:
             # Try slot_mapping-based lookup first (needed when the
             # same request's target K/V are at known cache slots).
             # BUT: for SpecDecoding, slot_mapping may only cover the
@@ -1922,14 +1959,17 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     attn_metadata
                 )
 
+            if _kv_share is not None:
+                _sk_shape = shared_key.shape if shared_key is not None else None
+                _sk_mean = shared_key.float().mean().item() if shared_key is not None else None
+                with open('/tmp/attn_path_debug.log', 'a') as _f:
+                    _f.write(f"[IMPL_SDPA_GATHER] layer={self._layer_name} "
+                             f"shared_key_shape={_sk_shape} shared_key_mean={_sk_mean}\n")
+
             if shared_key is not None and shared_value is not None:
-                # ── ATTENTION PATH DIAGNOSTIC ──
-                import torch as _torch
-                if not _torch.compiler.is_compiling():
+                if _kv_share is not None:
                     with open('/tmp/attn_path_debug.log', 'a') as _f:
-                        _f.write(f"[ATTN_PATH] layer={self._layer_name} head_dim={self.head_size} "
-                                 f"path=KV_SHARED_SDPA attn_state={attn_metadata.attn_state} "
-                                 f"num_tokens={num_tokens}\n")
+                        _f.write(f"[IMPL_PATH] layer={self._layer_name} path=SDPA_KV_SHARED\n")
                 return self._forward_shared_kv_prefill_attention(
                     query,
                     shared_key,
@@ -1948,17 +1988,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
             and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL
         )
 
-        _path = "FIA"  # default
-        if (
+        _cond_a = (
             attn_metadata.attn_state in (AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding)
             and (self.sliding_window is None or self.kv_sharing_target_layer_name is not None)
             and (_pa_usable or use_large_head_fallback or self.kv_sharing_target_layer_name is not None)
-        ):
-            # PA works for all head_dims on this Ascend device;
-            # the large-head fallback flag just means we skip FIA.
-            output = self.forward_paged_attention(query, attn_metadata, output)
-            _path = "PA"
-        elif (
+        )
+        _cond_b = (
             not _EXTRA_CTX.capturing
             and use_large_head_fallback
             and self.kv_sharing_target_layer_name is None
@@ -1966,9 +2001,27 @@ class AscendAttentionBackendImpl(AttentionImpl):
             and value is not None
             and query.shape[0] == key.shape[0]
             and attn_metadata.attn_state in (AscendAttentionState.PrefillNoCache, AscendAttentionState.ChunkedPrefill, AscendAttentionState.SpecDecoding)
-        ):
+        )
+
+        if _kv_share is not None:
+            with open('/tmp/attn_path_debug.log', 'a') as _f:
+                _f.write(f"[IMPL_COND_ABCD] layer={self._layer_name} "
+                         f"cond_A={_cond_a} cond_B={_cond_b} cond_C={use_large_head_fallback} "
+                         f"pa_usable={_pa_usable} is_fdo_capture={_is_fdo_capture} "
+                         f"capturing={_EXTRA_CTX.capturing}\n")
+
+        if _cond_a:
+            # PA works for all head_dims on this Ascend device;
+            # the large-head fallback flag just means we skip FIA.
+            if _kv_share is not None:
+                with open('/tmp/attn_path_debug.log', 'a') as _f:
+                    _f.write(f"[IMPL_PATH] layer={self._layer_name} path=PA\n")
+            output = self.forward_paged_attention(query, attn_metadata, output)
+        elif _cond_b:
+            if _kv_share is not None:
+                with open('/tmp/attn_path_debug.log', 'a') as _f:
+                    _f.write(f"[IMPL_PATH] layer={self._layer_name} path=LARGE_HEAD_PREFILL_SDPA\n")
             output = self._forward_large_head_prefill_attention(query, key, value, attn_metadata, output)
-            _path = "LARGE_HEAD_PREFILL"
         elif use_large_head_fallback:
             # Large head_dim + non-DecodeOnly, non-prefill edge case.
             # During FDO capture, PA and FIA v2 both fail for head_dim=512.
@@ -1976,23 +2029,21 @@ class AscendAttentionBackendImpl(AttentionImpl):
             # decomposes into capturable ops and supports any head_dim.
             # PIECEWISE capture is not affected (PA works there).
             if _is_fdo_capture:
+                if _kv_share is not None:
+                    with open('/tmp/attn_path_debug.log', 'a') as _f:
+                        _f.write(f"[IMPL_PATH] layer={self._layer_name} path=FDO_SDPA\n")
                 output = self._fdo_safe_large_head_attention(
                     query, key, value, attn_metadata, output, kv_cache)
-                _path = "FDO_SDPA"
             else:
+                if _kv_share is not None:
+                    with open('/tmp/attn_path_debug.log', 'a') as _f:
+                        _f.write(f"[IMPL_PATH] layer={self._layer_name} path=PA_FALLBACK\n")
                 output = self.forward_paged_attention(query, attn_metadata, output)
-                _path = "PA_FALLBACK"
         else:
+            if _kv_share is not None:
+                with open('/tmp/attn_path_debug.log', 'a') as _f:
+                    _f.write(f"[IMPL_PATH] layer={self._layer_name} path=FIA\n")
             output = self.forward_fused_infer_attention(query, key, value, attn_metadata, output, kv_cache)
-            _path = "FIA"
-
-        # ── ATTENTION PATH LOG (draft layers only, once) ──
-        if self.kv_sharing_target_layer_name is not None:
-            with open('/tmp/attn_path_debug.log', 'a') as _f:
-                    _f.write(f"[ATTN_PATH] layer={self._layer_name} head_dim={self.head_size} "
-                             f"path={_path} attn_state={attn_metadata.attn_state} "
-                             f"num_tokens={num_tokens} large_head={use_large_head_fallback} "
-                             f"sliding={self.sliding_window}\n")
 
         return output
 
@@ -2029,6 +2080,20 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
         assert layer._k_scale_float == 1.0 and layer._v_scale_float == 1.0
         num_tokens = query.shape[0]
+
+        _kv_share = getattr(self, 'kv_sharing_target_layer_name', None)
+        _is_draft = getattr(_EXTRA_CTX, 'is_draft_model', False)
+
+        # ── DIAG: forward entry ──
+        if _kv_share is not None:
+            with open('/tmp/attn_path_debug.log', 'a') as _f:
+                _f.write(f"[FWD_ENTRY] layer={self._layer_name} head_dim={self.head_size} "
+                         f"mr_type={attn_metadata.model_runner_type if attn_metadata else 'None'} "
+                         f"causal={attn_metadata.causal if attn_metadata else 'None'} "
+                         f"num_tokens={num_tokens} key_is_None={key is None} "
+                         f"value_is_None={value is None} kv_cache_is_None={kv_cache is None} "
+                         f"is_draft={_is_draft}\n")
+
         if attn_metadata is None:
             return output.fill_(0)
 
@@ -2060,25 +2125,41 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 getattr(self, 'kv_sharing_target_layer_name', None) is not None
                 and getattr(_EXTRA_CTX, 'is_draft_model', False)
             )
+            if _is_draft_kv_share:
+                if _kv_share is not None:
+                    with open('/tmp/attn_path_debug.log', 'a') as _f:
+                        _f.write(f"[FWD_SKIP_RESHAPE] layer={self._layer_name} "
+                                 f"skip reshape_and_cache (draft KV share)\n")
             if not _is_draft_kv_share:
                 output_padded = output
                 query, key, value, output_padded = self.reshape_and_cache(
                     query, key, value, kv_cache, attn_metadata, output
                 )
+
+        # ── DIAG: pooling check ──
+        _is_pooling = (attn_metadata.model_runner_type == "pooling" and not attn_metadata.causal)
+        if _kv_share is not None:
+            with open('/tmp/attn_path_debug.log', 'a') as _f:
+                _f.write(f"[FWD_POOLING_CHECK] layer={self._layer_name} "
+                         f"is_pooling={_is_pooling} "
+                         f"mr_type={attn_metadata.model_runner_type} "
+                         f"causal={attn_metadata.causal} "
+                         f"output_padded_is_None={output_padded is None}\n")
+
         # pooling model branch
-        if attn_metadata.model_runner_type == "pooling" and not attn_metadata.causal:
-            if getattr(self, 'kv_sharing_target_layer_name', None) is not None:
+        if _is_pooling:
+            if _kv_share is not None:
                 with open('/tmp/attn_path_debug.log', 'a') as _f:
-                    _f.write(f"[ATTN_POOLING_RETURN] layer={self._layer_name} early_return!\n")
+                    _f.write(f"[FWD_POOLING_TAKEN] layer={self._layer_name} "
+                             f"calling _forward_encoder_attention\n")
             attn_output = self._forward_encoder_attention(query, key, value, attn_metadata, output)
             output[:num_tokens] = attn_output[:num_tokens]
             return output
-        # ── FORWARD DIAG (draft layers, every call) ──
-        if getattr(self, 'kv_sharing_target_layer_name', None) is not None:
+
+        if _kv_share is not None:
             with open('/tmp/attn_path_debug.log', 'a') as _f:
-                    _f.write(f"[ATTN_FORWARD] layer={self._layer_name} head_dim={self.head_size} "
-                             f"key_is_None={key is None} value_is_None={value is None} "
-                             f"num_tokens={num_tokens}\n")
+                _f.write(f"[FWD_CALL_IMPL] layer={self._layer_name} "
+                         f"calling forward_impl (output_padded={output_padded is not None})\n")
 
         if output_padded is not None:
             attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output_padded)
@@ -2086,21 +2167,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
             attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output)
         output[:num_tokens] = attn_output[:num_tokens]
         return output
-
-
-# Monkey-patch: wrap forward to log every call
-_orig_forward = AscendAttentionBackendImpl.forward
-def _patched_forward(self, layer, query, key, value, kv_cache, attn_metadata, output=None, output_scale=None, output_block_scale=None):
-    _kd = getattr(self, 'kv_sharing_target_layer_name', None)
-    if _kd is not None:
-        try:
-            with open('/tmp/attn_path_debug.log', 'a') as _f:
-                _f.write(f"[FORWARD_PATCHED] layer={getattr(self, '_layer_name', '?')} "
-                         f"head_dim={self.head_size} kv_share={_kd}\n")
-        except:
-            pass
-    return _orig_forward(self, layer, query, key, value, kv_cache, attn_metadata, output=output, output_scale=output_scale, output_block_scale=output_block_scale)
-AscendAttentionBackendImpl.forward = _patched_forward
 
 
 class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
