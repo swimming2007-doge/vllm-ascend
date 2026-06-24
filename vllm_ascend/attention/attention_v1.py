@@ -2085,6 +2085,21 @@ class AscendAttentionBackendImpl(AttentionImpl):
         return output
 
 
+# Monkey-patch: wrap forward to log every call
+_orig_forward = AscendAttentionBackendImpl.forward
+def _patched_forward(self, layer, query, key, value, kv_cache, attn_metadata, output=None, output_scale=None, output_block_scale=None):
+    _kd = getattr(self, 'kv_sharing_target_layer_name', None)
+    if _kd is not None:
+        try:
+            with open('/tmp/attn_path_debug.log', 'a') as _f:
+                _f.write(f"[FORWARD_PATCHED] layer={getattr(self, '_layer_name', '?')} "
+                         f"head_dim={self.head_size} kv_share={_kd}\n")
+        except:
+            pass
+    return _orig_forward(self, layer, query, key, value, kv_cache, attn_metadata, output=output, output_scale=output_scale, output_block_scale=output_block_scale)
+AscendAttentionBackendImpl.forward = _patched_forward
+
+
 class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
     """Attention backend implementation for INT8 KV cache (C8/QuaRot) models.
 
