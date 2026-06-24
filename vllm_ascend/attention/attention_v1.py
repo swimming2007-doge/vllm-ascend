@@ -1861,12 +1861,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
         if (self.kv_sharing_target_layer_name is not None
                 and not getattr(self, '_entry_logged', False)):
             object.__setattr__(self, '_entry_logged', True)
-            import sys
-            print(f"[ATTN_ENTRY] layer={self._layer_name} head_dim={self.head_size} "
-                  f"kv_share={self.kv_sharing_target_layer_name} "
-                  f"key_is_None={key is None} value_is_None={value is None} "
-                  f"num_tokens={num_tokens} attn_state={attn_metadata.attn_state}",
-                  file=sys.stderr, flush=True)
+            with open('/tmp/attn_path_debug.log', 'a') as _f:
+                _f.write(f"[ATTN_ENTRY] layer={self._layer_name} head_dim={self.head_size} "
+                         f"kv_share={self.kv_sharing_target_layer_name} "
+                         f"key_is_None={key is None} value_is_None={value is None} "
+                         f"num_tokens={num_tokens} attn_state={attn_metadata.attn_state}\n")
 
         # KV-sharing layers (e.g., Gemma4 MTP draft) read K/V from the
         # target layer's cache.  Ensure self.key_cache / self.value_cache
@@ -1930,11 +1929,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 # ── ATTENTION PATH DIAGNOSTIC ──
                 if not getattr(self, '_attn_path_logged', False):
                     self._attn_path_logged = True
-                    import sys
-                    print(f"[ATTN_PATH] layer={self._layer_name} head_dim={self.head_size} "
-                          f"path=KV_SHARED_SDPA attn_state={attn_metadata.attn_state} "
-                          f"num_tokens={num_tokens}",
-                          file=sys.stderr, flush=True)
+                    with open('/tmp/attn_path_debug.log', 'a') as _f:
+                        _f.write(f"[ATTN_PATH] layer={self._layer_name} head_dim={self.head_size} "
+                                 f"path=KV_SHARED_SDPA attn_state={attn_metadata.attn_state} "
+                                 f"num_tokens={num_tokens}\n")
                 return self._forward_shared_kv_prefill_attention(
                     query,
                     shared_key,
@@ -1995,12 +1993,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
         if (self.kv_sharing_target_layer_name is not None
                 and not getattr(self, '_attn_path_logged', False)):
             self._attn_path_logged = True
-            import sys
-            print(f"[ATTN_PATH] layer={self._layer_name} head_dim={self.head_size} "
-                  f"path={_path} attn_state={attn_metadata.attn_state} "
-                  f"num_tokens={num_tokens} large_head={use_large_head_fallback} "
-                  f"sliding={self.sliding_window}",
-                  file=sys.stderr, flush=True)
+            with open('/tmp/attn_path_debug.log', 'a') as _f:
+                _f.write(f"[ATTN_PATH] layer={self._layer_name} head_dim={self.head_size} "
+                         f"path={_path} attn_state={attn_metadata.attn_state} "
+                         f"num_tokens={num_tokens} large_head={use_large_head_fallback} "
+                         f"sliding={self.sliding_window}\n")
 
         return output
 
@@ -2082,12 +2079,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
         if (getattr(self, 'kv_sharing_target_layer_name', None) is not None
                 and not getattr(self, '_fwd_logged', False)):
             object.__setattr__(self, '_fwd_logged', True)
-            import sys
-            print(f"[ATTN_FORWARD] layer={self._layer_name} head_dim={self.head_size} "
-                  f"kv_share={self.kv_sharing_target_layer_name} "
-                  f"key_is_None={key is None} value_is_None={value is None} "
-                  f"num_tokens={num_tokens}",
-                  file=sys.stderr, flush=True)
+            with open('/tmp/attn_path_debug.log', 'a') as _f:
+                _f.write(f"[ATTN_FORWARD] layer={self._layer_name} head_dim={self.head_size} "
+                         f"kv_share={self.kv_sharing_target_layer_name} "
+                         f"key_is_None={key is None} value_is_None={value is None} "
+                         f"num_tokens={num_tokens}\n")
 
         if output_padded is not None:
             attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output_padded)
