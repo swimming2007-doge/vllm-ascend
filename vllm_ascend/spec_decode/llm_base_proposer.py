@@ -922,11 +922,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         if self._sync_flag("/tmp/vllm_sync_target_kv"):
             _ev = getattr(self, '_target_done_event', None)
             if _ev is not None:
-                _ev.synchronize()
+                _ev.wait()
         if self._sync_flag("/tmp/vllm_sync_buffers"):
             _ev = getattr(self, '_buffers_ready_event', None)
             if _ev is not None:
-                _ev.synchronize()
+                _ev.wait()
 
     def _run_merged_draft(
         self,
