@@ -610,7 +610,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         )
         # ── SYNC GAP DIAG: record event after all buffer writes ──
         # (_set_positions, input_ids copy are async on NPU)
-        if os.environ.get("VLLM_ASCEND_SYNC_BUFFERS", "") == "1":
+        # Controlled by sentinel file: /tmp/vllm_sync_buffers
+        if os.path.exists("/tmp/vllm_sync_buffers"):
             _buffers_ready = torch.npu.Event()
             _buffers_ready.record()
             self._buffers_ready_event = _buffers_ready
@@ -906,18 +907,23 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
         return draft_token_ids
 
+    @staticmethod
+    def _sync_flag(path: str) -> bool:
+        """Check whether a sync-gap toggle file exists (cheap stat call)."""
+        return os.path.exists(path)
+
     def _sync_wait_target_events(self) -> None:
         """Wait for NPU events recorded after target forward / buffer writes.
 
-        Controlled by env vars for systematic sync-gap measurement:
-          VLLM_ASCEND_SYNC_TARGET_KV=1  → wait for KV cache writes
-          VLLM_ASCEND_SYNC_BUFFERS=1    → wait for buffer writes
+        Controlled by sentinel files (no restart needed):
+          /tmp/vllm_sync_target_kv   → wait for KV cache writes (Test A)
+          /tmp/vllm_sync_buffers     → wait for buffer writes (Test B)
         """
-        if os.environ.get("VLLM_ASCEND_SYNC_TARGET_KV", "") == "1":
+        if self._sync_flag("/tmp/vllm_sync_target_kv"):
             _ev = getattr(self, '_target_done_event', None)
             if _ev is not None:
                 _ev.synchronize()
-        if os.environ.get("VLLM_ASCEND_SYNC_BUFFERS", "") == "1":
+        if self._sync_flag("/tmp/vllm_sync_buffers"):
             _ev = getattr(self, '_buffers_ready_event', None)
             if _ev is not None:
                 _ev.synchronize()

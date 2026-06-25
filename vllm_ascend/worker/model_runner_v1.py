@@ -2024,7 +2024,8 @@ class NPUModelRunner(GPUModelRunner):
         # ── SYNC GAP DIAG: record event after all target forward ops ──
         # (reshape_and_cache KV writes are async on NPU; draft may read
         # stale KV cache without this barrier.)
-        if (os.environ.get("VLLM_ASCEND_SYNC_TARGET_KV", "") == "1"
+        # Controlled by sentinel file: /tmp/vllm_sync_target_kv
+        if (os.path.exists("/tmp/vllm_sync_target_kv")
                 and hasattr(self, 'drafter') and self.drafter is not None):
             _target_done = torch.npu.Event()
             _target_done.record()
