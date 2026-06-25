@@ -1433,6 +1433,15 @@ class AscendAttentionBackendImpl(AttentionImpl):
             context_lens=attn_metadata.seq_lens,
             out=output,
         )
+        if _kv_share is not None:
+            _out_mean = output.float().mean().item()
+            _out_sum = output.float().sum().item()
+            _q_sum = query.float().sum().item()
+            with open('/tmp/attn_path_debug.log', 'a') as _f:
+                _f.write(f"[PA_OUT] layer={self._layer_name} head_dim={self.head_size} "
+                         f"q_sum={_q_sum:.4f} out_sum={_out_sum:.4f} "
+                         f"out_mean={_out_mean:.6f} "
+                         f"num_tokens={query.shape[0]}\n")
         return output
 
     def _forward_encoder_attention(
@@ -1519,6 +1528,15 @@ class AscendAttentionBackendImpl(AttentionImpl):
             num_tokens,
         )
 
+        # ── DIAG: log which branch large-head prefill takes ──
+        _is_cross_attn = key.shape[0] != num_tokens
+        with open('/tmp/attn_path_debug.log', 'a') as _f:
+            _f.write(f"[LGHD_PREFILL_BRANCH] layer={self._layer_name} "
+                     f"cross_attn={_is_cross_attn} "
+                     f"num_tokens={num_tokens} key_len={key.shape[0]} "
+                     f"head_size={self.head_size} attn_state={attn_metadata.attn_state} "
+                     f"sliding={self.sliding_window}\n")
+
         # Ascend FIA (npu_fusion_attention) cannot handle cross-attention
         # where actual_seq_qlen differs from actual_seq_kvlen — it either
         # crashes or produces zero / garbage output.  When KV was gathered
@@ -1573,27 +1591,58 @@ class AscendAttentionBackendImpl(AttentionImpl):
             attn_out = attn_out.squeeze(0).transpose(0, 1)  # [T_q, H, D]
             output[:num_tokens] = attn_out[:num_tokens]
         else:
-            # Self-attention: Q length == KV length, FIA handles correctly.
-            sparse_mode = 4 if self.sliding_window is not None else 3 if attn_metadata.causal else 0
-            pre_tokens = self.sliding_window if self.sliding_window is not None else SWA_INT_MAX
-            next_tokens = 0 if attn_metadata.causal or self.sliding_window is not None else SWA_INT_MAX
-            attn_mask = attn_metadata.attn_mask
-            if attn_mask is not None and attn_mask.dtype not in (torch.bool, torch.uint8):
-                attn_mask = attn_mask.bool()
-            attn_output = torch_npu.npu_fusion_attention(
-                query=query,
-                key=key,
-                value=value,
-                head_num=self.num_heads,
-                input_layout="TND",
-                atten_mask=attn_mask,
-                scale=self.scale,
-                pre_tockens=pre_tokens,
-                next_tockens=next_tokens,
-                actual_seq_qlen=attn_metadata.actual_seq_lengths_q,
-                actual_seq_kvlen=actual_seq_lengths_kv,
-                sparse_mode=sparse_mode,
-            )[0]
+            # Self-attention: Q length == KV length.
+            # FIA TND only supports head_dim in {64,128,192,256}.
+            # For unsupported head_dims (e.g. 512), use PyTorch SDPA.
+            if self.head_size in FIA_TND_SUPPORTED_HEAD_SIZES:
+                sparse_mode = 4 if self.sliding_window is not None else 3 if attn_metadata.causal else 0
+                pre_tokens = self.sliding_window if self.sliding_window is not None else SWA_INT_MAX
+                next_tokens = 0 if attn_metadata.causal or self.sliding_window is not None else SWA_INT_MAX
+                attn_mask = attn_metadata.attn_mask
+                if attn_mask is not None and attn_mask.dtype not in (torch.bool, torch.uint8):
+                    attn_mask = attn_mask.bool()
+                attn_output = torch_npu.npu_fusion_attention(
+                    query=query,
+                    key=key,
+                    value=value,
+                    head_num=self.num_heads,
+                    input_layout="TND",
+                    atten_mask=attn_mask,
+                    scale=self.scale,
+                    pre_tockens=pre_tokens,
+                    next_tockens=next_tokens,
+                    actual_seq_qlen=attn_metadata.actual_seq_lengths_q,
+                    actual_seq_kvlen=actual_seq_lengths_kv,
+                    sparse_mode=sparse_mode,
+                )[0]
+            else:
+                # head_dim not supported by FIA TND → use PyTorch SDPA
+                with open('/tmp/attn_path_debug.log', 'a') as _f:
+                    _f.write(f"[LGHD_SDPA_SELF] layer={self._layer_name} "
+                             f"head_size={self.head_size} num_tokens={num_tokens}\n")
+                import torch.nn.functional as F_sdpa
+                num_heads = self.num_heads
+                num_kv_heads = self.num_kv_heads
+                head_size = self.head_size
+
+                q = query.view(num_tokens, num_heads, head_size)
+                k = key.view(num_tokens, num_kv_heads, head_size)
+                v = value.view(num_tokens, num_kv_heads, head_size)
+
+                # GQA: repeat KV heads to match Q heads
+                if num_heads != num_kv_heads:
+                    n_rep = num_heads // num_kv_heads
+                    k = k.repeat_interleave(n_rep, dim=1)
+                    v = v.repeat_interleave(n_rep, dim=1)
+
+                attn_out = F_sdpa.scaled_dot_product_attention(
+                    q.unsqueeze(0).transpose(1, 2),   # [1, H, T, D]
+                    k.unsqueeze(0).transpose(1, 2),
+                    v.unsqueeze(0).transpose(1, 2),
+                    is_causal=attn_metadata.causal,
+                    scale=self.scale,
+                )
+                attn_output = attn_out.squeeze(0).transpose(0, 1)
             output[:num_tokens] = attn_output[:num_tokens]
         return output
 
@@ -1663,6 +1712,21 @@ class AscendAttentionBackendImpl(AttentionImpl):
             scale=self.scale,
         )  # [1, H, T, D]
         attn_output = attn_output.squeeze(0).transpose(0, 1)  # [T, H, D]
+
+        # ── DIAG: log attention output stats + signature for cross-prompt comparison ──
+        _attn_mean = attn_output.float().mean().item()
+        _attn_std = attn_output.float().std().item()
+        _attn_sum = attn_output.float().sum().item()
+        _q_mean = query[:num_tokens].float().mean().item()
+        _kv_sum = shared_key.float().sum().item()
+        with open('/tmp/attn_path_debug.log', 'a') as _f:
+            _f.write(f"[SDPA_SHARED] layer={self._layer_name} "
+                     f"head_size={self.head_size} "
+                     f"num_tokens={num_tokens} kv_len={S} "
+                     f"q_mean={_q_mean:.6f} attn_out_mean={_attn_mean:.6f} "
+                     f"attn_out_std={_attn_std:.6f} "
+                     f"attn_sum={_attn_sum:.4f} kv_sum={_kv_sum:.4f} "
+                     f"is_sliding={self.sliding_window is not None}\n")
 
         output[:num_tokens] = attn_output
         return output
@@ -1762,31 +1826,38 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # Swap to target cache when KV-sharing (mirrors PA path fix in
         # forward_paged_attention).
         _tgt_impl = getattr(self, '_kv_share_target_impl', None)
+        _swapped = False
         if _tgt_impl is not None and _tgt_impl.key_cache is not None:
             read_kc = _tgt_impl.key_cache
             read_vc = _tgt_impl.value_cache
+            _swapped = True
         else:
             read_kc = self.key_cache
             read_vc = self.value_cache
 
         if read_kc is None or read_vc is None:
+            with open('/tmp/attn_path_debug.log', 'a') as _f:
+                _f.write(f"[KV_SHARE_BLOCK] layer={self._layer_name} "
+                         f"ERROR=null_cache swapped={_swapped}\n")
             return None, None
         block_table = attn_metadata.block_tables
         seq_lens = attn_metadata.seq_lens_list
         if block_table is None or not seq_lens:
+            with open('/tmp/attn_path_debug.log', 'a') as _f:
+                _f.write(f"[KV_SHARE_BLOCK] layer={self._layer_name} "
+                         f"ERROR=no_block_table bt_is_none={block_table is None} "
+                         f"seq_lens={seq_lens}\n")
             return None, None
 
         try:
             dense_key, dense_value = self._gather_paged_kv_to_dense(
                 read_kc, read_vc, block_table, seq_lens,
             )
-            # Fallback: if the retrieved KV is all zeros and per-group
-            # block_tables are available (set by AscendGemma4Proposer),
-            # try block_tables in REVERSE gid order.  The highest gids
-            # (5 = global attention) are assigned last and are the
-            # correct ones for head_size=512 layers.
             _k_mean = dense_key.float().mean().item()
+            _k_std = dense_key.float().std().item()
+            _v_mean = dense_value.float().mean().item()
             _per_group_bt = getattr(self, '_per_group_bt_ref', None)
+            _fallback_gid = -1
             if abs(_k_mean) < 1e-6 and _per_group_bt is not None and len(_per_group_bt) > 0:
                 # REVERSE iteration: try highest gid first (global attn = 5)
                 for _gid, _bt in reversed(list(_per_group_bt.items())):
@@ -1798,11 +1869,29 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         if abs(_km) > 1e-6:
                             dense_key, dense_value = _dk, _dv
                             block_table = _bt
+                            _k_mean = _km
+                            _k_std = _dk.float().std().item()
+                            _v_mean = _dv.float().mean().item()
+                            _fallback_gid = _gid
                             break
                     except Exception:
                         continue
+            # ── DIAG: log KV sharing result ──
+            with open('/tmp/attn_path_debug.log', 'a') as _f:
+                _f.write(f"[KV_SHARE_BLOCK] layer={self._layer_name} "
+                         f"swapped={_swapped} "
+                         f"k_shape={list(dense_key.shape)} "
+                         f"k_mean={_k_mean:.6f} k_std={_k_std:.6f} "
+                         f"v_mean={_v_mean:.6f} "
+                         f"bt_shape={list(block_table.shape)} "
+                         f"seq_lens={seq_lens[:5] if len(seq_lens)>5 else seq_lens} "
+                         f"fallback_gid={_fallback_gid} "
+                         f"head_size={self.head_size}\n")
             return dense_key, dense_value
-        except Exception:
+        except Exception as e:
+            with open('/tmp/attn_path_debug.log', 'a') as _f:
+                _f.write(f"[KV_SHARE_BLOCK] layer={self._layer_name} "
+                         f"ERROR={e}\n")
             return None, None
 
     def do_kv_cache_update(
@@ -1905,11 +1994,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
         # Large-head fallback: head_dim not in {64,128,192,256}.
         # FIA writes KV cache in TND layout, but _forward_shared_kv_prefill_attention
-        # uses PyTorch SDPA which expects standard [B,H,L,D] layout.  When the
-        # gathered KV data is in TND layout, SDPA misinterprets the bytes, producing
-        # garbage attention output.  Skip the SDPA prefill path for large-head layers;
-        # they will fall through to Condition A which uses PA (Ascend native op that
-        # understands TND layout and reads directly from paged cache).
+        # uses PyTorch SDPA which expects standard [B,H,L,D] layout.
+        # HOWEVER: the KV cache is stored in paged block format (not TND).
+        # _gather_paged_kv_to_dense reads from blocks and produces
+        # [tokens, kv_heads, head_dim] which IS the standard layout SDPA expects.
+        # The TND layout only applies to FIA kernel input/output, not to stored
+        # cache.  Allow all head_dims (including 512) through SDPA_KV_SHARED
+        # so that causal cross-attention masking works correctly (PA may not
+        # apply proper causal masking for multi-token KV-sharing queries).
         use_large_head_fallback = self._should_use_large_head_attention_fallback()
 
         _kv_prefill_eligible = (
@@ -1917,7 +2009,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
             and key is not None
             and value is not None
             and query.shape[0] == key.shape[0]
-            and not use_large_head_fallback
             and attn_metadata.attn_state in (AscendAttentionState.PrefillNoCache, AscendAttentionState.ChunkedPrefill, AscendAttentionState.SpecDecoding)
         )
 
@@ -2009,6 +2100,20 @@ class AscendAttentionBackendImpl(AttentionImpl):
                          f"cond_A={_cond_a} cond_B={_cond_b} cond_C={use_large_head_fallback} "
                          f"pa_usable={_pa_usable} is_fdo_capture={_is_fdo_capture} "
                          f"capturing={_EXTRA_CTX.capturing}\n")
+
+        # ── DIAG: log condition decisions for ALL large-head layers (target + draft) ──
+        if use_large_head_fallback:
+            _k_shape = key.shape if key is not None else None
+            with open('/tmp/attn_path_debug.log', 'a') as _f:
+                _f.write(f"[LGHD_COND] layer={self._layer_name} "
+                         f"attn_state={attn_metadata.attn_state} "
+                         f"sliding={self.sliding_window} "
+                         f"cond_A={_cond_a} cond_B={_cond_b} "
+                         f"pa_usable={_pa_usable} is_fdo_capture={_is_fdo_capture} "
+                         f"kv_share={_kv_share is not None} "
+                         f"num_tokens={num_tokens} key_shape={_k_shape} "
+                         f"head_size={self.head_size} "
+                         f"Q_eq_K={key is not None and key.shape[0] == query.shape[0]}\n")
 
         if _cond_a:
             # PA works for all head_dims on this Ascend device;

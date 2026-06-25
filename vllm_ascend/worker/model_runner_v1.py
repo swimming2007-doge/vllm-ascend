@@ -18,6 +18,7 @@
 #
 
 import math
+import os
 import sys
 import time
 from collections import defaultdict
@@ -2020,6 +2021,14 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
+        # ── SYNC GAP DIAG: record event after all target forward ops ──
+        # (reshape_and_cache KV writes are async on NPU; draft may read
+        # stale KV cache without this barrier.)
+        if (os.environ.get("VLLM_ASCEND_SYNC_TARGET_KV", "") == "1"
+                and hasattr(self, 'drafter') and self.drafter is not None):
+            _target_done = torch.npu.Event()
+            _target_done.record()
+            self.drafter._target_done_event = _target_done
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
@@ -2054,6 +2063,36 @@ class NPUModelRunner(GPUModelRunner):
 
                 sample_hidden_states = hidden_states[logits_indices]
                 logits = self.model.compute_logits(sample_hidden_states)
+
+                # ── DUMP: save full target logits for token-by-token comparison ──
+                if not getattr(self, '_diag_full_logits_done', False):
+                    self._diag_full_logits_done = True
+                    _fl = logits[0].float().cpu()
+                    torch.save(_fl, '/tmp/target_logits_step0.pt')
+                    import sys
+                    print(f"[FULL_LOGITS] TARGET saved: shape={_fl.shape} "
+                          f"argmax={_fl.argmax().item()} max_prob={_fl.softmax(dim=-1).max().item():.6f} "
+                          f"vocab_range=({_fl.min().item():.4f}, {_fl.max().item():.4f})",
+                          file=sys.stderr, flush=True)
+
+                # ── DIAG: compute target logits from intermediate layers ──
+                if True:  # always run (reset by dict clear)
+                    try:
+                        import vllm.model_executor.models.gemma4 as _gm4
+                        _dev = logits.device
+                        for _key in sorted(_gm4._DIAG_TARGET_HS.keys(), key=lambda x: (x != 'final', x)):
+                            _hs = _gm4._DIAG_TARGET_HS[_key].to(_dev)
+                            _logits = self.model.compute_logits(_hs)
+                            _probs = torch.softmax(_logits.float(), dim=-1)
+                            _top5 = torch.topk(_probs[0], k=min(5, _probs.shape[-1]))
+                            _ids = _top5.indices.tolist()
+                            _p = [f'{v:.4f}' for v in _top5.values.tolist()]
+                            with open('/tmp/attn_path_debug.log', 'a') as _f:
+                                _f.write(f"[LOGITS_TARGET_L{_key}] top1_id={_ids[0]} "
+                                         f"top1_prob={_p[0]} top5_ids={_ids} top5_probs={_p}\n")
+                    except Exception as _e:
+                        with open('/tmp/attn_path_debug.log', 'a') as _f:
+                            _f.write(f"[LOGITS_TARGET_ERROR] {_e}\n")
             else:
                 # Rare case.
                 assert not self.is_pooling_model

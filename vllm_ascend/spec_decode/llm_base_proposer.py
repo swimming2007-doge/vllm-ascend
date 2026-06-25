@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import copy
+import os
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
@@ -537,6 +538,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             if forward_context is not None:
                 forward_context.moe_layer_index = 0
 
+            self._sync_wait_target_events()
             self._runnable(
                 num_input_tokens=num_tokens,
                 batch_size=batch_size,
@@ -606,6 +608,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             num_prefill_reqs=num_prefill_reqs,
             num_decode_reqs=num_decode_reqs,
         )
+        # ── SYNC GAP DIAG: record event after all buffer writes ──
+        # (_set_positions, input_ids copy are async on NPU)
+        if os.environ.get("VLLM_ASCEND_SYNC_BUFFERS", "") == "1":
+            _buffers_ready = torch.npu.Event()
+            _buffers_ready.record()
+            self._buffers_ready_event = _buffers_ready
         if self.pcp_size * self.dcp_size > 1:
             assert long_seq_args is not None
             query_lens_d, ori_token_indices_to_sample = long_seq_args
@@ -888,6 +896,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 "is_prefill": attn_metadata_i.num_prefills,
             }
             run_draft = partial(self._runnable, **model_inputs)
+            self._sync_wait_target_events()
 
             if self.enable_enpu:
                 self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
@@ -896,6 +905,22 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 draft_token_ids = run_draft()
                 self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
         return draft_token_ids
+
+    def _sync_wait_target_events(self) -> None:
+        """Wait for NPU events recorded after target forward / buffer writes.
+
+        Controlled by env vars for systematic sync-gap measurement:
+          VLLM_ASCEND_SYNC_TARGET_KV=1  → wait for KV cache writes
+          VLLM_ASCEND_SYNC_BUFFERS=1    → wait for buffer writes
+        """
+        if os.environ.get("VLLM_ASCEND_SYNC_TARGET_KV", "") == "1":
+            _ev = getattr(self, '_target_done_event', None)
+            if _ev is not None:
+                _ev.synchronize()
+        if os.environ.get("VLLM_ASCEND_SYNC_BUFFERS", "") == "1":
+            _ev = getattr(self, '_buffers_ready_event', None)
+            if _ev is not None:
+                _ev.synchronize()
 
     def _run_merged_draft(
         self,
@@ -995,6 +1020,17 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         sample_hidden_states = last_hidden_states[token_indices_to_sample]
         logits = self.model.compute_logits(sample_hidden_states)
 
+        # ── DUMP: save full draft step0 logits for comparison ──
+        if not getattr(self, '_diag_full_draft_done', False):
+            self._diag_full_draft_done = True
+            _fl = logits[0].float().cpu()
+            torch.save(_fl, '/tmp/draft_logits_step0.pt')
+            import sys
+            print(f"[FULL_LOGITS] DRAFT step0 saved: shape={_fl.shape} "
+                  f"argmax={_fl.argmax().item()} max_prob={_fl.softmax(dim=-1).max().item():.6f} "
+                  f"vocab_range=({_fl.min().item():.4f}, {_fl.max().item():.4f})",
+                  file=sys.stderr, flush=True)
+
         if lmhead_tp_enable() and num_indices < logits.shape[0]:
             logits = logits[:num_indices]
             token_indices_to_sample = token_indices_to_sample[:num_indices]
@@ -1002,9 +1038,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         draft_token_ids = logits.argmax(dim=-1)
 
         # ── DRAFT LOGITS DIAGNOSTIC (Pos0) ──
-        _diag = not getattr(self, '_logits_diag_done', False)
+        _diag = True  # always run (dict cleared each forward)
         if _diag:
-            self._logits_diag_done = True
             import sys
             _topk = torch.topk(logits[0], k=20, dim=-1)
             _top_ids = _topk.indices.tolist()
@@ -1017,6 +1052,24 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             _top_probs = _probs[_topk.indices].tolist()
             print(f"[DRAFT_LOGITS_POS0] top-20 probs={[f'{p:.4f}' for p in _top_probs]}",
                   file=sys.stderr, flush=True)
+
+            # ── DIAG: compute draft logits from intermediate layers ──
+            try:
+                import vllm.model_executor.models.gemma4_mtp as _gmtp
+                _dev = logits.device
+                for _key in sorted(_gmtp._DIAG_DRAFT_HS.keys(), key=lambda x: (x != 'final', x)):
+                    _hs = _gmtp._DIAG_DRAFT_HS[_key].to(_dev)
+                    _logits = self.model.compute_logits(_hs)
+                    _probs = torch.softmax(_logits.float(), dim=-1)
+                    _top5 = torch.topk(_probs[0], k=min(5, _probs.shape[-1]))
+                    _ids = _top5.indices.tolist()
+                    _p = [f'{v:.4f}' for v in _top5.values.tolist()]
+                    with open('/tmp/attn_path_debug.log', 'a') as _f:
+                        _f.write(f"[LOGITS_DRAFT_L{_key}] top1_id={_ids[0]} "
+                                 f"top1_prob={_p[0]} top5_ids={_ids} top5_probs={_p}\n")
+            except Exception as _e:
+                with open('/tmp/attn_path_debug.log', 'a') as _f:
+                    _f.write(f"[LOGITS_DRAFT_ERROR] {_e}\n")
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
@@ -1091,6 +1144,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             self.input_ids[:batch_size] = input_ids
             self._set_positions(batch_size, clamped_positions)
             self.hidden_states[:batch_size] = hidden_states.view(batch_size, -1)
+            # Ascend NPU: copy may be async; sync before next iteration reads.
+            torch.npu.current_stream().synchronize()
 
             if self.supports_mm_inputs:
                 self.inputs_embeds[:batch_size] = self.model.embed_input_ids(input_ids)
@@ -1288,6 +1343,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
             self._set_positions(num_tokens, target_positions)
             self.hidden_states[:num_tokens] = target_hidden_states.view(num_tokens, -1)
+            # Ensure NPU copy completes before _run_merged_draft reads.
+            # Without this sync, a busy NPU stream may still have the copy
+            # kernel queued when the draft forward starts, causing the draft
+            # to read zeros for target_hidden_states → garbage logits.
+            torch.npu.current_stream().synchronize()
 
             return num_tokens, token_indices_to_sample, cad, (query_lens_d, ori_token_indices_to_sample)
         else:
@@ -1334,6 +1394,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             if self.pass_hidden_states_to_model:
                 assert self.parallel_drafting_hidden_state_tensor is not None
                 self.hidden_states[out_hidden_state_mapping] = target_hidden_states
+                torch.npu.current_stream().synchronize()  # Ascend: async copy guard
                 # Use torch.where to avoid DtoH sync from boolean indexing
                 mask = self.is_masked_token_mask[:total_num_output_tokens]
                 torch.where(
