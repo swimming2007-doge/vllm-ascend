@@ -69,6 +69,19 @@ class AscendGemma4Proposer(_VllmGemma4Proposer, AscendSpecDecodeBaseProposer):
         self._centroids_inputs: dict[int, torch.Tensor] = {}
         self._centroids_outputs: dict[int, torch.Tensor] = {}
 
+    # ---- _greedy_sample ----------------------------------------------------
+    # Override to enable centroids masking in eager mode on Ascend NPU.
+    # Upstream uses CUDA graphs with pre-captured centroids sizes, which
+    # is not available on NPU. We bypass CUDA graphs and call
+    # get_top_tokens() directly — this uses the same sparse centroid
+    # vocabulary restriction but runs in eager mode.
+
+    def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        model = self.get_model()
+        if getattr(model, 'masked_embedding', None) is not None:
+            return model.get_top_tokens(hidden_states)
+        return super()._greedy_sample(hidden_states)
+
     # ---- model_returns_tuple -----------------------------------------------
     # Ascend base returns False for "mtp", but Gemma4 MTP forward()
     # returns (draft_hidden_states, backbone_hidden_states).
@@ -104,6 +117,23 @@ class AscendGemma4Proposer(_VllmGemma4Proposer, AscendSpecDecodeBaseProposer):
             for layer_name in attn_group.layer_names:
                 per_layer_attn_metadata[layer_name] = attn_metadata
         return per_group_attn_metadata, per_layer_attn_metadata
+
+    # ---- set_per_group_block_table -------------------------------------------
+    # Override to log block table updates — tracks when new blocks are assigned
+    # to each KV cache group. Critical for the "append" degradation theory.
+
+    def set_per_group_block_table(self, gid: int, block_table: torch.Tensor) -> None:
+        self._per_group_block_tables[gid] = block_table
+        import os
+        os.makedirs('/tmp/kv_dump', exist_ok=True)
+        _bt = block_table
+        _uniq = _bt.unique().tolist() if _bt.numel() > 0 else []
+        _uniq_clean = [b for b in _uniq if b >= 0]
+        with open('/tmp/kv_dump/block_gather.txt', 'a') as _bgf:
+            _bgf.write(f"[SET_PER_GROUP_BT] gid={gid} "
+                       f"bt_shape=({_bt.shape[0]},{_bt.shape[1]}) "
+                       f"num_unique_blocks={len(_uniq_clean)} "
+                       f"blocks={_uniq_clean[:10]}...\n")
 
     # ---- _maybe_share_lm_head ----------------------------------------------
     # Gemma4 MTP's lm_head operates in draft hidden_size (e.g. 1024),

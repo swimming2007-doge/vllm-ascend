@@ -1384,6 +1384,24 @@ class NPUModelRunner(GPUModelRunner):
         draft_token_ids = draft_token_ids[target_logits_indices + 1]
         if self.pcp_size > 1:
             logits_indices = logits_indices_pcp
+
+        # ── DIAG: verify draft_token_ids match actual draft predictions ──
+        if not getattr(self, '_diag_draft_ids_done', False):
+            self._diag_draft_ids_done = True
+            import sys as _s
+            _actual_draft = getattr(self, '_draft_token_ids', None)
+            print(f"[DRAFT_IDS_DIAG] input_buf draft_ids={draft_token_ids.tolist()}", file=_s.stderr, flush=True)
+            print(f"[DRAFT_IDS_DIAG] logits_indices={logits_indices.tolist()}", file=_s.stderr, flush=True)
+            print(f"[DRAFT_IDS_DIAG] target_logits_indices={target_logits_indices.tolist()}", file=_s.stderr, flush=True)
+            print(f"[DRAFT_IDS_DIAG] num_draft_tokens={num_draft_tokens.tolist()}", file=_s.stderr, flush=True)
+            if _actual_draft is not None:
+                _ad = _actual_draft.flatten().tolist()
+                print(f"[DRAFT_IDS_DIAG] actual_draft_model_predictions={_ad}", file=_s.stderr, flush=True)
+                _match = (draft_token_ids.tolist() == _ad[:len(draft_token_ids)])
+                print(f"[DRAFT_IDS_DIAG] input_buf_matches_actual={_match}", file=_s.stderr, flush=True)
+            # Also dump the full input_ids at relevant positions
+            _all_inputs = self.input_ids.gpu[logits_indices].tolist()
+            print(f"[DRAFT_IDS_DIAG] input_ids_at_logits_indices={_all_inputs}", file=_s.stderr, flush=True)
         return SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
             num_draft_tokens=num_draft_tokens.tolist(),
@@ -2382,18 +2400,58 @@ class NPUModelRunner(GPUModelRunner):
         if lmhead_tp_enable() and logits is not None:
             logits = logits[: len(spec_decode_metadata.logits_indices)]
 
-        # ── TARGET LOGITS DIAGNOSTIC (once) ──
-        if not getattr(self, '_target_logits_diag', False):
-            self._target_logits_diag = True
-            import sys
-            _tgt_idx = spec_decode_metadata.target_logits_indices
-            if _tgt_idx is not None and len(_tgt_idx) > 0 and logits is not None:
-                _t_logits = logits[_tgt_idx[0]:_tgt_idx[0]+1]  # first target logit
-                _t_topk = torch.topk(_t_logits[0].float(), k=20, dim=-1)
-                print(f"[TARGET_LOGITS_POS0] top20_ids: {_t_topk.indices.tolist()}", file=sys.stderr, flush=True)
-                _t_probs = torch.softmax(_t_logits[0].float(), dim=-1)
-                _t_top_probs = _t_probs[_t_topk.indices].tolist()
-                print(f"[TARGET_LOGITS_POS0] top20_probs: {[f'{p:.4f}' for p in _t_top_probs]}", file=sys.stderr, flush=True)
+        # ── ACCEPTANCE RATE COUNTER (continuous) ──
+        if not hasattr(self, '_accept_stats'):
+            self._accept_stats = {'step': 0, 'total_draft': 0, 'total_accepted': 0,
+                                   'pos_accept': [0]*8, 'pos_total': [0]*8,
+                                   'step_items': []}
+        import sys
+        _tgt_idx = spec_decode_metadata.target_logits_indices
+        _draft_ids = spec_decode_metadata.draft_token_ids
+        if _tgt_idx is not None and len(_tgt_idx) > 0 and logits is not None:
+            _t_logits = logits[_tgt_idx].float()
+            _t_argmax = _t_logits.argmax(dim=-1)
+            _accepted = (_draft_ids == _t_argmax)
+            _n = len(_draft_ids)
+            _n_acc = _accepted.sum().item()
+            self._accept_stats['step'] += 1
+            self._accept_stats['total_draft'] += _n
+            self._accept_stats['total_accepted'] += _n_acc
+            # Update global decode step for SDPA_SHARED diagnostic correlation
+            import vllm_ascend.attention.attention_v1 as _attn_v1
+            _attn_v1.set_decode_step(self._accept_stats['step'])
+            for i in range(min(_n, 8)):
+                self._accept_stats['pos_total'][i] += 1
+                if _accepted[i].item():
+                    self._accept_stats['pos_accept'][i] += 1
+            # Record per-step pos0 status for first 20 steps
+            _step = self._accept_stats['step']
+            _pos0_acc = _accepted[0].item() if _n > 0 else False
+            self._accept_stats['step_items'].append((_step, _pos0_acc, _n_acc, _n))
+            if _step <= 20 or _step % 10 == 0:
+                _td = self._accept_stats['total_draft']
+                _ta = self._accept_stats['total_accepted']
+                _per_pos = ' '.join([f"pos{i}={self._accept_stats['pos_accept'][i]}/{self._accept_stats['pos_total'][i]}"
+                                     for i in range(min(max(spec_decode_metadata.num_draft_tokens), 4))])
+                # ── APPEND DIAG: track block/seq growth per step ──
+                _nct = self.input_batch.num_computed_tokens_cpu[0]  # seq_len for req 0
+                _bs = self.block_size
+                _nb = (_nct + _bs - 1) // _bs if _bs > 0 else 0  # ceil div
+                _bt0 = None
+                try:
+                    _bt0 = self.input_batch.block_table[5].get_device_tensor()
+                    _bt0_shape = tuple(_bt0.shape)
+                except Exception:
+                    _bt0_shape = "N/A"
+                print(f"[ACCEPT] step={_step} this_step: pos0_ok={_pos0_acc} accepted={_n_acc}/{_n} | "
+                      f"total={_ta}/{_td} rate={_ta/max(1,_td):.3f} | {_per_pos} | "
+                      f"seq_len={_nct} blk_needed={_nb} bt_shape={_bt0_shape}",
+                      file=sys.stderr, flush=True)
+            # Full dump at step 50
+            if _step == 50:
+                _items = self._accept_stats['step_items']
+                print(f"[ACCEPT_STEPS] first 20 pos0: {[(s, int(ok)) for s, ok, _, _ in _items[:20]]}",
+                      file=sys.stderr, flush=True)
 
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
