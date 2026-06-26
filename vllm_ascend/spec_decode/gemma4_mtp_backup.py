@@ -308,8 +308,6 @@ class Gemma4MTPDecoderLayer(nn.Module):
             quant_config=None,
             prefix=f"{prefix}.mlp",
         )
-        self.mlp._diag_layer_idx = self.layer_idx
-
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -563,14 +561,6 @@ class Gemma4MTP(nn.Module):
         spec_step_idx: int = 0,
         **kwargs: object,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if not getattr(self, '_lm_diag_done', False):
-            self._lm_diag_done = True
-            import sys
-            _w = self.lm_head.weight
-            print(f"[DRAFT_LM_HEAD] shape={list(_w.shape)} "
-                  f"mean={_w.float().mean().item():.8f} std={_w.float().std().item():.8f} "
-                  f"dtype={_w.dtype} device={_w.device}",
-                  file=sys.stderr, flush=True)
         return self.model(
             input_ids,
             positions,

@@ -347,11 +347,8 @@ class AscendGemma4Proposer(_VllmGemma4Proposer, AscendSpecDecodeBaseProposer):
         # SD² Steering: install MLP gate-level patch on the draft model so
         # that steering biases computed from target intermediate layers are
         # injected into each draft layer's up-projection before the GELU gate.
-        import sys
-        print(f"[SD2_PROPOSER] load_model, SD2_COLLECT={__import__('os').environ.get('VLLM_ASCEND_SD2_COLLECT','?')!r}", file=sys.stderr, flush=True)
         from vllm_ascend.spec_decode.sd2 import SD2Runtime
         self._sd2 = SD2Runtime()
-        print(f"[SD2_PROPOSER] SD2Runtime created, enabled={self._sd2.enabled} collect={self._sd2.collect}", file=sys.stderr, flush=True)
         if self._sd2.enabled:
             draft_model = self.get_model()
             self._sd2.install_on_draft(draft_model, device=self.device)

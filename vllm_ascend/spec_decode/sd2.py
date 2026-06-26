@@ -53,11 +53,6 @@ class SD2Runtime:
         self._steering_module = None
         self._X_mean = None
         self._X_std = None
-        import sys
-        print(f"[SD2_INIT] enabled={self._enabled} collect={self._collect} "
-              f"weights={self._weights_path!r} layers={self._layers} "
-              f"COLLECT_ENV={os.environ.get('VLLM_ASCEND_SD2_COLLECT','?')!r}",
-              file=sys.stderr, flush=True)
 
     @property
     def enabled(self) -> bool:
