@@ -981,10 +981,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 if self.method == "mtp":
                     model_kwargs["positions"] = model_positions
 
-                # ── Detect real run vs warmup (target HS near-zero when KV empty) ──
-                _mhs_norm = model_hidden_states.float().norm(dim=-1).mean().item()
-                self._is_real_run = _mhs_norm > 50.0
-
         ret_hidden_states = self.model(**model_kwargs)
         if not self.model_returns_tuple():
             last_hidden_states = ret_hidden_states
@@ -1030,73 +1026,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         sample_hidden_states = last_hidden_states[token_indices_to_sample]
         logits = self.model.compute_logits(sample_hidden_states)
 
-        # ── DUMP: save full draft step0 logits for comparison ──
-        if not getattr(self, '_diag_full_draft_done', False) and getattr(self, '_is_real_run', False):
-            self._diag_full_draft_done = True
-            _fl = logits[0].float().cpu()
-            torch.save(_fl, '/tmp/draft_logits_step0.pt')
-            import sys
-            print(f"[FULL_LOGITS] DRAFT step0 saved: shape={_fl.shape} "
-                  f"argmax={_fl.argmax().item()} max_prob={_fl.softmax(dim=-1).max().item():.6f} "
-                  f"vocab_range=({_fl.min().item():.4f}, {_fl.max().item():.4f})",
-                  file=sys.stderr, flush=True)
-
         if lmhead_tp_enable() and num_indices < logits.shape[0]:
             logits = logits[:num_indices]
             token_indices_to_sample = token_indices_to_sample[:num_indices]
 
         draft_token_ids = logits.argmax(dim=-1)
-
-        # ── DUMP: save ALL draft logits + token_ids for rejection comparison ──
-        if not getattr(self, '_diag_all_draft_done', False) and getattr(self, '_is_real_run', False):
-            self._diag_all_draft_done = True
-            import os as _os
-            _save = {
-                'draft_logits': logits.float().cpu(),        # [N, vocab_size]
-                'draft_token_ids': draft_token_ids.cpu(),    # [N]
-            }
-            _os.makedirs('/tmp/kv_dump', exist_ok=True)
-            torch.save(_save, '/tmp/kv_dump/draft_all_logits.pt')
-            import sys as _sys
-            _d_probs = torch.softmax(logits.float(), dim=-1)
-            print(f"[DRAFT_ALL] saved {logits.shape[0]} draft tokens: "
-                  f"ids={draft_token_ids.tolist()} "
-                  f"probs={[f'{_d_probs[i, tid].item():.4f}' for i, tid in enumerate(draft_token_ids)]}",
-                  file=_sys.stderr, flush=True)
-
-        # ── DRAFT LOGITS DIAGNOSTIC (Pos0) ──
-        _diag = True  # always run (dict cleared each forward)
-        if _diag:
-            import sys
-            _topk = torch.topk(logits[0], k=20, dim=-1)
-            _top_ids = _topk.indices.tolist()
-            _top_vals = _topk.values.tolist()
-            print(f"[DRAFT_LOGITS_POS0] top-20 ids: {_top_ids}",
-                  file=sys.stderr, flush=True)
-            print(f"[DRAFT_LOGITS_POS0] top-20 vals: {[f'{v:.2f}' for v in _top_vals]}",
-                  file=sys.stderr, flush=True)
-            _probs = torch.softmax(logits[0], dim=-1)
-            _top_probs = _probs[_topk.indices].tolist()
-            print(f"[DRAFT_LOGITS_POS0] top-20 probs={[f'{p:.4f}' for p in _top_probs]}",
-                  file=sys.stderr, flush=True)
-
-            # ── DIAG: compute draft logits from intermediate layers ──
-            try:
-                import vllm.model_executor.models.gemma4_mtp as _gmtp
-                _dev = logits.device
-                for _key in sorted(_gmtp._DIAG_DRAFT_HS.keys(), key=lambda x: (x != 'final', x)):
-                    _hs = _gmtp._DIAG_DRAFT_HS[_key].to(_dev)
-                    _logits = self.model.compute_logits(_hs)
-                    _probs = torch.softmax(_logits.float(), dim=-1)
-                    _top5 = torch.topk(_probs[0], k=min(5, _probs.shape[-1]))
-                    _ids = _top5.indices.tolist()
-                    _p = [f'{v:.4f}' for v in _top5.values.tolist()]
-                    with open('/tmp/attn_path_debug.log', 'a') as _f:
-                        _f.write(f"[LOGITS_DRAFT_L{_key}] top1_id={_ids[0]} "
-                                 f"top1_prob={_p[0]} top5_ids={_ids} top5_probs={_p}\n")
-            except Exception as _e:
-                with open('/tmp/attn_path_debug.log', 'a') as _f:
-                    _f.write(f"[LOGITS_DRAFT_ERROR] {_e}\n")
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
@@ -1137,13 +1071,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         _EXTRA_CTX.num_tokens = input_batch_size
         _EXTRA_CTX.num_accept_tokens = batch_size
 
-        # ── APPEND DIAG: mark decode step start ──
-        _diag_nct = getattr(self.runner.input_batch, 'num_computed_tokens_cpu', None)
-        _diag_sl = _diag_nct[0].item() if _diag_nct is not None else -1
-        with open('/tmp/kv_dump/block_gather.txt', 'a') as _bgf:
-            _bgf.write(f"[DRAFT_STEP_START] seq_len={_diag_sl} "
-                       f"num_spec_tokens={self.num_speculative_tokens}\n")
-
         for draft_step in range(self.num_speculative_tokens - 1):
             # Reset MOE layer index for each draft step iteration
             forward_context = get_forward_context()
@@ -1155,12 +1082,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # tensor.argmax() returns int64 by default.
             input_ids = draft_token_ids_tensor[draft_step]
 
-            # ── APPEND DIAG: log draft iteration ──
-            _diag_pos = positions[0].item() if positions is not None else -1
-            _diag_iid = input_ids[0].item() if input_ids is not None else -1
-            with open('/tmp/kv_dump/block_gather.txt', 'a') as _bgf:
-                _bgf.write(f"[DRAFT_ITER] draft_step={draft_step} "
-                           f"pos0={_diag_pos} input_id0={_diag_iid}\n")
             if not getattr(self, 'constant_draft_positions', False):
                 positions += 1
 
@@ -1229,11 +1150,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             else:
                 last_hidden_states, hidden_states = ret_hidden_states
 
-            # ── NAN DIAG: check model output ──
-            _nan_lhs = torch.isnan(last_hidden_states).any().item() if last_hidden_states is not None else False
-            _nan_hs = torch.isnan(hidden_states).any().item() if hidden_states is not None else False
-            _nan_input_hs = torch.isnan(model_hidden_states).any().item()
-
             last_hidden_states, model_positions, hidden_states = self.maybe_all_gather_and_unpad(
                 last_hidden_states, model_positions, hidden_states
             )
@@ -1250,9 +1166,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
             sample_hidden_states = last_hidden_states[token_indices_to_sample]
             logits = self.model.compute_logits(sample_hidden_states)
-            _nan_logits = torch.isnan(logits).any().item()
-            _nan_shs = torch.isnan(sample_hidden_states).any().item()
-
             if lmhead_tp_enable() and num_indices < logits.shape[0]:
                 logits = logits[:num_indices]
                 token_indices_to_sample = token_indices_to_sample[:num_indices]
@@ -1262,38 +1175,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             draft_token_ids = logits.argmax(dim=-1)
             draft_token_ids_tensor[draft_step + 1] = draft_token_ids
 
-            # ── NAN REPORT: per-iteration ──
-            _nan_dtid = (draft_token_ids < 0).any().item()
-            _hs_nan_next = torch.isnan(hidden_states).any().item()
-            import sys as _sys_nan
-            _lhs_norm = last_hidden_states.float().norm(dim=-1).mean().item() if last_hidden_states is not None else -1
-            _hs_norm = hidden_states.float().norm(dim=-1).mean().item()
-            _logits_norm = logits.float().norm(dim=-1).mean().item()
-            _shs_norm = sample_hidden_states.float().norm(dim=-1).mean().item()
-            _top1_prob = torch.softmax(logits.float(), dim=-1).max(dim=-1).values[0].item()
-            print(f"[NAN_DIAG] step={draft_step} input_hs_nan={_nan_input_hs} "
-                  f"last_hs_nan={_nan_lhs} hs_nan={_nan_hs} shs_nan={_nan_shs} "
-                  f"logits_nan={_nan_logits} dtid_bad={_nan_dtid} hs_next_nan={_hs_nan_next} "
-                  f"lhs_norm={_lhs_norm:.2f} hs_norm={_hs_norm:.2f} shs_norm={_shs_norm:.2f} "
-                  f"logits_norm={_logits_norm:.2f} top1_prob={_top1_prob:.4f}",
-                  file=_sys_nan.stderr, flush=True)
 
-            # ── DUMP: save loop-step draft logits (once, real run only) ──
-            if not getattr(self, f'_diag_draft_step{draft_step+1}_done', False) and getattr(self, '_is_real_run', False):
-                setattr(self, f'_diag_draft_step{draft_step+1}_done', True)
-                import os as _os2, sys as _sys2
-                _d_probs = torch.softmax(logits.float(), dim=-1)
-                _save = {
-                    'draft_logits': logits.float().cpu(),
-                    'draft_token_ids': draft_token_ids.cpu(),
-                    'draft_probs': _d_probs.cpu(),
-                }
-                _os2.makedirs('/tmp/kv_dump', exist_ok=True)
-                torch.save(_save, f'/tmp/kv_dump/draft_step{draft_step+1}_logits.pt')
-                print(f"[DRAFT_STEP{draft_step+1}] saved {logits.shape[0]} tokens: "
-                      f"ids={draft_token_ids.tolist()} "
-                      f"probs={[f'{_d_probs[i, tid].item():.4f}' for i, tid in enumerate(draft_token_ids)]}",
-                      file=_sys2.stderr, flush=True)
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = draft_token_ids_tensor.swapaxes(0, 1)

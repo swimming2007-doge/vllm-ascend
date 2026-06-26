@@ -124,16 +124,6 @@ class AscendGemma4Proposer(_VllmGemma4Proposer, AscendSpecDecodeBaseProposer):
 
     def set_per_group_block_table(self, gid: int, block_table: torch.Tensor) -> None:
         self._per_group_block_tables[gid] = block_table
-        import os
-        os.makedirs('/tmp/kv_dump', exist_ok=True)
-        _bt = block_table
-        _uniq = _bt.unique().tolist() if _bt.numel() > 0 else []
-        _uniq_clean = [b for b in _uniq if b >= 0]
-        with open('/tmp/kv_dump/block_gather.txt', 'a') as _bgf:
-            _bgf.write(f"[SET_PER_GROUP_BT] gid={gid} "
-                       f"bt_shape=({_bt.shape[0]},{_bt.shape[1]}) "
-                       f"num_unique_blocks={len(_uniq_clean)} "
-                       f"blocks={_uniq_clean[:10]}...\n")
 
     # ---- _maybe_share_lm_head ----------------------------------------------
     # Gemma4 MTP's lm_head operates in draft hidden_size (e.g. 1024),

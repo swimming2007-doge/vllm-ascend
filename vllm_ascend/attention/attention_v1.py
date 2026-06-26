@@ -66,17 +66,6 @@ from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
 from vllm_ascend.utils import weak_ref_tensors
 
-# ── Global decode step counter for diagnostic correlation ──
-_decode_step_counter: int = 0
-
-
-def set_decode_step(step: int) -> None:
-    global _decode_step_counter
-    _decode_step_counter = step
-
-
-def get_decode_step() -> int:
-    return _decode_step_counter
 from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
 
 # default max value of sliding window size
@@ -1421,19 +1410,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
             _kc = self.key_cache
             _vc = self.value_cache
 
-        _kv_share = getattr(self, 'kv_sharing_target_layer_name', None)
-        if _kv_share is not None:
-            _bt_shape = attn_metadata.block_tables.shape if attn_metadata.block_tables is not None else None
-            with open('/tmp/attn_path_debug.log', 'a') as _f:
-                _f.write(f"[PA_ENTRY] layer={self._layer_name} head_dim={self.head_size} "
-                         f"has_tgt_impl={_target_impl is not None} "
-                         f"has_tgt_cache={_has_tgt_cache} "
-                         f"using_target_cache={_has_tgt_cache} "
-                         f"self_key_cache_shape={self.key_cache.shape if self.key_cache is not None else None} "
-                         f"tgt_key_cache_shape={_kc.shape} "
-                         f"block_tables_shape={_bt_shape} "
-                         f"seq_lens={attn_metadata.seq_lens}\n")
-
         torch_npu._npu_paged_attention(
             query=query,
             key_cache=_kc,
@@ -1445,15 +1421,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
             context_lens=attn_metadata.seq_lens,
             out=output,
         )
-        if _kv_share is not None:
-            _out_mean = output.float().mean().item()
-            _out_sum = output.float().sum().item()
-            _q_sum = query.float().sum().item()
-            with open('/tmp/attn_path_debug.log', 'a') as _f:
-                _f.write(f"[PA_OUT] layer={self._layer_name} head_dim={self.head_size} "
-                         f"q_sum={_q_sum:.4f} out_sum={_out_sum:.4f} "
-                         f"out_mean={_out_mean:.6f} "
-                         f"num_tokens={query.shape[0]}\n")
         return output
 
     def _forward_encoder_attention(
@@ -1725,29 +1692,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
         )  # [1, H, T, D]
         attn_output = attn_output.squeeze(0).transpose(0, 1)  # [T, H, D]
 
-        # ── DIAG: log attention output stats + K distribution + step counter ──
-        _attn_mean = attn_output.float().mean().item()
-        _attn_std = attn_output.float().std().item()
-        _attn_sum = attn_output.float().sum().item()
-        _q_mean = query[:num_tokens].float().mean().item()
-        _kv_sum = shared_key.float().sum().item()
-        _k_mean = k.float().mean().item()
-        _k_std = k.float().std().item()
-        _k_recent = k[-128:].float() if S >= 128 else k.float()
-        _k_recent_mean = _k_recent.mean().item()
-        _dstep = get_decode_step()
-        with open('/tmp/attn_path_debug.log', 'a') as _f:
-            _f.write(f"[SDPA_SHARED] layer={self._layer_name} "
-                     f"decode_step={_dstep} "
-                     f"head_size={self.head_size} "
-                     f"num_tokens={num_tokens} kv_len={S} "
-                     f"q_mean={_q_mean:.6f} attn_out_mean={_attn_mean:.6f} "
-                     f"attn_out_std={_attn_std:.6f} "
-                     f"attn_sum={_attn_sum:.4f} kv_sum={_kv_sum:.4f} "
-                     f"k_mean={_k_mean:.6f} k_std={_k_std:.6f} "
-                     f"k_recent128_mean={_k_recent_mean:.6f} "
-                     f"is_sliding={self.sliding_window is not None}\n")
-
         output[:num_tokens] = attn_output
         return output
 
@@ -1805,17 +1749,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
         gathered_key = key_cache.index_select(0, flat_block_ids).reshape(dense_shape)
         gathered_value = value_cache.index_select(0, flat_block_ids).reshape(dense_shape)
 
-        # ── APPEND DIAG: log block gather per call ──
-        _unique_blocks = flat_block_ids.unique().tolist()
-        _k_mean = gathered_key.float().mean().item() if gathered_key.numel() > 0 else 0.0
-        with open('/tmp/kv_dump/block_gather.txt', 'a') as _bgf:
-            _bgf.write(f"[BLK_GATHER] layer={self._layer_name} "
-                       f"seq_lens={seq_lens} max_seq_len={max_seq_len} "
-                       f"num_blocks={num_blocks} block_size={block_size} "
-                       f"bt_shape=({block_table.shape[0]},{block_table.shape[1]}) "
-                       f"unique_blocks={_unique_blocks} "
-                       f"k_mean={_k_mean:.6f}\n")
-
         positions = torch.arange(max_tokens_padded, dtype=torch.long, device=key_cache.device)
         valid_mask = positions.unsqueeze(0) < seq_lens_tensor.unsqueeze(1)
         return gathered_key[valid_mask].contiguous(), gathered_value[valid_mask].contiguous()
@@ -1866,31 +1799,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
             read_kc = self.key_cache
             read_vc = self.value_cache
 
-        # ── ONE-TIME DUMP: compare draft vs target KV cache shapes ──
-        if not hasattr(self, '_kv_shape_dumped'):
-            self._kv_shape_dumped = True
-            _own_kc = self.key_cache
-            _own_vc = self.value_cache
-            _tgt_kc = getattr(_tgt_impl, 'key_cache', None) if _tgt_impl else None
-            _tgt_vc = getattr(_tgt_impl, 'value_cache', None) if _tgt_impl else None
-            _own_nh = getattr(self, 'num_heads', '?')
-            _own_nkv = getattr(self, 'num_kv_heads', '?')
-            _own_hs = getattr(self, 'head_size', '?')
-            _tgt_nh = getattr(_tgt_impl, 'num_heads', '?') if _tgt_impl else '?'
-            _tgt_nkv = getattr(_tgt_impl, 'num_kv_heads', '?') if _tgt_impl else '?'
-            _tgt_hs = getattr(_tgt_impl, 'head_size', '?') if _tgt_impl else '?'
-            import os
-            os.makedirs('/tmp/kv_dump', exist_ok=True)
-            with open('/tmp/kv_dump/kv_shape_dump.txt', 'a') as _sf:
-                _sf.write(f"[KV_SHAPE_DUMP] draft_layer={self._layer_name}\n")
-                _sf.write(f"  draft_own:  key_cache={_own_kc.shape if _own_kc is not None else None} "
-                         f"num_heads={_own_nh} num_kv_heads={_own_nkv} head_size={_own_hs}\n")
-                _sf.write(f"  target:     key_cache={_tgt_kc.shape if _tgt_kc is not None else None} "
-                         f"num_heads={_tgt_nh} num_kv_heads={_tgt_nkv} head_size={_tgt_hs}\n")
-                _sf.write(f"  read_using: key_cache={read_kc.shape if read_kc is not None else None} "
-                         f"swapped={_swapped}\n")
-                _sf.write(f"  kv_sharing_target_layer_name={getattr(self, 'kv_sharing_target_layer_name', None)}\n")
-
         if read_kc is None or read_vc is None:
             with open('/tmp/attn_path_debug.log', 'a') as _f:
                 _f.write(f"[KV_SHARE_BLOCK] layer={self._layer_name} "
@@ -1910,17 +1818,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
             _routed_bt = _per_group_bt[_my_gid]
         block_table = _routed_bt if _routed_bt is not None else attn_metadata.block_tables
         seq_lens = attn_metadata.seq_lens_list
-        # ── TRACE _seq_lens_cpu through the pipeline ──
-        _tgt_impl_trace = getattr(self, '_kv_share_target_impl', None)
-        if _tgt_impl_trace is not None:
-            _trace_kc = read_kc if _swapped else self.key_cache
-            _trace_kc_shape = _trace_kc.shape if _trace_kc is not None else None
-            with open('/tmp/kv_dump/seq_lens_trace.txt', 'a') as _tf:
-                _tf.write(f"[SEQ_TRACE] layer={self._layer_name} "
-                         f"seq_lens_list={seq_lens} "
-                         f"key_cache_shape={_trace_kc_shape} "
-                         f"block_table_shape={block_table.shape if block_table is not None else None} "
-                         f"swapped={_swapped}\n")
         if block_table is None or not seq_lens:
             with open('/tmp/attn_path_debug.log', 'a') as _f:
                 _f.write(f"[KV_SHARE_BLOCK] layer={self._layer_name} "
@@ -1955,18 +1852,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                             break
                     except Exception:
                         continue
-            # ── DIAG: log KV sharing result ──
-            with open('/tmp/attn_path_debug.log', 'a') as _f:
-                _f.write(f"[KV_SHARE_BLOCK] layer={self._layer_name} "
-                         f"swapped={_swapped} "
-                         f"routing_gid={_my_gid} "
-                         f"k_shape={list(dense_key.shape)} "
-                         f"k_mean={_k_mean:.6f} k_std={_k_std:.6f} "
-                         f"v_mean={_v_mean:.6f} "
-                         f"bt_shape={list(block_table.shape)} "
-                         f"seq_lens={seq_lens[:5] if len(seq_lens)>5 else seq_lens} "
-                         f"fallback_gid={_fallback_gid} "
-                         f"head_size={self.head_size}\n")
             return dense_key, dense_value
         except Exception as e:
             with open('/tmp/attn_path_debug.log', 'a') as _f:
