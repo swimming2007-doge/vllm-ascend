@@ -60,3 +60,49 @@ Improvement: **+22.6pp** (2.3× baseline)
 3. **9ed19929** — Guard `synchronize()` during NPU graph capture in `_run_merged_draft`
 4. K=3 (was K=4), auto capture sizes (was [5])
 
+---
+
+## K=3, Target FDO + Draft Eager, W8A8 Compressed, TP=2
+
+**Date**: 2026-06-27
+**Model**: Gemma4 31B W8A8 compressed (53-59 layers FP16 fallback), K=3, Target FDO, Draft eager, TP=2
+**Config**: `VLLM_ASCEND_MTP_MODE=draft_eager`, `cudagraph_mode=FULL_DECODE_ONLY`, max-num-seqs=16, max-num-batched-tokens=16000
+**Log**: `/home/wumeng/logs/31b_MTP_k3_w8a8_bench_serve.log`
+
+### vllm bench serve (standard benchmark)
+
+| Metric | Value |
+|:---|---:|
+| Output token throughput | **35.92 tok/s** |
+| Peak output throughput | 40.00 tok/s |
+| Mean TTFT | 652ms |
+| Mean TPOT | 48.53ms |
+| Successful requests | 102/120 |
+
+### Speculative Decoding
+
+| Metric | Value |
+|:---|---:|
+| Acceptance rate | 52.91% |
+| Acceptance length | 2.59 |
+| Per-position | pos0=55.5%, pos1=52.2%, pos2=51.1% |
+
+### Engine-side Metrics
+
+| Metric | W8A8 | FP16 (prev) | Change |
+|:---|---:|---:|---:|
+| Engine gen throughput | **73.8 tok/s** | 57.2 tok/s | **+29%** |
+| Weight memory | 18.78 GB | ~31 GB | -39% |
+
+### Comparison
+
+| | FP16 | W8A8 |
+|:---|---:|---:|
+| Engine gen throughput | ~58 tok/s | **~74 tok/s** |
+| bench serve throughput | — | **35.9 tok/s** |
+| acceptance_rate benchmark | ~25 tok/s | ~27 tok/s |
+
+FP16→W8A8: engine gen +29%, weight memory -39%. Bottleneck is Draft eager mode
+(12 small forward passes per decode step, Python↔NPU overhead). Draft FDO needed
+for further improvement.
+
