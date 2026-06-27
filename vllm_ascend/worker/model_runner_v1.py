@@ -2022,11 +2022,13 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
-        # ── SYNC GAP DIAG: record event after all target forward ops ──
-        # (reshape_and_cache KV writes are async on NPU; draft may read
-        # stale KV cache without this barrier.)
-        # Controlled by sentinel file: /tmp/vllm_sync_target_kv
-        if (os.path.exists("/tmp/vllm_sync_target_kv")
+        # Record NPU event after target forward completes, so the draft
+        # model can wait on it before reading the KV cache.  Required when
+        # the target model runs in FDO graph mode (_mtp_target_fdo=True)
+        # because reshape_and_cache KV writes are async on the NPU stream.
+        # Also triggerable via sentinel file /tmp/vllm_sync_target_kv for
+        # diagnostic use in eager target mode.
+        if ((getattr(self, '_mtp_target_fdo', False) or os.path.exists("/tmp/vllm_sync_target_kv"))
                 and hasattr(self, 'drafter') and self.drafter is not None):
             _target_done = torch.npu.Event()
             _target_done.record()
