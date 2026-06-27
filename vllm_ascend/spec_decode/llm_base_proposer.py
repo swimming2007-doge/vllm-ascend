@@ -913,20 +913,17 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         return os.path.exists(path)
 
     def _sync_wait_target_events(self) -> None:
-        """Wait for NPU events recorded after target forward completes.
+        """Wait for NPU events recorded after target forward / buffer writes.
 
-        In both_fdo/draft_eager mode, the target model's FDO graph replay
-        writes KV cache asynchronously on the NPU stream.  We must wait for
-        those writes to complete before the draft model reads the KV cache.
-
-        Sentinel files (for diagnostic toggling without restart):
-          /tmp/vllm_sync_target_kv   → also wait for KV cache writes
-          /tmp/vllm_sync_buffers     → also wait for buffer writes
+        Controlled by sentinel files (no restart needed):
+          /tmp/vllm_sync_target_kv   → wait for KV cache writes (Test A)
+          /tmp/vllm_sync_buffers     → wait for buffer writes (Test B)
         """
-        _ev = getattr(self, '_target_done_event', None)
-        if _ev is not None:
-            _ev.wait()
-            self._target_done_event = None
+        if self._sync_flag("/tmp/vllm_sync_target_kv"):
+            _ev = getattr(self, '_target_done_event', None)
+            if _ev is not None:
+                _ev.wait()
+                self._target_done_event = None
         if self._sync_flag("/tmp/vllm_sync_buffers"):
             _ev = getattr(self, '_buffers_ready_event', None)
             if _ev is not None:
