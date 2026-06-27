@@ -2026,10 +2026,7 @@ class NPUModelRunner(GPUModelRunner):
         # model can wait on it before reading the KV cache.  Required when
         # the target model runs in FDO graph mode (_mtp_target_fdo=True)
         # because reshape_and_cache KV writes are async on the NPU stream.
-        # Also triggerable via sentinel file /tmp/vllm_sync_target_kv for
-        # diagnostic use in eager target mode.
-        # TODO: re-enable _mtp_target_fdo gating after debugging hang
-        if (os.path.exists("/tmp/vllm_sync_target_kv")
+        if ((getattr(self, '_mtp_target_fdo', False) or os.path.exists("/tmp/vllm_sync_target_kv"))
                 and hasattr(self, 'drafter') and self.drafter is not None):
             _target_done = torch.npu.Event()
             _target_done.record()

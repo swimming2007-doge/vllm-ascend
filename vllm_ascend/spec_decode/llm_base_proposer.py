@@ -362,7 +362,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                         "SD² active: overriding VLLM_ASCEND_MTP_MODE %s -> draft_eager "
                         "(MLP steering patches need eager draft execution)", mtp_mode)
                 mtp_mode = "draft_eager"
-            self._mtp_draft_fdo = mtp_mode in ("target_eager", "both_fdo")
+            self._mtp_draft_fdo = False  # Draft FDO disabled: hangs during replay
 
             if not self._mtp_draft_fdo:
                 # Draft runs eager — disable graph mode for the proposer so
@@ -913,22 +913,16 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         return os.path.exists(path)
 
     def _sync_wait_target_events(self) -> None:
-        """Wait for NPU events recorded after target forward / buffer writes.
+        """Wait for NPU events recorded after target forward completes.
 
-        Controlled by sentinel files (no restart needed):
-          /tmp/vllm_sync_target_kv   → wait for KV cache writes (Test A)
-          /tmp/vllm_sync_buffers     → wait for buffer writes (Test B)
+        In draft_eager/both_fdo mode, the target model's FDO graph replay
+        writes KV cache asynchronously on the NPU stream.  We must wait for
+        those writes to complete before the draft model reads the KV cache.
         """
-        if self._sync_flag("/tmp/vllm_sync_target_kv"):
-            _ev = getattr(self, '_target_done_event', None)
-            if _ev is not None:
-                _ev.wait()
-                self._target_done_event = None
-        if self._sync_flag("/tmp/vllm_sync_buffers"):
-            _ev = getattr(self, '_buffers_ready_event', None)
-            if _ev is not None:
-                _ev.wait()
-                self._buffers_ready_event = None
+        _ev = getattr(self, '_target_done_event', None)
+        if _ev is not None:
+            _ev.wait()
+            self._target_done_event = None
 
     def _run_merged_draft(
         self,
