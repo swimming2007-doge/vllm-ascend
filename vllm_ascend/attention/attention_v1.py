@@ -654,9 +654,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                               and get_forward_context().cudagraph_runtime_mode
                               != CUDAGraphMode.FULL)
                     if use_pa:
-                        print(f"[FIA-UPDATE] PA fallback layer={key} "
-                              f"num_tokens={num_tokens} head_dim={_head_dim}",
-                              file=sys.stderr, flush=True)
                         # _npu_paged_attention expects tensors for
                         # context_lens.  seq_lens from attn_metadata
                         # may be a list.
@@ -707,10 +704,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         input_layout = "BNSD"
                         sparse_mode = 0
                     _ws = graph_params.workspaces.get(num_tokens)
-                    print(f"[FIA-UPDATE] layer={key} num_tokens={num_tokens} "
-                          f"head_dim={_head_dim} "
-                          f"sparse_mode={sparse_mode} block_size={block_size}",
-                          file=sys.stderr, flush=True)
                     torch.npu.graph_task_update_begin(update_stream, handle)
                     torch_npu.npu_fused_infer_attention_score.out(
                         query=query, key=key_cache, value=value,
