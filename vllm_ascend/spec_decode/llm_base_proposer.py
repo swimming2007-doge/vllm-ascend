@@ -1112,7 +1112,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             self._set_positions(batch_size, clamped_positions)
             self.hidden_states[:batch_size] = hidden_states.view(batch_size, -1)
             # Ascend NPU: copy may be async; sync before next iteration reads.
-            torch.npu.current_stream().synchronize()
+            # Skip during NPU graph capture — synchronize on a captured
+            # stream is illegal (error 107027).  During FDO replay the
+            # buffer copies happen in _propose() before the graph runs.
+            if not torch.npu.is_current_stream_capturing():
+                torch.npu.current_stream().synchronize()
 
             if self.supports_mm_inputs:
                 self.inputs_embeds[:batch_size] = self.model.embed_input_ids(input_ids)
