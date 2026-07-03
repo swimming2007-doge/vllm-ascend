@@ -172,14 +172,6 @@ class ACLGraphWrapper:
         entry = self.concrete_aclgraph_entries[batch_descriptor]
 
         if entry.aclgraph is None:
-            # MTP: When the current stream is already being captured
-            # (e.g. target model's FDO graph in PIECEWISE mode),
-            # skip this wrapper's capture and run eagerly. Nested NPU
-            # graph captures corrupt the outer graph's workspace.
-            _outer_capturing = torch.npu.is_current_stream_capturing()
-            if _outer_capturing:
-                return self.runnable(*args, **kwargs)
-
             if self.aclgraph_options.debug_log_enable:
                 # Since we capture aclgraph for many different shapes and
                 # capturing is fast, we don't need to log it for every
