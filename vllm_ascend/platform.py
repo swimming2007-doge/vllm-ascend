@@ -627,7 +627,12 @@ class NPUPlatform(Platform):
             # TODO(2026/7/15): Delete the reduced gear after the new driver is released.
             if get_ascend_device_type() == AscendDeviceType.A5:
                 prune_capture_sizes_for_950(vllm_config)
-            update_aclgraph_sizes(vllm_config)
+            # Gemma4 MTP: target 60 layers + draft layers consume more ACL
+            # graph resources (streams). Cap capture sizes to the NPU stream
+            # limit. Scoped to gemma4 MTP so other piecewise models keep their
+            # existing capture-size behavior.
+            if _is_gemma4_mtp:
+                update_aclgraph_sizes(vllm_config)
             ascend_config.ascend_compilation_config.enable_npugraph_ex = False
         elif (
             compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
