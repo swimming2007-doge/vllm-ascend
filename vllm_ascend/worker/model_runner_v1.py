@@ -20,7 +20,6 @@
 import gc
 import logging
 import math
-import os
 import sys
 import time
 from collections import defaultdict
@@ -2346,7 +2345,7 @@ class NPUModelRunner(GPUModelRunner):
         # the target model runs in FDO graph mode because reshape_and_cache
         # KV writes are async on the NPU stream.
         _target_is_fdo = self.compilation_config.cudagraph_mode.has_full_cudagraphs()
-        if ((_target_is_fdo or os.path.exists("/tmp/vllm_sync_target_kv"))
+        if (_target_is_fdo
                 and hasattr(self, 'drafter') and self.drafter is not None):
             # Reuse a single event across steps instead of allocating one per
             # forward on the hot path, to avoid NPU event resource pressure.
