@@ -1501,7 +1501,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             return _kv_share_out
         if (
             attn_metadata.attn_state == AscendAttentionState.DecodeOnly
-            and using_paged_attention(num_tokens, self.vllm_config)
+            and using_paged_attention(num_tokens, self.vllm_config, self.head_size)
             and self.sliding_window is None
         ):
             output = self.forward_paged_attention(query, attn_metadata, output)

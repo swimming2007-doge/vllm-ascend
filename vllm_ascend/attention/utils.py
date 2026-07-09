@@ -143,15 +143,31 @@ def ascend_chunked_prefill_workspace_size(vllm_config: VllmConfig) -> int:
     return chunked_prefill_workspace_size
 
 
-def using_paged_attention(runtime_shape: int, vllm_config: VllmConfig) -> bool:
-    if vllm_config.speculative_config is not None:
-        return False
+def using_paged_attention(
+    runtime_shape: int,
+    vllm_config: VllmConfig,
+    head_size: int | None = None,
+) -> bool:
     if get_ascend_device_type() == AscendDeviceType.A5:
         return False
     from vllm.config.compilation import CUDAGraphMode
 
     cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
     if cudagraph_mode != CUDAGraphMode.FULL_DECODE_ONLY:
+        return False
+
+    # Gemma4 global attention has head_dim=512, which FIA (TND) does not
+    # support on A2/A3.  Route head_dim=512 layers to PagedAttention even
+    # under speculative decoding (MTP), gated to Gemma4 so other models keep
+    # the original shape-based behavior.
+    spec = vllm_config.speculative_config
+    is_gemma4_mtp = spec is not None and spec.use_gemma4_mtp()
+    if is_gemma4_mtp and head_size == 512:
+        return True
+
+    # Non-Gemma4 or non-512 head_dim: speculative decoding keeps the original
+    # shape-based gating (PA disabled under MTP for other models).
+    if spec is not None:
         return False
 
     return runtime_shape in get_ascend_config().pa_shape_list
