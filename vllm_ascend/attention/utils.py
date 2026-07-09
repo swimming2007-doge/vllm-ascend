@@ -11,6 +11,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 
+from vllm_ascend.device.utils import FIA_TND_LARGE_HEAD_FALLBACK_HEAD_SIZE
 from vllm_ascend.utils import (
     AscendDeviceType,
     get_ascend_config,
@@ -150,23 +151,26 @@ def using_paged_attention(
 ) -> bool:
     if get_ascend_device_type() == AscendDeviceType.A5:
         return False
+    # A2/A3 FIA (TND) does not support head_dim=512 (Gemma4 global attention).
+    # Route head_dim=512 layers to PagedAttention.  Non-speculative decoding
+    # always routes (sync upstream #11091); under speculative decoding (MTP)
+    # this is gated to Gemma4 so other speculative methods keep PA disabled.
+    # TODO: Remove this fallback when A2/A3 FIA TND supports Gemma4's
+    # 512-dim global attention heads.  Prefill is handled by the device
+    # adaptor (npu_large_head_prefill_attention).
+    spec = vllm_config.speculative_config
+    if head_size == FIA_TND_LARGE_HEAD_FALLBACK_HEAD_SIZE:
+        if spec is None or spec.use_gemma4_mtp():
+            return True
+        return False
     from vllm.config.compilation import CUDAGraphMode
 
     cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
     if cudagraph_mode != CUDAGraphMode.FULL_DECODE_ONLY:
         return False
 
-    # Gemma4 global attention has head_dim=512, which FIA (TND) does not
-    # support on A2/A3.  Route head_dim=512 layers to PagedAttention even
-    # under speculative decoding (MTP), gated to Gemma4 so other models keep
-    # the original shape-based behavior.
-    spec = vllm_config.speculative_config
-    is_gemma4_mtp = spec is not None and spec.use_gemma4_mtp()
-    if is_gemma4_mtp and head_size == 512:
-        return True
-
-    # Non-Gemma4 or non-512 head_dim: speculative decoding keeps the original
-    # shape-based gating (PA disabled under MTP for other models).
+    # Non-512 head_dim: speculative decoding keeps the original shape-based
+    # gating (PA disabled under MTP for other models).
     if spec is not None:
         return False
 
