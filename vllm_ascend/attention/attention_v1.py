@@ -1609,10 +1609,16 @@ class AscendAttentionBackendImpl(AttentionImpl):
     ):
         num_tokens = query.shape[0]
 
-        if (self.head_size == 512
-                and _EXTRA_CTX.is_draft_model
-                and not _EXTRA_CTX.capturing):
-            if self.key_cache is not None:
+        if self.head_size == 512 and _EXTRA_CTX.is_draft_model:
+            if _EXTRA_CTX.capturing:
+                if not getattr(self, "_sdpa_capture_warned", False):
+                    self._sdpa_capture_warned = True
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "SDPA fallback SKIPPED: _EXTRA_CTX.capturing=True. "
+                        "Use --enforce-eager to activate SDPA for head_dim=512 draft layers."
+                    )
+            elif self.key_cache is not None:
                 output = self._forward_sdpa_decode(query, attn_metadata, output)
                 return output
 
