@@ -1613,20 +1613,17 @@ class AscendAttentionBackendImpl(AttentionImpl):
             if _EXTRA_CTX.capturing:
                 if not getattr(self, "_sdpa_capture_warned", False):
                     self._sdpa_capture_warned = True
-                    import logging
-                    logging.getLogger(__name__).warning(
-                        "SDPA fallback SKIPPED: _EXTRA_CTX.capturing=True. "
-                        "Use --enforce-eager to activate SDPA for head_dim=512 draft layers."
-                    )
+                    import sys
+                    print("[SDPA] SKIPPED: capturing=True, use --enforce-eager",
+                          file=sys.stderr, flush=True)
             elif self.key_cache is not None:
                 if not getattr(self, "_sdpa_hit_logged", False):
                     self._sdpa_hit_logged = True
-                    import logging
-                    logging.getLogger(__name__).warning(
-                        "SDPA fallback ACTIVE: head_dim=512 draft layer. "
-                        f"num_tokens={num_tokens}, block_size={self.key_cache.shape[1]}, "
-                        f"seq_lens={attn_metadata.seq_lens_list}"
-                    )
+                    import sys
+                    print("[SDPA] ACTIVE: head_dim=512 draft layer, "
+                          f"num_tokens={num_tokens}, "
+                          f"seq_lens={attn_metadata.seq_lens_list}",
+                          file=sys.stderr, flush=True)
                 output = self._forward_sdpa_decode(query, attn_metadata, output)
                 return output
 
