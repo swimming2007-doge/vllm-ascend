@@ -1587,13 +1587,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 scale=scale,
                 is_causal=False,
             )  # (1, num_heads, n_q, head_size)
-            out_b = out_bn.permute(0, 2, 1, 3).reshape(q_b.shape[0], num_heads * head_size)
+            out_b = out_bn.permute(0, 2, 1, 3).reshape(q_b.shape[0], num_heads, head_size)
             attn_outputs.append(out_b)
 
         if attn_outputs:
             attn_output = torch.cat(attn_outputs, dim=0)
         else:
-            attn_output = torch.zeros(num_tokens, num_heads * head_size,
+            attn_output = torch.zeros(num_tokens, num_heads, head_size,
                                       dtype=query.dtype, device=query.device)
         output[:num_tokens] = attn_output[:num_tokens]
         return output
