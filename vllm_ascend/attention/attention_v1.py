@@ -1590,6 +1590,24 @@ class AscendAttentionBackendImpl(AttentionImpl):
             out_b = out_bn.permute(0, 2, 1, 3).reshape(q_b.shape[0], num_heads, head_size)
             attn_outputs.append(out_b)
 
+            if b == 0 and not getattr(self, "_sdpa_dump_done", False):
+                import os
+                if os.environ.get("SDPA_DUMP", "") == "1":
+                    self._sdpa_dump_done = True
+                    dump_q = q_b.cpu().float().numpy()
+                    dump_k = k_b.cpu().float().numpy()
+                    dump_v = v_b.cpu().float().numpy()
+                    dump_o = out_b.cpu().float().numpy()
+                    import numpy
+                    numpy.savez("/tmp/sdpa_dump_layer3_ascend.npz",
+                               q=dump_q, k=dump_k, v=dump_v, out=dump_o,
+                               scale=scale, sl=sl)
+                    import sys
+                    print(f"[SDPA DUMP] saved to /tmp/sdpa_dump_layer3_ascend.npz | "
+                          f"q={dump_q.shape} mean={dump_q.mean():.6f} std={dump_q.std():.6f} | "
+                          f"k={dump_k.shape} mean={dump_k.mean():.6f} std={dump_k.std():.6f}",
+                          file=sys.stderr, flush=True)
+
         if attn_outputs:
             attn_output = torch.cat(attn_outputs, dim=0)
         else:
