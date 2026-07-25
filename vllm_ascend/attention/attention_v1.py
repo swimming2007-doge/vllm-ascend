@@ -1619,6 +1619,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         "Use --enforce-eager to activate SDPA for head_dim=512 draft layers."
                     )
             elif self.key_cache is not None:
+                if not getattr(self, "_sdpa_hit_logged", False):
+                    self._sdpa_hit_logged = True
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "SDPA fallback ACTIVE: head_dim=512 draft layer. "
+                        f"num_tokens={num_tokens}, block_size={self.key_cache.shape[1]}, "
+                        f"seq_lens={attn_metadata.seq_lens_list}"
+                    )
                 output = self._forward_sdpa_decode(query, attn_metadata, output)
                 return output
 
