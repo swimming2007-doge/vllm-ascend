@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 import torch
+import torch.nn.functional as F
 import torch_npu
 import vllm.envs as envs_vllm
 from vllm.config import VllmConfig, get_current_vllm_config
@@ -1527,6 +1528,76 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 attn_metadata.reshape_cache_event.record()
         return query, key, value, output
 
+    def _forward_sdpa_decode(
+        self,
+        query: torch.Tensor,
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        num_tokens = query.shape[0]
+        num_heads = self.num_heads
+        num_kv_heads = self.num_kv_heads
+        head_size = self.head_size
+        scale = self.scale
+        block_size = self.key_cache.shape[1]
+
+        block_table = attn_metadata.block_tables  # [batch, max_blocks]
+        seq_lens = attn_metadata.seq_lens_list
+        batch_size = block_table.shape[0]
+
+        q_start = attn_metadata.query_start_loc
+        if q_start is not None and len(q_start) > 1:
+            cu_seq_q = q_start
+        else:
+            cu_seq_q = torch.tensor([0, num_tokens], dtype=torch.int32, device=query.device)
+
+        n_rep = num_heads // num_kv_heads
+        q_reshape = query[:num_tokens].view(num_tokens, num_heads, head_size)
+
+        attn_outputs = []
+        for b in range(batch_size):
+            b_start = int(cu_seq_q[b].item())
+            b_end = int(cu_seq_q[b + 1].item())
+            if b_end <= b_start:
+                continue
+            q_b = q_reshape[b_start:b_end]  # (n_q, num_heads, head_size)
+            sl = seq_lens[b]
+            if sl == 0:
+                continue
+
+            num_blocks = (sl + block_size - 1) // block_size
+            blk_ids = block_table[b, :num_blocks].long()
+
+            k_blocks = self.key_cache[blk_ids]  # (num_blocks, block_size, n_kv_heads, head_size)
+            v_blocks = self.value_cache[blk_ids]
+
+            k_b = k_blocks.reshape(-1, num_kv_heads, head_size)[:sl]
+            v_b = v_blocks.reshape(-1, num_kv_heads, head_size)[:sl]
+
+            if n_rep > 1:
+                k_b = k_b.unsqueeze(2).expand(-1, -1, n_rep, -1).reshape(sl, num_heads, head_size)
+                v_b = v_b.unsqueeze(2).expand(-1, -1, n_rep, -1).reshape(sl, num_heads, head_size)
+
+            q_bn = q_b.unsqueeze(0).permute(0, 2, 1, 3)    # (1, num_heads, n_q, head_size)
+            k_bn = k_b.unsqueeze(0).permute(0, 2, 1, 3)    # (1, num_heads, sl, head_size)
+            v_bn = v_b.unsqueeze(0).permute(0, 2, 1, 3)
+
+            out_bn = F.scaled_dot_product_attention(
+                q_bn, k_bn, v_bn,
+                scale=scale,
+                is_causal=False,
+            )  # (1, num_heads, n_q, head_size)
+            out_b = out_bn.permute(0, 2, 1, 3).reshape(q_b.shape[0], num_heads * head_size)
+            attn_outputs.append(out_b)
+
+        if attn_outputs:
+            attn_output = torch.cat(attn_outputs, dim=0)
+        else:
+            attn_output = torch.zeros(num_tokens, num_heads * head_size,
+                                      dtype=query.dtype, device=query.device)
+        output[:num_tokens] = attn_output[:num_tokens]
+        return output
+
     def forward_impl(
         self,
         query: torch.Tensor,
@@ -1537,6 +1608,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
         output: torch.Tensor,
     ):
         num_tokens = query.shape[0]
+
+        if (self.head_size == 512
+                and _EXTRA_CTX.is_draft_model
+                and not _EXTRA_CTX.capturing):
+            if self.key_cache is not None:
+                output = self._forward_sdpa_decode(query, attn_metadata, output)
+                return output
+
         from vllm_ascend.utils import is_950
         _pa_gate = (
             attn_metadata.attn_state in (AscendAttentionState.DecodeOnly,
