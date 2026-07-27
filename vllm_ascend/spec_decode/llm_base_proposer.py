@@ -1457,8 +1457,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # cast to int32 is crucial when eagle model is compiled.
             # tensor.argmax() returns int64 by default.
             input_ids = draft_token_ids_tensor[draft_index]
-            positions += 1
-
+            # Advance positions for the next draft step. Skipped for
+            # constant-position drafters (MTP/Gemma4, constant_draft_positions=
+            # True): all draft steps run from the same position. Mirrors
+            # upstream's `if not self.constant_draft_positions` gate.
+            if not self.constant_draft_positions:
+                positions += 1
             # NOTE(woosuk): We should handle the case where the draft model
             # generates tokens beyond the max model length. Since it is complex
             # to remove such requests from the batch, we keep them in the batch
@@ -1861,9 +1865,14 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             common_attn_metadata.graph_pad_size = -1
             common_attn_metadata.num_input_tokens = input_batch_size
 
-        # The loop part
-        used_update_positions += 1
-
+        # The loop part -- advance one draft step. Skipped entirely for
+        # constant-position drafters (MTP/Gemma4, constant_draft_positions=True):
+        # all draft steps predict from the same position, so positions/seq_lens
+        # must NOT advance between steps (see upstream gemma4.py). Mirrors
+        # upstream's `if not self.constant_draft_positions` gate around
+        # _update_positions_dependent_metadata.
+        if not self.constant_draft_positions:
+            used_update_positions += 1
         # Clone the data so that when calculating the data at position 2 and position 3
         # in the merged graph, it does not affect position 1
         # FIXME(lilinsiman)
@@ -1896,22 +1905,24 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # For data integrity when async scheduling, we shouldn't use in place
         # operations in case they are modified in next step's `prepare_input`
         # of main model.
-        # Increment the sequence lengths.
-        common_attn_metadata.seq_lens[:batch_size] += 1
-        # For the requests that exceed the max model length, we set the
-        # sequence length to 1 to minimize their overheads in attention.
-        exceeds_mask = common_attn_metadata.seq_lens[:batch_size] > self.max_model_len
-        common_attn_metadata.seq_lens[:batch_size].masked_fill_(exceeds_mask, 1)
-        if common_attn_metadata.seq_lens_cpu is not None:
-            common_attn_metadata.seq_lens_cpu[:batch_size] = common_attn_metadata.seq_lens_cpu[:batch_size] + 1
-            exceeds_mask_cpu = common_attn_metadata.seq_lens_cpu[:batch_size] > self.max_model_len
-            common_attn_metadata.seq_lens_cpu[:batch_size].masked_fill_(exceeds_mask_cpu, 1)
-        if common_attn_metadata._seq_lens_cpu is not None:
-            common_attn_metadata._seq_lens_cpu[:batch_size] = common_attn_metadata._seq_lens_cpu[:batch_size] + 1
-            exceeds_mask_internal_cpu = common_attn_metadata._seq_lens_cpu[:batch_size] > self.max_model_len
-            common_attn_metadata._seq_lens_cpu[:batch_size].masked_fill_(exceeds_mask_internal_cpu, 1)
-        if common_attn_metadata.num_computed_tokens_cpu is not None:
-            common_attn_metadata.num_computed_tokens_cpu[:batch_size] += 1
+        # Increment the sequence lengths. Skipped for constant-position
+        # drafters (see note above).
+        if not self.constant_draft_positions:
+            common_attn_metadata.seq_lens[:batch_size] += 1
+            # For the requests that exceed the max model length, we set the
+            # sequence length to 1 to minimize their overheads in attention.
+            exceeds_mask = common_attn_metadata.seq_lens[:batch_size] > self.max_model_len
+            common_attn_metadata.seq_lens[:batch_size].masked_fill_(exceeds_mask, 1)
+            if common_attn_metadata.seq_lens_cpu is not None:
+                common_attn_metadata.seq_lens_cpu[:batch_size] = common_attn_metadata.seq_lens_cpu[:batch_size] + 1
+                exceeds_mask_cpu = common_attn_metadata.seq_lens_cpu[:batch_size] > self.max_model_len
+                common_attn_metadata.seq_lens_cpu[:batch_size].masked_fill_(exceeds_mask_cpu, 1)
+            if common_attn_metadata._seq_lens_cpu is not None:
+                common_attn_metadata._seq_lens_cpu[:batch_size] = common_attn_metadata._seq_lens_cpu[:batch_size] + 1
+                exceeds_mask_internal_cpu = common_attn_metadata._seq_lens_cpu[:batch_size] > self.max_model_len
+                common_attn_metadata._seq_lens_cpu[:batch_size].masked_fill_(exceeds_mask_internal_cpu, 1)
+            if common_attn_metadata.num_computed_tokens_cpu is not None:
+                common_attn_metadata.num_computed_tokens_cpu[:batch_size] += 1
         if self.uses_mrope:
             common_attn_metadata.positions[:batch_size].copy_(clamped_positions[0])
         else:
