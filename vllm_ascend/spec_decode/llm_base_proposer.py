@@ -143,6 +143,56 @@ def _is_glm_model(model_config) -> bool:
     return "glm" in str(model_type).lower()
 
 
+def build_per_group_layer_attn_metadata(
+    draft_attn_groups,
+    common_attn_metadata,
+    per_group_block_tables,
+    num_reqs,
+    build_attn_metadata,
+):
+    """Build per-layer attention metadata, swapping each group's block_table.
+
+    Mirrors the target model-runner pattern (see ``_prepare_inputs``): for each
+    KV cache group, shallow-copy the common metadata and install that group's
+    block_table, so layers address the correct KV cache.
+
+    Required for drafters spanning multiple KV cache groups -- e.g. Gemma4 MTP,
+    whose sliding-attention draft layers (head_dim=256) share one block_table
+    (gid 0) while the full-attention draft layer (head_dim=512) uses another
+    (gid 1). Without this swap every draft layer reads gid 0's block_table, and
+    the full-attention layer addresses the sliding group's KV cache -- the root
+    cause of the head_dim=512 numerical divergence on A2/A3.
+
+    Args:
+        draft_attn_groups: attention groups, each exposing
+            ``kv_cache_group_id``, ``layer_names`` and ``get_metadata_builder()``.
+        common_attn_metadata: base common metadata whose block_table belongs to
+            one group (typically gid 0).
+        per_group_block_tables: ``{gid: block_table_tensor}`` captured by the
+            target via ``set_per_group_block_table``; ``None`` for single-group
+            drafters (EAGLE/MLP), which then reuse the common block_table.
+        num_reqs: number of requests to slice each block_table to.
+        build_attn_metadata: ``callable(cm_group, attn_group) -> attn_metadata``.
+
+    Returns:
+        ``{layer_name: attn_metadata}`` covering all layers across all groups.
+    """
+    per_layer_attn_metadata: dict[str, Any] = {}
+    for attn_group in draft_attn_groups:
+        gid = attn_group.kv_cache_group_id
+        if per_group_block_tables is not None and gid in per_group_block_tables:
+            cm_group = copy.copy(common_attn_metadata)
+            cm_group.block_table_tensor = per_group_block_tables[gid][:num_reqs]
+        else:
+            cm_group = common_attn_metadata
+        attn_metadata = build_attn_metadata(cm_group, attn_group)
+        for layer_name in attn_group.layer_names:
+            per_layer_attn_metadata[layer_name] = attn_metadata
+    return per_layer_attn_metadata
+
+
+
+
 class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
     _runnable: ACLGraphWrapper | Callable
 
@@ -636,7 +686,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 common_attn_metadata.prefill_context_parallel_metadata = self.runner.pcp_manager.long_seq_metadata
 
             assert len(self.draft_attn_groups) > 0
-            builder = self.draft_attn_groups[0].get_metadata_builder()
             kv_cache_spec = self.draft_attn_groups[0].kv_cache_spec
             # update the tensor's address for each step.
             for draft_index in range(self.num_speculative_tokens):
@@ -663,23 +712,37 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 if self.pcp_size * self.dcp_size > 1 and draft_index > 0:
                     assert self.block_table_tensor_clone is not None, "block_table_tensor_clone is not init"
                     common_attn_metadata.block_table_tensor = self.block_table_tensor_clone[:num_reqs]
-                if not self.use_compress or draft_index == 0:
-                    attn_metadata_eagle = builder.build_for_graph_capture(
-                        common_attn_metadata,
-                        AscendAttentionState.SpecDecoding
-                        if self.method == "mtp"
-                        else AscendAttentionState.ChunkedPrefill,
-                        **extra_attn_metadata_args,
-                    )
-                else:
-                    attn_metadata_eagle = builder.build_for_drafting(
-                        common_attn_metadata,
-                        draft_index,
-                        **extra_attn_metadata_args,
-                    )
-                per_layer_attn_metadata = dict()
-                for layer_name in self.attn_layer_names:
-                    per_layer_attn_metadata[layer_name] = attn_metadata_eagle
+                # Build per-group metadata, swapping in the correct block_table
+                # per KV cache group. Gemma4 MTP has multiple groups (sliding vs
+                # full attention) with separate block tables; the original code
+                # reused draft_attn_groups[0]'s builder and block_table for ALL
+                # layers, so the full-attention layer (head_dim=512) read the
+                # sliding group's block_table and addressed the wrong KV cache.
+                # The build_for_graph_capture/build_for_drafting branch, the
+                # attn_state and the SAS extra args are preserved verbatim.
+                attn_state = (
+                    AscendAttentionState.SpecDecoding if self.method == "mtp" else AscendAttentionState.ChunkedPrefill
+                )
+                # Only Gemma4/step3.5 drafters maintain per-group block tables
+                # (multi KV-cache-group models); other drafters (EAGLE/MLP) do
+                # not set this attribute and use the single common block table.
+                per_group_bts = getattr(self, "_per_group_block_tables", None)
+
+                def _build_group_md(
+                    cm_group, attn_group, *, _di=draft_index, _s=attn_state, _e=extra_attn_metadata_args
+                ):
+                    group_builder = attn_group.get_metadata_builder()
+                    if not self.use_compress or _di == 0:
+                        return group_builder.build_for_graph_capture(cm_group, _s, **_e)
+                    return group_builder.build_for_drafting(cm_group, _di, **_e)
+
+                per_layer_attn_metadata = build_per_group_layer_attn_metadata(
+                    self.draft_attn_groups,
+                    common_attn_metadata,
+                    per_group_bts,
+                    num_reqs,
+                    _build_group_md,
+                )
                 multi_steps_attn_metadata.append(per_layer_attn_metadata)
 
         model_positions = self._get_positions(num_tokens)
@@ -975,7 +1038,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         common_attn_metadata.num_input_tokens = num_input_tokens
         # FIXME(woosuk): The below two ops cause synchronization. Optimize.
         assert len(self.draft_attn_groups) > 0
-        builder = self.draft_attn_groups[0].get_metadata_builder()
         extra_attn_metadata_args: dict = {}
         if self.use_compress:
             extra_attn_metadata_args = dict(
@@ -984,32 +1046,46 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 common_ratio_to_sas_metadata=dict(),
                 block_size=self.draft_attn_groups[0].kv_cache_spec.block_size,
             )
-        attn_metadata = builder.build(0, common_attn_metadata, self.runner.get_model(), **extra_attn_metadata_args)
 
-        # MTP draft always runs in decode-like mode (1 token per request)
-        # regardless of the target model's attention state. During chunked
-        # prefill the common_attn_metadata inherits ChunkedPrefill from the
-        # target, which makes the PA gate in forward_impl fail for 512-dim
-        # global attention heads (Gemma4), routing them through the dense-KV-
-        # gather prefill fallback (_gather_paged_kv_to_dense) that OOMs on
-        # long sequences. Override to SpecDecoding so all draft attention
-        # heads route through PA/FIA correctly. Subsequent draft steps are
-        # already handled by attn_update_stack_num_spec_norm (line 1724).
-        if self.method == "mtp":
-            attn_metadata.attn_state = AscendAttentionState.SpecDecoding
+        # Build per-group attention metadata, swapping in the correct
+        # block_table per KV cache group. Gemma4 MTP has multiple groups
+        # (sliding vs full attention) with separate block tables; using
+        # draft_attn_groups[0]'s block_table for ALL layers made the
+        # full-attention (head_dim=512) layer read the sliding group's KV
+        # cache -- the root cause of the A2/L20 numerical divergence.
+        per_group_bts = getattr(self, "_per_group_block_tables", None)
+        num_reqs_md = common_attn_metadata.batch_size()
 
-        if hasattr(attn_metadata, "causal") and not attn_metadata.causal:
-            attn_metadata.attn_mask = None
+        def _build_group_md(cm_group, attn_group, _e=extra_attn_metadata_args):
+            md = attn_group.get_metadata_builder().build(0, cm_group, self.runner.get_model(), **_e)
+            # MTP draft always runs in decode-like mode (1 token per request)
+            # regardless of the target model's attention state. During chunked
+            # prefill the common_attn_metadata inherits ChunkedPrefill from the
+            # target, which makes the PA gate in forward_impl fail for 512-dim
+            # global attention heads (Gemma4), routing them through the dense-KV-
+            # gather prefill fallback (_gather_paged_kv_to_dense) that OOMs on
+            # long sequences. Override to SpecDecoding so all draft attention
+            # heads route through PA/FIA correctly. Subsequent draft steps are
+            # already handled by attn_update_stack_num_spec_norm.
+            if self.method == "mtp":
+                md.attn_state = AscendAttentionState.SpecDecoding
+            if hasattr(md, "causal") and not md.causal:
+                md.attn_mask = None
+            return md
+
+        per_layer_attn_metadata = build_per_group_layer_attn_metadata(
+            self.draft_attn_groups,
+            common_attn_metadata,
+            per_group_bts,
+            num_reqs_md,
+            _build_group_md,
+        )
+        multi_steps_attn_metadata = [per_layer_attn_metadata]
 
         if self.uses_mrope:
             used_update_positions = self.mrope_positions[:, token_indices_to_sample]
         else:
             used_update_positions = self.positions[token_indices_to_sample]
-        per_layer_attn_metadata = dict()
-        # The first step of speculative.
-        for layer_name in self.attn_layer_names:
-            per_layer_attn_metadata[layer_name] = attn_metadata
-        multi_steps_attn_metadata = [per_layer_attn_metadata]
 
         # Copy the old attn_metadata and update
         attn_metadata_i = per_layer_attn_metadata[self.attn_layer_names[0]]
@@ -1030,6 +1106,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         metadata_has_prefill = bool(getattr(attn_metadata_i, "num_prefills", 0))
         is_prefill_batch = num_prefill_reqs > 0 or metadata_has_prefill
+        # Seed step-0 metadata for the multi-step update loop below.
+        # attn_update_stack_num_spec_norm ignores its old_attn_metadata arg and
+        # rebuilds a fresh per-group metadata on every call (see line ~1970), so
+        # this value is only the initial placeholder threaded through the loop.
+        attn_metadata = attn_metadata_i
         if self.pcp_size * self.dcp_size > 1:
             is_decode_only_batch = num_decode_reqs > 0 and not is_prefill_batch
             if self.num_speculative_tokens > 1 and is_decode_only_batch:
@@ -1088,7 +1169,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                                 mtp_slot_mapping,
                                 attn_group=attn_group,
                             )
-                            for layer_name in self.attn_layer_names:
+                            for layer_name in attn_group.layer_names:
                                 per_layer_attn_metadata[layer_name] = attn_metadata
                         multi_steps_attn_metadata.append(per_layer_attn_metadata)
         else:
@@ -1107,7 +1188,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                             aclgraph_runtime_mode,
                             attn_group=attn_group,
                         )
-                        for layer_name in self.attn_layer_names:
+                        for layer_name in attn_group.layer_names:
                             per_layer_attn_metadata[layer_name] = attn_metadata
                     multi_steps_attn_metadata.append(per_layer_attn_metadata)
 
@@ -1730,7 +1811,19 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         assert draft_index > 0
         assert attn_group is not None, "vllm-ascend v0.17.0rc1 requires attn_group"
         common_attn_metadata = self.shallow_copy_metadata(old_common_metadata)
-
+        # Per-group block_table swap -- the multi-step-loop twin of
+        # build_per_group_layer_attn_metadata (called at _propose entry,
+        # ~line 1114, for the pos0 / initial metadata). The common
+        # block_table belongs to the sliding group (gid 4); without this
+        # swap it is reused for ALL draft groups, so full_attention layers
+        # (gid 5, head_dim=512) read sliding-group KV (head_dim=256 layout)
+        # and address it via slot_mapping too. pos0 is unaffected (its
+        # metadata is swapped at entry); pos1/pos2 hit this path and get
+        # corrupted -- the A2 pos1/pos2 acceptance gap vs L20.
+        per_group_bts = getattr(self, "_per_group_block_tables", None)
+        _upd_gid = attn_group.kv_cache_group_id
+        if per_group_bts is not None and _upd_gid in per_group_bts:
+            common_attn_metadata.block_table_tensor = per_group_bts[_upd_gid][:batch_size]
         if draft_index == 1:
             if aclgraph_runtime_mode == CUDAGraphMode.FULL:
                 common_attn_metadata.num_reqs = input_batch_size
@@ -1851,7 +1944,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 block_numbers = clamped_positions[0] // block_size
             else:
                 block_numbers = clamped_positions // block_size
-            block_ids = old_common_metadata.block_table_tensor.gather(dim=1, index=block_numbers.view(-1, 1))
+            # Use the per-group-swapped block_table (see swap above), not the
+            # pre-swap old_common one -- otherwise multi-group drafters write
+            # KV slots into the wrong group's physical blocks.
+            block_ids = common_attn_metadata.block_table_tensor.gather(dim=1, index=block_numbers.view(-1, 1))
             block_ids = block_ids.view(-1)
             if self.uses_mrope:
                 slot_mapping = block_ids * block_size + clamped_positions[0] % block_size

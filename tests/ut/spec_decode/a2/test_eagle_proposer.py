@@ -1152,6 +1152,7 @@ class TestEagleProposerPropose:
         mock_attn_metadata = MagicMock()
         mock_builder.build.return_value = mock_attn_metadata
         mock_attn_group.get_metadata_builder.return_value = mock_builder
+        mock_attn_group.layer_names = ['model.layers.36.self_attn.attn']
         self.proposer.draft_attn_groups = [mock_attn_group]
         self.proposer.attn_layer_names = ['model.layers.36.self_attn.attn']
         self.proposer.kernel_block_size = 128

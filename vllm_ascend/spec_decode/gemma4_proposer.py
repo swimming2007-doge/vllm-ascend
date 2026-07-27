@@ -18,6 +18,7 @@ from vllm.v1.spec_decode.gemma4 import (
 from vllm_ascend.attention import kv_sharing
 from vllm_ascend.spec_decode.llm_base_proposer import (
     AscendSpecDecodeBaseProposer,
+    build_per_group_layer_attn_metadata,
 )
 
 
@@ -108,35 +109,35 @@ class AscendGemma4Proposer(_VllmGemma4Proposer, AscendSpecDecodeBaseProposer):
         return True
 
     # ---- build_per_group_and_layer_attn_metadata ----------------------------
-    # Override to add diagnostics for multi-group block table assignment.
+    # Override to swap in the correct block_table per KV cache group via the
+    # shared build_per_group_layer_attn_metadata util (same pattern the target
+    # model-runner and set_inputs_first_pass use). Gemma4 MTP spans multiple KV
+    # cache groups (sliding vs full attention); without the per-group swap the
+    # full-attention layer reads the sliding group's block_table.
 
     def build_per_group_and_layer_attn_metadata(
         self,
         common_attn_metadata,
         draft_index: int = 0,
     ):
-        from copy import copy
-
-        per_group_attn_metadata: list[object] = []
-        per_layer_attn_metadata: dict[str, object] = {}
-        # Slice to the actual batch size to match the upstream Gemma4Proposer
-        # behavior: stored block tables may be padded (num_reqs_padded) from
-        # the target forward pass, while the drafter runs on the unpadded
-        # batch. Without this slice, padded rows leak into draft metadata.
-        batch_size = common_attn_metadata.batch_size()
-        for attn_group in self.draft_attn_groups:
-            gid = attn_group.kv_cache_group_id
-            if gid in self._per_group_block_tables:
-                cm = copy(common_attn_metadata)
-                cm.block_table_tensor = self._per_group_block_tables[gid][:batch_size]
-            else:
-                cm = common_attn_metadata
-            attn_metadata = attn_group.get_metadata_builder().build_for_drafting(
+        def _build(cm, attn_group):
+            return attn_group.get_metadata_builder().build_for_drafting(
                 common_attn_metadata=cm, draft_index=draft_index
             )
-            per_group_attn_metadata.append(attn_metadata)
-            for layer_name in attn_group.layer_names:
-                per_layer_attn_metadata[layer_name] = attn_metadata
+
+        # Slice to the actual batch size: stored block tables may be padded
+        # (num_reqs_padded) from the target forward pass, while the drafter
+        # runs on the unpadded batch.
+        batch_size = common_attn_metadata.batch_size()
+        per_layer_attn_metadata = build_per_group_layer_attn_metadata(
+            self.draft_attn_groups,
+            common_attn_metadata,
+            self._per_group_block_tables,
+            batch_size,
+            _build,
+        )
+        # Reconstruct the per-group list in draft_attn_groups order.
+        per_group_attn_metadata = [per_layer_attn_metadata[group.layer_names[0]] for group in self.draft_attn_groups]
         return per_group_attn_metadata, per_layer_attn_metadata
 
     # ---- set_per_group_block_table -------------------------------------------
