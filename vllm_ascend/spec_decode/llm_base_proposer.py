@@ -781,11 +781,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             if forward_context is not None:
                 forward_context.moe_layer_index = 0
 
-            # Gemma4 MTP: the draft reads the target's KV cache, so it must wait
-            # for the target's async KV write to finish. For non-Gemma4 models
-            # _sync_wait_target_events is a no-op; this gate skips the call.
-            if self._is_gemma4_mtp:
-                self._sync_wait_target_events()
             self._runnable(
                 num_input_tokens=num_tokens,
                 batch_size=batch_size,
@@ -809,27 +804,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL:
             self._update_full_graph_params(forward_context, num_input_tokens, multi_steps_attn_metadata)
 
-    @property
-    def _is_gemma4_mtp(self) -> bool:
-        """True only for Gemma4 MTP. Gates Gemma4-only hooks in the shared
-        base so other draft proposers hit no extra work on the hot path."""
-        return (
-            self.speculative_config is not None and getattr(self.speculative_config, "use_gemma4_mtp", lambda: False)()
-        )
-
-    def notify_target_forward_done(self) -> None:
-        """Record any state needed right after the target model's forward.
-
-        Called by the runner immediately after the target forward completes.
-        No-op in the shared base: only Gemma4 MTP reads the target model's
-        KV cache and thus needs to record an NPU event to synchronise with
-        the target's async (FDO-graph) KV writes.  AscendGemma4Proposer
-        overrides this with the real event-record; all other draft proposers
-        own their KV cache and fall through here.  Paired with
-        ``_sync_wait_target_events`` (the wait side, called inside the draft).
-        """
-        return
-
     def set_per_group_block_table(
         self,
         gid: int,
@@ -843,16 +817,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         group's block table to locate the correct shared cache at runtime.
         AscendGemma4Proposer overrides this; single-group proposers fall
         through here.
-        """
-        return
-
-    def _sync_wait_target_events(self) -> None:
-        """Wait for NPU events recorded after target forward completes.
-
-        No-op in the shared base: only Gemma4 MTP reads the target model's
-        KV cache and thus needs to wait on the target's async KV writes.
-        AscendGemma4Proposer overrides this with the real event-wait; all
-        other draft proposers own their KV cache and fall through here.
         """
         return
 
@@ -1226,9 +1190,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 "is_prefill": is_prefill_batch,
             }
             run_draft = partial(self._runnable, **model_inputs)
-            # Gemma4 MTP: same as above, wait for the target KV write to finish.
-            if self._is_gemma4_mtp:
-                self._sync_wait_target_events()
 
             # [STEP_DBG] total draft runnable wall-clock (eager forward or graph
             # replay). Outside the compiled fn so the timer is not stripped.

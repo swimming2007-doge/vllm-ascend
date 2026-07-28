@@ -19,7 +19,6 @@ from dataclasses import dataclass
 from enum import Enum
 
 import torch
-import torch.nn.functional as F
 import torch_npu
 import vllm.envs as envs_vllm
 from vllm.config import VllmConfig, get_current_vllm_config
@@ -720,9 +719,27 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     if isinstance(param, PagedAttentionGraphParam):
                         if _EXTRA_CTX.is_draft_model:
                             draft_step, key = draft_attn_key_steps[attn_count]
-                            block_table = attn_metadata[draft_step][key].block_tables
-                            seq_lens = attn_metadata[draft_step][key].seq_lens
+                            _draft_md = attn_metadata[draft_step][key]
+                            block_table = _draft_md.block_tables
+                            seq_lens = _draft_md.seq_lens
                             attn_count = attn_count + 1
+                            # MTP verify: the capture path (kv_sharing.
+                            # resolve_capture_kv) expands block_table/context_lens
+                            # to per-query for SpecDecoding, so the captured PA op
+                            # has a per-query query ([num_reqs*(K+1)]). Replay must
+                            # match -- feeding per-seq tensors here makes the PA
+                            # kernel address the wrong KV and collapses graph-mode
+                            # pos0 to ~77% (eager stays 98% via
+                            # maybe_expand_paged_kv_for_verify). Mirrors the
+                            # non-draft branch below.
+                            if (_draft_md.attn_state == AscendAttentionState.SpecDecoding
+                                    and speculative_config is not None):
+                                _q = param.params[0]
+                                _num_tokens = _q.shape[0] if _q is not None else 0
+                                _k = speculative_config.num_speculative_tokens
+                                if _num_tokens == seq_lens.shape[0] * (_k + 1):
+                                    block_table, seq_lens = expand_paged_kv_to_per_query(
+                                        block_table, seq_lens, _k)
                         else:
                             layer_name = param.layer_name
                             metadata_key = layer_name if layer_name is not None and layer_name in attn_metadata else key
@@ -1528,94 +1545,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 attn_metadata.reshape_cache_event.record()
         return query, key, value, output
 
-    def _forward_sdpa_decode(
-        self,
-        query: torch.Tensor,
-        attn_metadata: AscendMetadata,
-        output: torch.Tensor,
-    ) -> torch.Tensor:
-        num_tokens = query.shape[0]
-        num_heads = self.num_heads
-        num_kv_heads = self.num_kv_heads
-        head_size = self.head_size
-        scale = self.scale
-        block_size = self.key_cache.shape[1]
-
-        block_table = attn_metadata.block_tables  # [batch, max_blocks]
-        seq_lens = attn_metadata.seq_lens_list
-        batch_size = block_table.shape[0]
-
-        q_start = attn_metadata.query_start_loc
-        if q_start is not None and len(q_start) > 1:
-            cu_seq_q = q_start
-        else:
-            cu_seq_q = torch.tensor([0, num_tokens], dtype=torch.int32, device=query.device)
-
-        n_rep = num_heads // num_kv_heads
-        q_reshape = query[:num_tokens].view(num_tokens, num_heads, head_size)
-
-        attn_outputs = []
-        for b in range(batch_size):
-            b_start = int(cu_seq_q[b].item())
-            b_end = int(cu_seq_q[b + 1].item())
-            if b_end <= b_start:
-                continue
-            q_b = q_reshape[b_start:b_end]  # (n_q, num_heads, head_size)
-            sl = seq_lens[b]
-            if sl == 0:
-                continue
-
-            num_blocks = (sl + block_size - 1) // block_size
-            blk_ids = block_table[b, :num_blocks].long()
-
-            k_blocks = self.key_cache[blk_ids]  # (num_blocks, block_size, n_kv_heads, head_size)
-            v_blocks = self.value_cache[blk_ids]
-
-            k_b = k_blocks.reshape(-1, num_kv_heads, head_size)[:sl]
-            v_b = v_blocks.reshape(-1, num_kv_heads, head_size)[:sl]
-
-            if n_rep > 1:
-                k_b = k_b.unsqueeze(2).expand(-1, -1, n_rep, -1).reshape(sl, num_heads, head_size)
-                v_b = v_b.unsqueeze(2).expand(-1, -1, n_rep, -1).reshape(sl, num_heads, head_size)
-
-            q_bn = q_b.unsqueeze(0).permute(0, 2, 1, 3)    # (1, num_heads, n_q, head_size)
-            k_bn = k_b.unsqueeze(0).permute(0, 2, 1, 3)    # (1, num_heads, sl, head_size)
-            v_bn = v_b.unsqueeze(0).permute(0, 2, 1, 3)
-
-            out_bn = F.scaled_dot_product_attention(
-                q_bn, k_bn, v_bn,
-                scale=scale,
-                is_causal=False,
-            )  # (1, num_heads, n_q, head_size)
-            out_b = out_bn.permute(0, 2, 1, 3).reshape(q_b.shape[0], num_heads, head_size)
-            attn_outputs.append(out_b)
-
-            if b == 0 and not getattr(self, "_sdpa_dump_done", False):
-                import os
-                if os.environ.get("SDPA_DUMP", "") == "1":
-                    self._sdpa_dump_done = True
-                    dump_q = q_b.cpu().float().numpy()
-                    dump_k = k_b.cpu().float().numpy()
-                    dump_v = v_b.cpu().float().numpy()
-                    dump_o = out_b.cpu().float().numpy()
-                    import numpy
-                    numpy.savez("/tmp/sdpa_dump_layer3_ascend.npz",
-                               q=dump_q, k=dump_k, v=dump_v, out=dump_o,
-                               scale=scale, sl=sl)
-                    import sys
-                    print(f"[SDPA DUMP] saved to /tmp/sdpa_dump_layer3_ascend.npz | "
-                          f"q={dump_q.shape} mean={dump_q.mean():.6f} std={dump_q.std():.6f} | "
-                          f"k={dump_k.shape} mean={dump_k.mean():.6f} std={dump_k.std():.6f}",
-                          file=sys.stderr, flush=True)
-
-        if attn_outputs:
-            attn_output = torch.cat(attn_outputs, dim=0)
-        else:
-            attn_output = torch.zeros(num_tokens, num_heads, head_size,
-                                      dtype=query.dtype, device=query.device)
-        output[:num_tokens] = attn_output[:num_tokens]
-        return output
-
     def forward_impl(
         self,
         query: torch.Tensor,
@@ -1626,24 +1555,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
         output: torch.Tensor,
     ):
         num_tokens = query.shape[0]
-
-        if self.head_size == 512 and _EXTRA_CTX.is_draft_model:
-            if _EXTRA_CTX.capturing:
-                if not getattr(self, "_sdpa_capture_warned", False):
-                    self._sdpa_capture_warned = True
-                    import sys
-                    print("[SDPA] SKIPPED: capturing=True, use --enforce-eager",
-                          file=sys.stderr, flush=True)
-            elif self.key_cache is not None:
-                if not getattr(self, "_sdpa_hit_logged", False):
-                    self._sdpa_hit_logged = True
-                    import sys
-                    print("[SDPA] ACTIVE: head_dim=512 draft layer, "
-                          f"num_tokens={num_tokens}, "
-                          f"seq_lens={attn_metadata.seq_lens_list}",
-                          file=sys.stderr, flush=True)
-                output = self._forward_sdpa_decode(query, attn_metadata, output)
-                return output
 
         from vllm_ascend.utils import is_950
         _pa_gate = (
