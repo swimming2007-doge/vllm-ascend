@@ -34,6 +34,7 @@ def _triton_rope(
     cos_sin_row_stride,
     pos_ptr,
     num_tokens,
+    num_pos_rows,
     n_qh: tl.constexpr,
     n_kh: tl.constexpr,
     hd: tl.constexpr,
@@ -88,6 +89,12 @@ def _triton_rope(
         cos_mask = cos_offsets < (rope_dim // 2)
         if USE_COS_SIN:
             pos_idx = tl.load(pos_ptr + row_idx).to(tl.int64)
+            # Spec-decode placeholder/padded rows can carry out-of-range
+            # positions (e.g. -1 dummy slots). Clamp the row index into the
+            # cache: unguarded, the cos/sin row load is an MTE access at an
+            # OOB DDR address (EZ9999 0x800000) that kills the device stream.
+            # Outputs of clamped rows are discarded downstream.
+            pos_idx = tl.minimum(tl.maximum(pos_idx, 0), num_pos_rows - 1)
             cos_start_ptr = cos_sin_ptr + pos_idx * cos_sin_row_stride
             cos_row = tl.load(cos_start_ptr + cos_offsets, mask=cos_mask, other=0).to(tl.float32)
             sin_row = tl.load(cos_start_ptr + sin_offsets, mask=cos_mask, other=0).to(tl.float32)
@@ -189,6 +196,7 @@ def _triton_rope_siso(
     cos_sin_row_stride,
     pos_ptr,
     num_tokens,
+    num_pos_rows,
     n_h: tl.constexpr,
     hd: tl.constexpr,
     rope_dim: tl.constexpr,
@@ -213,6 +221,12 @@ def _triton_rope_siso(
         cos_mask = cos_offsets < (rope_dim // 2)
         if USE_COS_SIN:
             pos_idx = tl.load(pos_ptr + row_idx).to(tl.int64)
+            # Spec-decode placeholder/padded rows can carry out-of-range
+            # positions (e.g. -1 dummy slots). Clamp the row index into the
+            # cache: unguarded, the cos/sin row load is an MTE access at an
+            # OOB DDR address (EZ9999 0x800000) that kills the device stream.
+            # Outputs of clamped rows are discarded downstream.
+            pos_idx = tl.minimum(tl.maximum(pos_idx, 0), num_pos_rows - 1)
             cos_start_ptr = cos_sin_ptr + pos_idx * cos_sin_row_stride
             cos_row = tl.load(cos_start_ptr + cos_offsets, mask=cos_mask, other=0).to(tl.float32)
             sin_row = tl.load(cos_start_ptr + sin_offsets, mask=cos_mask, other=0).to(tl.float32)
@@ -300,6 +314,7 @@ def rope_forward_triton(
             cos_sin_cache.stride(0),
             positions,
             num_tokens,
+            cos_sin_cache.shape[0],
             n_q_head,
             n_kv_head,
             head_dim,
@@ -332,6 +347,7 @@ def rope_forward_triton(
             None,
             None,
             num_tokens,
+            0,
             n_q_head,
             n_kv_head,
             head_dim,
@@ -384,6 +400,7 @@ def rope_forward_triton_siso(
             cos_sin_cache.stride(0),
             positions,
             num_tokens,
+            cos_sin_cache.shape[0],
             n_head,
             head_dim,
             rope_dim,
@@ -412,6 +429,7 @@ def rope_forward_triton_siso(
             None,
             None,
             num_tokens,
+            0,
             n_head,
             head_dim,
             rope_dim,
