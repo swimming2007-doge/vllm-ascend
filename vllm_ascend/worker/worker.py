@@ -601,6 +601,15 @@ class NPUWorker(WorkerBase):
 
     def profile_memory(self) -> None:
         """Profiles the torch reserved memory, torch allocated memory in execute_model()."""
+        # The stats are only consumed by the debug log below, and
+        # torch.npu.memory_reserved()/memory_allocated() build the full
+        # allocator stats snapshot (Python-side recursion over the nested
+        # dict) on every call. Called unconditionally per execute_model this
+        # dominates step time on MTP workloads (observed: rank spends minutes
+        # per step in _recurse_add_to_result, engine effectively frozen,
+        # AICore 0%). Only pay it when the numbers will actually be logged.
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
         self.torch_reserved = torch.npu.memory_reserved()
         self.torch_allocated = torch.npu.memory_allocated()
         if logger.isEnabledFor(logging.DEBUG):
