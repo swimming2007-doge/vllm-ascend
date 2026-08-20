@@ -198,6 +198,18 @@ class AscendMetadata:
     # (batch_size, max_blocks_per_seq)
     block_tables: torch.Tensor = None
 
+    # MTP verify pre-expansion (per-query block_table / context_lens), computed
+    # on the DEFAULT stream at metadata-build time so the graph-param-update
+    # region never launches the expansion kernels (RepeatInterleaveV2 et al.
+    # are undefined behavior inside the ACL graph-task-update stream context).
+    # Only valid while block_tables/seq_lens still are the exact tensors the
+    # expansion was built from: consumers must compare the *_expanded_src
+    # fields by identity before use.
+    block_tables_expanded: torch.Tensor | None = None
+    block_tables_expanded_src: torch.Tensor | None = None
+    seq_lens_expanded: torch.Tensor | None = None
+    seq_lens_expanded_src: torch.Tensor | None = None
+
     # The indices of the token slots that input tokens will be stored into.
     # E.g., if `slot_mapping` is [35, 2, 17] and the block size is 16, the
     # three tokens are stored in the 3rd slot in block 2, 2nd slot in block 0,
@@ -354,8 +366,27 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
                 dim=0,
             )
 
+        # MTP verify: pre-expand block_table/seq_lens to per-query HERE, on the
+        # default stream during metadata build, so update_graph_params can pass
+        # ready-made tensors into the update region instead of launching
+        # RepeatInterleaveV2/arange inside `with torch.npu.stream(update_stream)`
+        # (compute kernels in the ACL graph-task-update context are undefined
+        # behavior on CANN 9.0.1: DDR OOB / rejected launch / silent no-op).
+        # The update-side gate re-derives num_tokens from the same
+        # seq_lens.shape[0], so the expanded shapes line up 1:1. Computed after
+        # the FIA padding above so the *_src identities match the stored fields.
+        block_tables_expanded = seq_lens_expanded = None
+        if (attn_state == AscendAttentionState.SpecDecoding
+                and self.speculative_config is not None):
+            block_tables_expanded, seq_lens_expanded = expand_paged_kv_to_per_query(
+                block_table, seq_lens, self.speculative_config.num_speculative_tokens)
+
         attn_metadata = AscendMetadata(
             num_actual_tokens=num_actual_tokens,
+            block_tables_expanded=block_tables_expanded,
+            block_tables_expanded_src=block_table if block_tables_expanded is not None else None,
+            seq_lens_expanded=seq_lens_expanded,
+            seq_lens_expanded_src=seq_lens if seq_lens_expanded is not None else None,
             num_decode_tokens=num_decode_tokens,
             block_tables=block_table,
             query_start_loc=query_start_loc,
@@ -738,8 +769,18 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                 _num_tokens = _q.shape[0] if _q is not None else 0
                                 _k = speculative_config.num_speculative_tokens
                                 if _num_tokens == seq_lens.shape[0] * (_k + 1):
-                                    block_table, seq_lens = expand_paged_kv_to_per_query(
-                                        block_table, seq_lens, _k)
+                                    # Prefer the build-time pre-expansion when
+                                    # its source tensors are still current;
+                                    # NEVER launch the expansion kernels inside
+                                    # this update-stream region (see build()).
+                                    if (_draft_md.block_tables_expanded is not None
+                                            and _draft_md.block_tables_expanded_src is block_table
+                                            and _draft_md.seq_lens_expanded_src is seq_lens):
+                                        block_table = _draft_md.block_tables_expanded
+                                        seq_lens = _draft_md.seq_lens_expanded
+                                    else:
+                                        block_table, seq_lens = expand_paged_kv_to_per_query(
+                                            block_table, seq_lens, _k)
                         else:
                             layer_name = param.layer_name
                             metadata_key = layer_name if layer_name is not None and layer_name in attn_metadata else key
@@ -753,8 +794,18 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                 _num_tokens = _q.shape[0] if _q is not None else 0
                                 _k = speculative_config.num_speculative_tokens
                                 if _num_tokens == seq_lens.shape[0] * (_k + 1):
-                                    block_table, seq_lens = expand_paged_kv_to_per_query(
-                                        block_table, seq_lens, _k)
+                                    # Prefer the build-time pre-expansion when
+                                    # its source tensors are still current;
+                                    # NEVER launch the expansion kernels inside
+                                    # this update-stream region (see build()).
+                                    if (attn_metadata[metadata_key].block_tables_expanded is not None
+                                            and attn_metadata[metadata_key].block_tables_expanded_src is block_table
+                                            and attn_metadata[metadata_key].seq_lens_expanded_src is seq_lens):
+                                        block_table = attn_metadata[metadata_key].block_tables_expanded
+                                        seq_lens = attn_metadata[metadata_key].seq_lens_expanded
+                                    else:
+                                        block_table, seq_lens = expand_paged_kv_to_per_query(
+                                            block_table, seq_lens, _k)
                         update_paged_attention_graph_param(
                             update_stream,
                             handle,

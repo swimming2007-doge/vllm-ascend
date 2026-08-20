@@ -57,6 +57,25 @@ def expand_paged_kv_to_per_query(
     base = seq_lens.to(torch.int32) - k
     offsets = torch.arange(k + 1, dtype=torch.int32, device=seq_lens.device)
     context_lens = (base.unsqueeze(1) + offsets.unsqueeze(0)).reshape(-1)
+    # NOTE (2026-08-19): two replacement strategies were tried and BOTH are
+    # broken in the ACL graph-task-update stream context where this runs:
+    # - expand+reshape -> aclnnInplaceCopy_BroadcastToAiCore: launch rejected
+    #   at batch transitions ("kernel type error" 507000, engine death).
+    # - arange//(k+1) + index_select: launches fine but silently does not
+    #   take effect -> draft reads wrong KV -> acceptance collapses to ~0.2%
+    #   (server-side mean acceptance length 1.0).
+    # repeat_interleave is the only variant with proven-correct drafts here;
+    # its known issue is the RepeatInterleaveV2 MTE DDR OOB under >=80-req
+    # batches at graph-bucket transitions (engine death, plog 2026-08-19
+    # 09:58:33 + 07-25 / 07-28 / 08-19 02:17 dumps). That crash is the open
+    # problem; do not "fix" it by swapping the op here again without
+    # verifying acceptance, not just survival.
+    # UPDATE (2026-08-20): resolved on the graph path by moving the WHERE, not
+    # the op: AscendAttentionMetadataBuilder.build() now pre-expands on the
+    # default stream (AscendMetadata.*_expanded), and update_graph_params only
+    # consumes those ready tensors (inline fallback below only when the stash
+    # is missing/stale). Do not move this call back into the
+    # `with torch.npu.stream(update_stream)` region. (fix(attention): precompute MTP verify per-query expansion at metadata build time)
     block_table = block_table.repeat_interleave(k + 1, dim=0)
     return block_table, context_lens
 
