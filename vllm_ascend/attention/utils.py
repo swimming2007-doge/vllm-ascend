@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from functools import lru_cache
+import os
 from typing import Any
 
 import torch
@@ -99,6 +100,9 @@ def expand_paged_kv_to_per_query(
 # ---------------------------------------------------------------------------
 _MTP_VERIFY_STATIC_BUFFERS: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 
+# Diagnostics for the static-buffer scheme (VLLM_ASCEND_STATIC_BUF_DEBUG=1).
+_STATIC_BUF_DEBUG = os.environ.get("VLLM_ASCEND_STATIC_BUF_DEBUG", "0") == "1"
+
 
 def get_mtp_static_expansion_buffers(
     num_rows: int,
@@ -160,10 +164,18 @@ def copy_expansion_into_static_buffers(
             context_lens_expanded.device,
         )
     bt_buf, cl_buf = bufs
+    if _STATIC_BUF_DEBUG:
+        print(
+            f"[staticbuf] copy rows={rows} width={width} buf={tuple(bt_buf.shape)}"
+            f" bt_dev={bt_buf.device} cl_dev={cl_buf.device} cl_src_dev={context_lens_expanded.device}",
+            flush=True,
+        )
     if width > bt_buf.shape[1]:
         # Step is wider than the first-touch allocation (e.g. a draft bucket
         # allocated this rows key with a narrow table) -- fail safe to the
         # legacy fresh-tensor stash rather than raising mid-step.
+        if _STATIC_BUF_DEBUG:
+            print(f"[staticbuf] WIDTH FAILSAFE rows={rows} step={width} buf={bt_buf.shape[1]}", flush=True)
         return block_table_expanded, context_lens_expanded
     # The step's width can be narrower than the captured width; columns
     # beyond context_lens are never dereferenced by the PA kernel (it reads

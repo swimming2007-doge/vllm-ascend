@@ -55,6 +55,7 @@ from vllm_ascend.attention import kv_sharing
 # task faulted on the first replay on every trial without its per-step
 # task-update relaunch (MPU-invalid, program 363, 2026-08-24).
 _STATIC_BUF_FASTPATH = os.environ.get("VLLM_ASCEND_STATIC_BUF_FASTPATH", "0") == "1"
+_STATIC_BUF_DEBUG = os.environ.get("VLLM_ASCEND_STATIC_BUF_DEBUG", "0") == "1"
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     PagedAttentionGraphParam,
@@ -795,6 +796,16 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                     if (_draft_md.block_tables_expanded is not None
                                             and _draft_md.block_tables_expanded_src is block_table
                                             and _draft_md.seq_lens_expanded_src is seq_lens):
+                                        if _STATIC_BUF_DEBUG:
+                                            print(
+                                                f"[staticbuf] draft-branch stash rows={seq_lens.shape[0]}"
+                                                f" stash_bt={tuple(_draft_md.block_tables_expanded.shape)}"
+                                                f" stash_bt_dev={_draft_md.block_tables_expanded.device}"
+                                                f" stash_cl_dev={_draft_md.seq_lens_expanded.device}"
+                                                f" cap_bt={tuple(param.params[6].shape) if param.params[6] is not None else None}"
+                                                f" identity={param.params[6] is _draft_md.block_tables_expanded}",
+                                                flush=True,
+                                            )
                                         if (_STATIC_BUF_FASTPATH
                                                 and param.params[6] is _draft_md.block_tables_expanded
                                                 and param.params[7] is _draft_md.seq_lens_expanded):
@@ -840,6 +851,17 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                     if (attn_metadata[metadata_key].block_tables_expanded is not None
                                             and attn_metadata[metadata_key].block_tables_expanded_src is block_table
                                             and attn_metadata[metadata_key].seq_lens_expanded_src is seq_lens):
+                                        if _STATIC_BUF_DEBUG:
+                                            _md0 = attn_metadata[metadata_key]
+                                            print(
+                                                f"[staticbuf] target-branch stash rows={seq_lens.shape[0]}"
+                                                f" stash_bt={tuple(_md0.block_tables_expanded.shape)}"
+                                                f" stash_bt_dev={_md0.block_tables_expanded.device}"
+                                                f" stash_cl_dev={_md0.seq_lens_expanded.device}"
+                                                f" cap_bt={tuple(param.params[6].shape) if param.params[6] is not None else None}"
+                                                f" identity={param.params[6] is _md0.block_tables_expanded}",
+                                                flush=True,
+                                            )
                                         if (_STATIC_BUF_FASTPATH
                                                 and param.params[6] is attn_metadata[metadata_key].block_tables_expanded
                                                 and param.params[7] is attn_metadata[metadata_key].seq_lens_expanded):

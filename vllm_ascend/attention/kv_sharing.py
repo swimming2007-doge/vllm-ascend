@@ -37,6 +37,7 @@ draft-forward-misfire lesson documented across this PR).
 """
 
 from dataclasses import dataclass
+import os
 from typing import Any
 
 from vllm_ascend.attention.utils import expand_paged_kv_to_per_query, get_mtp_static_expansion_buffers
@@ -205,10 +206,21 @@ def resolve_capture_kv(impl, attn_metadata, num_tokens):
             # for the block-table buffer allocated it on the HOST and bound
             # uninitialized CPU memory into the captured task -- first replay
             # faulted with MPU-address-invalid in the PA kernel (2026-08-24).
+            _src_bt_shape = tuple(block_table.shape)
+            _src_cl_dev = context_lens.device
             block_table, context_lens = get_mtp_static_expansion_buffers(
                 context_lens.shape[0], block_table.device,
                 block_table.shape[1], block_table.dtype,
                 context_lens.device)
+            if os.environ.get("VLLM_ASCEND_STATIC_BUF_DEBUG", "0") == "1":
+                print(
+                    f"[staticbuf] capture bind rows={context_lens.shape[0]}"
+                    f" src_bt={_src_bt_shape} buf_bt={tuple(block_table.shape)}"
+                    f" bt_dev={block_table.device} cl_dev={context_lens.device}"
+                    f" src_cl_dev={_src_cl_dev}"
+                    f" draft={getattr(_EXTRA_CTX, 'is_draft_model', False)}",
+                    flush=True,
+                )
     return key_cache, value_cache, block_table, context_lens
 
 
