@@ -210,6 +210,17 @@ class AscendMetadata:
     seq_lens_expanded: torch.Tensor | None = None
     seq_lens_expanded_src: torch.Tensor | None = None
 
+    # Recorded on the DEFAULT stream right after the *_expanded kernels are
+    # enqueued at build time. update_graph_params must wait_event(this) on the
+    # update stream before rebinding PA to the expanded tensors: the
+    # task-update relaunch consumes them on the update stream and nothing
+    # else orders the two streams. Without the wait the relaunch can read the
+    # buffer one step stale (caching allocator reuses the address) -> verify
+    # attention runs with a block_table missing the newest blocks -> pos1/pos2
+    # acceptance collapse on an unlucky engine (per-boot lottery; diagnosed
+    # 2026-08-24 on DP2/TP4, engine1 ~94/83/72 vs healthy ~96/93/88).
+    expanded_ready_event: torch.npu.Event = None
+
     # The indices of the token slots that input tokens will be stored into.
     # E.g., if `slot_mapping` is [35, 2, 17] and the block size is 16, the
     # three tokens are stored in the 3rd slot in block 2, 2nd slot in block 0,
@@ -376,10 +387,19 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         # seq_lens.shape[0], so the expanded shapes line up 1:1. Computed after
         # the FIA padding above so the *_src identities match the stored fields.
         block_tables_expanded = seq_lens_expanded = None
+        expanded_ready_event = None
         if (attn_state == AscendAttentionState.SpecDecoding
                 and self.speculative_config is not None):
             block_tables_expanded, seq_lens_expanded = expand_paged_kv_to_per_query(
                 block_table, seq_lens, self.speculative_config.num_speculative_tokens)
+            # Doorbell for the cross-stream handoff: the expansion kernels
+            # above were just enqueued on the CURRENT (default) stream, but
+            # the stash is consumed on the UPDATE stream by the PA relaunch
+            # inside graph_task_update_begin/end. Record here (enqueue-only,
+            # never a host sync) so the update side can wait_event before
+            # reading the stash -- see update_graph_params.
+            expanded_ready_event = torch.npu.Event()
+            expanded_ready_event.record()
 
         attn_metadata = AscendMetadata(
             num_actual_tokens=num_actual_tokens,
@@ -387,6 +407,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             block_tables_expanded_src=block_table if block_tables_expanded is not None else None,
             seq_lens_expanded=seq_lens_expanded,
             seq_lens_expanded_src=seq_lens if seq_lens_expanded is not None else None,
+            expanded_ready_event=expanded_ready_event,
             num_decode_tokens=num_decode_tokens,
             block_tables=block_table,
             query_start_loc=query_start_loc,
@@ -776,6 +797,17 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                     if (_draft_md.block_tables_expanded is not None
                                             and _draft_md.block_tables_expanded_src is block_table
                                             and _draft_md.seq_lens_expanded_src is seq_lens):
+                                        # The stash was written by kernels on the
+                                        # DEFAULT stream; order that write before
+                                        # this update-stream read, OUTSIDE the
+                                        # task-update region. Single direction
+                                        # (update waits default), host never
+                                        # blocks, default stream gains no new
+                                        # waits -- the historical first-verify-
+                                        # step deadlock synced the opposite
+                                        # direction, not this one.
+                                        if _draft_md.expanded_ready_event is not None:
+                                            update_stream.wait_event(_draft_md.expanded_ready_event)
                                         block_table = _draft_md.block_tables_expanded
                                         seq_lens = _draft_md.seq_lens_expanded
                                     else:
@@ -801,6 +833,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                     if (attn_metadata[metadata_key].block_tables_expanded is not None
                                             and attn_metadata[metadata_key].block_tables_expanded_src is block_table
                                             and attn_metadata[metadata_key].seq_lens_expanded_src is seq_lens):
+                                        # Same cross-stream doorbell as the draft
+                                        # branch above: default-stream write must
+                                        # complete before the update-stream PA
+                                        # relaunch reads the stash.
+                                        if attn_metadata[metadata_key].expanded_ready_event is not None:
+                                            update_stream.wait_event(
+                                                attn_metadata[metadata_key].expanded_ready_event)
                                         block_table = attn_metadata[metadata_key].block_tables_expanded
                                         seq_lens = attn_metadata[metadata_key].seq_lens_expanded
                                     else:
