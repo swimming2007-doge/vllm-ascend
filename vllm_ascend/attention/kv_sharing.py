@@ -199,9 +199,16 @@ def resolve_capture_kv(impl, attn_metadata, num_tokens):
             # the capture (107030, 2026-08-24). At capture time only the
             # ADDRESS binding matters -- contents are dummy, exactly like the
             # legacy fresh-expansion tensors they replace.
+            # Devices follow the SOURCE tensors: block_table buffer on NPU,
+            # context_lens buffer stays CPU (metadata seq_lens is the
+            # _seq_lens_cpu host tensor here). Passing context_lens.device
+            # for the block-table buffer allocated it on the HOST and bound
+            # uninitialized CPU memory into the captured task -- first replay
+            # faulted with MPU-address-invalid in the PA kernel (2026-08-24).
             block_table, context_lens = get_mtp_static_expansion_buffers(
-                context_lens.shape[0], context_lens.device,
-                block_table.shape[1], block_table.dtype)
+                context_lens.shape[0], block_table.device,
+                block_table.shape[1], block_table.dtype,
+                context_lens.device)
     return key_cache, value_cache, block_table, context_lens
 
 

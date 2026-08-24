@@ -101,22 +101,41 @@ _MTP_VERIFY_STATIC_BUFFERS: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 
 
 def get_mtp_static_expansion_buffers(
-    num_rows: int, device: torch.device, width: int, dtype: torch.dtype = torch.int32
+    num_rows: int,
+    bt_device: torch.device,
+    width: int,
+    dtype: torch.dtype = torch.int32,
+    cl_device: torch.device | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return (block_table, context_lens) persistent buffers for `num_rows`
     per-query rows, allocated once with the FIRST-TOUCH width (capture time
     passes the full-width persistent block table, so that is the buffer
-    width). The SAME tensors are bound at capture time
-    (kv_sharing.resolve_capture_kv) and refreshed each step
-    (copy_expansion_into_static_buffers from metadata build). Allocation-
-    only: safe to call inside the graph capture region (the legacy path
-    allocated its fresh expansion tensors at the same spot), but the COPY
-    must stay outside it (synchronized aclrtMemcpy aborts a capture)."""
+    width). Each buffer follows its SOURCE tensor's device: the block table
+    lives on NPU (the expansion output the PA op has always consumed), while
+    context_lens is a CPU tensor at capture (metadata build uses
+    _seq_lens_cpu) and must stay CPU -- the eager PA setup only accepts a
+    host context_lens. Allocating the block-table buffer on the CPU instead
+    (context_lens.device -- the 2026-08-24 bug) bound uninitialized HOST
+    memory into the captured task: first replay read garbage block ids and
+    faulted with MPU-address-invalid in the PA kernel on every boot. The
+    SAME tensors are bound at capture (kv_sharing.resolve_capture_kv) and
+    refreshed each step (copy_expansion_into_static_buffers from metadata
+    build). Allocation-only: safe to call inside the graph capture region
+    (the legacy path allocated its fresh expansion tensors at the same
+    spot), but the COPY must stay outside it (synchronized aclrtMemcpy
+    aborts a capture)."""
+    if cl_device is None:
+        cl_device = bt_device
     bufs = _MTP_VERIFY_STATIC_BUFFERS.get(num_rows)
     if bufs is None:
         bufs = (
-            torch.empty((num_rows, width), dtype=dtype, device=device),
-            torch.empty((num_rows,), dtype=torch.int32, device=device),
+            torch.empty((num_rows, width), dtype=dtype, device=bt_device),
+            # ones, not empty: if the ATB PA launch BAKES host-tensor contents
+            # into its captured descriptor, garbage lens (e.g. ~2e9) fault the
+            # kernel with an out-of-pool read on the first replay, while len=1
+            # merely collapses acceptance -- a diagnosable signal, not a
+            # device crash.
+            torch.ones((num_rows,), dtype=torch.int32, device=cl_device),
         )
         _MTP_VERIFY_STATIC_BUFFERS[num_rows] = bufs
     return bufs
@@ -134,7 +153,11 @@ def copy_expansion_into_static_buffers(
     bufs = _MTP_VERIFY_STATIC_BUFFERS.get(rows)
     if bufs is None:
         bufs = get_mtp_static_expansion_buffers(
-            rows, context_lens_expanded.device, width, block_table_expanded.dtype
+            rows,
+            block_table_expanded.device,
+            width,
+            block_table_expanded.dtype,
+            context_lens_expanded.device,
         )
     bt_buf, cl_buf = bufs
     if width > bt_buf.shape[1]:
