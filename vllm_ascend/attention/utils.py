@@ -98,31 +98,19 @@ def expand_paged_kv_to_per_query(
 # strictly FEWER ops in the fragile task-update region.
 # ---------------------------------------------------------------------------
 _MTP_VERIFY_STATIC_BUFFERS: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-_MTP_VERIFY_STATIC_BUFFERS_MAX_WIDTH: int | None = None
-
-
-def _mtp_static_buffer_max_width() -> int:
-    # Full max_model_len width so every bucket/draft binding can share the
-    # same rows-keyed buffer regardless of its capture-time dummy width.
-    global _MTP_VERIFY_STATIC_BUFFERS_MAX_WIDTH
-    if _MTP_VERIFY_STATIC_BUFFERS_MAX_WIDTH is None:
-        vllm_config = get_current_vllm_config()
-        _MTP_VERIFY_STATIC_BUFFERS_MAX_WIDTH = (
-            vllm_config.model_config.max_model_len // vllm_config.cache_config.block_size
-        )
-    return _MTP_VERIFY_STATIC_BUFFERS_MAX_WIDTH
 
 
 def get_mtp_static_expansion_buffers(
-    num_rows: int, device: torch.device
+    num_rows: int, device: torch.device, width: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return (block_table, context_lens) persistent buffers for `num_rows`
-    per-query rows, allocated once at full width. The SAME tensors are bound
-    at capture time (kv_sharing.resolve_capture_kv) and refreshed each step
+    per-query rows, allocated once with the FIRST-TOUCH width (capture time
+    passes the full-width persistent block table, so that is the buffer
+    width). The SAME tensors are bound at capture time
+    (kv_sharing.resolve_capture_kv) and refreshed each step
     (copy_expansion_into_static_buffers from metadata build)."""
     bufs = _MTP_VERIFY_STATIC_BUFFERS.get(num_rows)
     if bufs is None:
-        width = _mtp_static_buffer_max_width()
         bufs = (
             torch.empty((num_rows, width), dtype=torch.int32, device=device),
             torch.empty((num_rows,), dtype=torch.int32, device=device),
@@ -139,16 +127,17 @@ def copy_expansion_into_static_buffers(
     buffers and return the buffers. Runs on the DEFAULT stream (enqueue-only
     device copy); the replayed PA consumes the same buffers on the same
     stream, so ordering is guaranteed with no cross-stream event."""
-    bt_buf, cl_buf = get_mtp_static_expansion_buffers(
-        context_lens_expanded.shape[0], context_lens_expanded.device
-    )
     rows, width = block_table_expanded.shape
-    if rows > bt_buf.shape[0] or width > bt_buf.shape[1]:
-        # Cannot happen by construction (rows are the key, width is the
-        # config max) -- fail safe to the legacy fresh-tensor stash rather
-        # than raising mid-step.
+    bufs = _MTP_VERIFY_STATIC_BUFFERS.get(rows)
+    if bufs is None:
+        bufs = get_mtp_static_expansion_buffers(rows, context_lens_expanded.device, width)
+    bt_buf, cl_buf = bufs
+    if width > bt_buf.shape[1]:
+        # Step is wider than the first-touch allocation (e.g. a draft bucket
+        # allocated this rows key with a narrow table) -- fail safe to the
+        # legacy fresh-tensor stash rather than raising mid-step.
         return block_table_expanded, context_lens_expanded
-    # The step's width can be narrower than the full captured width; columns
+    # The step's width can be narrower than the captured width; columns
     # beyond context_lens are never dereferenced by the PA kernel (it reads
     # only ceil(context_len/block_size) block ids per row).
     bt_buf[:rows, :width].copy_(block_table_expanded)
