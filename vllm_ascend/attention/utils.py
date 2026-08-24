@@ -101,18 +101,21 @@ _MTP_VERIFY_STATIC_BUFFERS: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 
 
 def get_mtp_static_expansion_buffers(
-    num_rows: int, device: torch.device, width: int
+    num_rows: int, device: torch.device, width: int, dtype: torch.dtype = torch.int32
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return (block_table, context_lens) persistent buffers for `num_rows`
     per-query rows, allocated once with the FIRST-TOUCH width (capture time
     passes the full-width persistent block table, so that is the buffer
     width). The SAME tensors are bound at capture time
     (kv_sharing.resolve_capture_kv) and refreshed each step
-    (copy_expansion_into_static_buffers from metadata build)."""
+    (copy_expansion_into_static_buffers from metadata build). Allocation-
+    only: safe to call inside the graph capture region (the legacy path
+    allocated its fresh expansion tensors at the same spot), but the COPY
+    must stay outside it (synchronized aclrtMemcpy aborts a capture)."""
     bufs = _MTP_VERIFY_STATIC_BUFFERS.get(num_rows)
     if bufs is None:
         bufs = (
-            torch.empty((num_rows, width), dtype=torch.int32, device=device),
+            torch.empty((num_rows, width), dtype=dtype, device=device),
             torch.empty((num_rows,), dtype=torch.int32, device=device),
         )
         _MTP_VERIFY_STATIC_BUFFERS[num_rows] = bufs
@@ -130,7 +133,9 @@ def copy_expansion_into_static_buffers(
     rows, width = block_table_expanded.shape
     bufs = _MTP_VERIFY_STATIC_BUFFERS.get(rows)
     if bufs is None:
-        bufs = get_mtp_static_expansion_buffers(rows, context_lens_expanded.device, width)
+        bufs = get_mtp_static_expansion_buffers(
+            rows, context_lens_expanded.device, width, block_table_expanded.dtype
+        )
     bt_buf, cl_buf = bufs
     if width > bt_buf.shape[1]:
         # Step is wider than the first-touch allocation (e.g. a draft bucket

@@ -39,7 +39,7 @@ draft-forward-misfire lesson documented across this PR).
 from dataclasses import dataclass
 from typing import Any
 
-from vllm_ascend.attention.utils import copy_expansion_into_static_buffers, expand_paged_kv_to_per_query
+from vllm_ascend.attention.utils import expand_paged_kv_to_per_query, get_mtp_static_expansion_buffers
 
 
 # ---------------------------------------------------------------------------
@@ -194,7 +194,14 @@ def resolve_capture_kv(impl, attn_metadata, num_tokens):
             # params[6]/[7] identity check. This keeps block_table/context_lens
             # data off the update stream entirely (cross-stream race + the
             # fragile task-update sequence both avoided).
-            block_table, context_lens = copy_expansion_into_static_buffers(block_table, context_lens)
+            # DO NOT copy here: this runs INSIDE the ACL graph capture region,
+            # where copy_ can route to a synchronized aclrtMemcpy and abort
+            # the capture (107030, 2026-08-24). At capture time only the
+            # ADDRESS binding matters -- contents are dummy, exactly like the
+            # legacy fresh-expansion tensors they replace.
+            block_table, context_lens = get_mtp_static_expansion_buffers(
+                context_lens.shape[0], context_lens.device,
+                block_table.shape[1], block_table.dtype)
     return key_cache, value_cache, block_table, context_lens
 
 
