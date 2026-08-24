@@ -80,6 +80,82 @@ def expand_paged_kv_to_per_query(
     return block_table, context_lens
 
 
+# ---------------------------------------------------------------------------
+# Persistent per-query expansion buffers (static-buffer scheme, 2026-08-24)
+#
+# The expansion stash tensors are FRESH allocations each step; the graph-param
+# update region rebinds the PA op to them on the UPDATE stream while their
+# contents are written on the DEFAULT stream -- an unordered cross-stream data
+# race (stale block_table missing the newest blocks -> pos1/pos2 acceptance
+# lottery). Fix attempt #3 (update_stream.wait_event before the relaunch)
+# poisoned the task-update sequence and collapsed an engine to persistent 0%
+# acceptance, so NO new op may join that sequence. Instead: bind the PA op
+# ONCE at capture to the persistent per-bucket buffers below, refresh their
+# CONTENTS on the DEFAULT stream in build(), and skip the update-region
+# relaunch entirely when the stash is the captured binding (identity check in
+# update_graph_params). Data then only flows default-stream (copy) ->
+# default-stream (replay): hardware-serialized, no cross-stream handoff, and
+# strictly FEWER ops in the fragile task-update region.
+# ---------------------------------------------------------------------------
+_MTP_VERIFY_STATIC_BUFFERS: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+_MTP_VERIFY_STATIC_BUFFERS_MAX_WIDTH: int | None = None
+
+
+def _mtp_static_buffer_max_width() -> int:
+    # Full max_model_len width so every bucket/draft binding can share the
+    # same rows-keyed buffer regardless of its capture-time dummy width.
+    global _MTP_VERIFY_STATIC_BUFFERS_MAX_WIDTH
+    if _MTP_VERIFY_STATIC_BUFFERS_MAX_WIDTH is None:
+        vllm_config = get_current_vllm_config()
+        _MTP_VERIFY_STATIC_BUFFERS_MAX_WIDTH = (
+            vllm_config.model_config.max_model_len // vllm_config.cache_config.block_size
+        )
+    return _MTP_VERIFY_STATIC_BUFFERS_MAX_WIDTH
+
+
+def get_mtp_static_expansion_buffers(
+    num_rows: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return (block_table, context_lens) persistent buffers for `num_rows`
+    per-query rows, allocated once at full width. The SAME tensors are bound
+    at capture time (kv_sharing.resolve_capture_kv) and refreshed each step
+    (copy_expansion_into_static_buffers from metadata build)."""
+    bufs = _MTP_VERIFY_STATIC_BUFFERS.get(num_rows)
+    if bufs is None:
+        width = _mtp_static_buffer_max_width()
+        bufs = (
+            torch.empty((num_rows, width), dtype=torch.int32, device=device),
+            torch.empty((num_rows,), dtype=torch.int32, device=device),
+        )
+        _MTP_VERIFY_STATIC_BUFFERS[num_rows] = bufs
+    return bufs
+
+
+def copy_expansion_into_static_buffers(
+    block_table_expanded: torch.Tensor,
+    context_lens_expanded: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Copy fresh per-query expansion results into the persistent per-bucket
+    buffers and return the buffers. Runs on the DEFAULT stream (enqueue-only
+    device copy); the replayed PA consumes the same buffers on the same
+    stream, so ordering is guaranteed with no cross-stream event."""
+    bt_buf, cl_buf = get_mtp_static_expansion_buffers(
+        context_lens_expanded.shape[0], context_lens_expanded.device
+    )
+    rows, width = block_table_expanded.shape
+    if rows > bt_buf.shape[0] or width > bt_buf.shape[1]:
+        # Cannot happen by construction (rows are the key, width is the
+        # config max) -- fail safe to the legacy fresh-tensor stash rather
+        # than raising mid-step.
+        return block_table_expanded, context_lens_expanded
+    # The step's width can be narrower than the full captured width; columns
+    # beyond context_lens are never dereferenced by the PA kernel (it reads
+    # only ceil(context_len/block_size) block ids per row).
+    bt_buf[:rows, :width].copy_(block_table_expanded)
+    cl_buf.copy_(context_lens_expanded)
+    return bt_buf, cl_buf
+
+
 def update_paged_attention_graph_param(
     update_stream,
     handle,

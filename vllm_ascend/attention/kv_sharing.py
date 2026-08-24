@@ -39,7 +39,7 @@ draft-forward-misfire lesson documented across this PR).
 from dataclasses import dataclass
 from typing import Any
 
-from vllm_ascend.attention.utils import expand_paged_kv_to_per_query
+from vllm_ascend.attention.utils import copy_expansion_into_static_buffers, expand_paged_kv_to_per_query
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +187,14 @@ def resolve_capture_kv(impl, attn_metadata, num_tokens):
             block_table, context_lens = expand_paged_kv_to_per_query(
                 block_table, context_lens, spec_cfg.num_speculative_tokens
             )
+            # Bind the PERSISTENT static buffers instead of the fresh expansion
+            # outputs: replay refreshes their contents on the DEFAULT stream
+            # (build() -> copy_expansion_into_static_buffers) and
+            # update_graph_params then SKIPS the update-region relaunch via the
+            # params[6]/[7] identity check. This keeps block_table/context_lens
+            # data off the update stream entirely (cross-stream race + the
+            # fragile task-update sequence both avoided).
+            block_table, context_lens = copy_expansion_into_static_buffers(block_table, context_lens)
     return key_cache, value_cache, block_table, context_lens
 
 

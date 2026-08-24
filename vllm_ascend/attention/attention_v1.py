@@ -52,6 +52,7 @@ from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     PagedAttentionGraphParam,
     cache_graph_workspace,
+    copy_expansion_into_static_buffers,
     enable_cp,
     maybe_route_512_capture,
     needs_layer_aware_fia_graph_replay,
@@ -380,6 +381,16 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
                 and self.speculative_config is not None):
             block_tables_expanded, seq_lens_expanded = expand_paged_kv_to_per_query(
                 block_table, seq_lens, self.speculative_config.num_speculative_tokens)
+            # Static-buffer scheme: stash the PERSISTENT buffers (contents
+            # refreshed HERE on the default stream) instead of the fresh
+            # expansion outputs. When these are the tensors the PA op was
+            # captured with (kv_sharing.resolve_capture_kv binds the same
+            # registry), update_graph_params skips the update-region relaunch
+            # entirely -- no cross-stream data handoff, and no new op joins
+            # the task-update sequence (the wait_event attempt collapsed an
+            # engine to persistent 0% acceptance).
+            block_tables_expanded, seq_lens_expanded = copy_expansion_into_static_buffers(
+                block_tables_expanded, seq_lens_expanded)
 
         attn_metadata = AscendMetadata(
             num_actual_tokens=num_actual_tokens,
@@ -776,6 +787,17 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                     if (_draft_md.block_tables_expanded is not None
                                             and _draft_md.block_tables_expanded_src is block_table
                                             and _draft_md.seq_lens_expanded_src is seq_lens):
+                                        if (param.params[6] is _draft_md.block_tables_expanded
+                                                and param.params[7] is _draft_md.seq_lens_expanded):
+                                            # Static-buffer fast path: the stash IS the
+                                            # captured binding (persistent buffers; contents
+                                            # refreshed on the DEFAULT stream in build(), which
+                                            # the replay is stream-ordered after). Nothing to
+                                            # rebind -- skip the relaunch, keep only the event
+                                            # record so the captured graph's ExternalEvent wait
+                                            # stays satisfied. Never add other ops here.
+                                            event.record(update_stream)
+                                            continue
                                         block_table = _draft_md.block_tables_expanded
                                         seq_lens = _draft_md.seq_lens_expanded
                                     else:
@@ -801,6 +823,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                     if (attn_metadata[metadata_key].block_tables_expanded is not None
                                             and attn_metadata[metadata_key].block_tables_expanded_src is block_table
                                             and attn_metadata[metadata_key].seq_lens_expanded_src is seq_lens):
+                                        if (param.params[6] is attn_metadata[metadata_key].block_tables_expanded
+                                                and param.params[7] is attn_metadata[metadata_key].seq_lens_expanded):
+                                            # Same static-buffer fast path as the draft branch:
+                                            # captured binding == stash, contents refreshed on
+                                            # the default stream; skip the relaunch, keep the
+                                            # event record only.
+                                            event.record(update_stream)
+                                            continue
                                         block_table = attn_metadata[metadata_key].block_tables_expanded
                                         seq_lens = attn_metadata[metadata_key].seq_lens_expanded
                                     else:
