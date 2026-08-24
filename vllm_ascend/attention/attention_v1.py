@@ -57,6 +57,7 @@ from vllm_ascend.attention.utils import (
     maybe_route_512_capture,
     needs_layer_aware_fia_graph_replay,
     notify_kv_cache_written,
+    pin_pa_workspace,
     split_decodes_and_prefills,
     update_paged_attention_graph_param,
     using_paged_attention,
@@ -1273,7 +1274,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     context_lens=context_lens,
                     out=output,
                 )
-                update_graph_params_workspaces(num_tokens, workspace)
+                # Pin for the process lifetime: acl_graph.weak_ref_workspaces
+                # drops this dict's strong ref right after capture, and the
+                # static-buffer fast path (update_graph_params identity skip)
+                # never re-derives a fresh workspace to patch in its place.
+                update_graph_params_workspaces(num_tokens, pin_pa_workspace(workspace))
 
             # Handle graph capturing mode
             stream = torch_npu.npu.current_stream()

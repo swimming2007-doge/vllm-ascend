@@ -150,6 +150,29 @@ def copy_expansion_into_static_buffers(
     return bt_buf, cl_buf
 
 
+# The capture path caches ONE PA workspace tensor per (graph, num_tokens)
+# bucket, and acl_graph.weak_ref_workspaces drops that strong reference
+# right after capture ("to save memory"). The legacy replay path is sound
+# under this because update_paged_attention_graph_param re-derives a fresh
+# workspace EVERY step and the task-update relaunch patches the captured
+# task's workspace pointer to it. The static-buffer fast path in
+# AscendAttentionBackendImpl.update_graph_params skips that relaunch, so
+# the captured task keeps its capture-time pointer -- which must therefore
+# stay allocated for the process lifetime. Pinning costs exactly the
+# tensors the legacy path re-allocates each step anyway (the caching
+# allocator recycles the same block), so this is no net memory increase;
+# the first static-buffer boot crashed on the very first replay otherwise
+# (MPU address invalid in paged_attention kernel, freed workspace read,
+# 2026-08-24).
+_PINNED_PA_WORKSPACES: list[torch.Tensor] = []
+
+
+def pin_pa_workspace(workspace: torch.Tensor) -> torch.Tensor:
+    """Hold a strong ref to a captured PA workspace for the process lifetime."""
+    _PINNED_PA_WORKSPACES.append(workspace)
+    return workspace
+
+
 def update_paged_attention_graph_param(
     update_stream,
     handle,
