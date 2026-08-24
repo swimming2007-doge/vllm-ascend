@@ -17,7 +17,6 @@
 
 from dataclasses import dataclass
 from enum import Enum
-import os
 
 import torch
 import torch_npu
@@ -49,23 +48,14 @@ from vllm_ascend.attention.kvcomp_attn.attention_utils import (
     reshape_and_cache_kvcomp,
 )
 from vllm_ascend.attention import kv_sharing
-
-# Kill switch for the static-buffer update-skip fast path (see the notes at
-# the two guarded branches in update_graph_params). Default OFF: the ATB PA
-# task faulted on the first replay on every trial without its per-step
-# task-update relaunch (MPU-invalid, program 363, 2026-08-24).
-_STATIC_BUF_FASTPATH = os.environ.get("VLLM_ASCEND_STATIC_BUF_FASTPATH", "0") == "1"
-_STATIC_BUF_DEBUG = os.environ.get("VLLM_ASCEND_STATIC_BUF_DEBUG", "0") == "1"
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     PagedAttentionGraphParam,
     cache_graph_workspace,
-    copy_expansion_into_static_buffers,
     enable_cp,
     maybe_route_512_capture,
     needs_layer_aware_fia_graph_replay,
     notify_kv_cache_written,
-    pin_pa_workspace,
     split_decodes_and_prefills,
     update_paged_attention_graph_param,
     using_paged_attention,
@@ -390,16 +380,6 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
                 and self.speculative_config is not None):
             block_tables_expanded, seq_lens_expanded = expand_paged_kv_to_per_query(
                 block_table, seq_lens, self.speculative_config.num_speculative_tokens)
-            # Static-buffer scheme: stash the PERSISTENT buffers (contents
-            # refreshed HERE on the default stream) instead of the fresh
-            # expansion outputs. When these are the tensors the PA op was
-            # captured with (kv_sharing.resolve_capture_kv binds the same
-            # registry), update_graph_params skips the update-region relaunch
-            # entirely -- no cross-stream data handoff, and no new op joins
-            # the task-update sequence (the wait_event attempt collapsed an
-            # engine to persistent 0% acceptance).
-            block_tables_expanded, seq_lens_expanded = copy_expansion_into_static_buffers(
-                block_tables_expanded, seq_lens_expanded)
 
         attn_metadata = AscendMetadata(
             num_actual_tokens=num_actual_tokens,
@@ -796,36 +776,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                     if (_draft_md.block_tables_expanded is not None
                                             and _draft_md.block_tables_expanded_src is block_table
                                             and _draft_md.seq_lens_expanded_src is seq_lens):
-                                        if _STATIC_BUF_DEBUG:
-                                            print(
-                                                f"[staticbuf] draft-branch stash rows={seq_lens.shape[0]}"
-                                                f" stash_bt={tuple(_draft_md.block_tables_expanded.shape)}"
-                                                f" stash_bt_dev={_draft_md.block_tables_expanded.device}"
-                                                f" stash_cl_dev={_draft_md.seq_lens_expanded.device}"
-                                                f" cap_bt={tuple(param.params[6].shape) if param.params[6] is not None else None}"
-                                                f" identity={param.params[6] is _draft_md.block_tables_expanded}",
-                                                flush=True,
-                                            )
-                                        if (_STATIC_BUF_FASTPATH
-                                                and param.params[6] is _draft_md.block_tables_expanded
-                                                and param.params[7] is _draft_md.seq_lens_expanded):
-                                            # Static-buffer fast path: the stash IS the
-                                            # captured binding (persistent buffers; contents
-                                            # refreshed on the DEFAULT stream in build(), which
-                                            # the replay is stream-ordered after). Nothing to
-                                            # rebind -- skip the relaunch, keep only the event
-                                            # record so the captured graph's ExternalEvent wait
-                                            # stays satisfied. Never add other ops here.
-                                            # NOTE: falsified 2026-08-24 -- even with NPU
-                                            # block_table / CPU context_lens buffers and a
-                                            # pinned workspace, every boot faulted on the
-                                            # FIRST replay (MPU-invalid, PA kernel). The ATB
-                                            # PA task appears to REQUIRE its per-step
-                                            # task-update relaunch; this branch is kept only
-                                            # behind VLLM_ASCEND_STATIC_BUF_FASTPATH=1 for
-                                            # future CANN-side retesting.
-                                            event.record(update_stream)
-                                            continue
                                         block_table = _draft_md.block_tables_expanded
                                         seq_lens = _draft_md.seq_lens_expanded
                                     else:
@@ -851,25 +801,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                     if (attn_metadata[metadata_key].block_tables_expanded is not None
                                             and attn_metadata[metadata_key].block_tables_expanded_src is block_table
                                             and attn_metadata[metadata_key].seq_lens_expanded_src is seq_lens):
-                                        if _STATIC_BUF_DEBUG:
-                                            _md0 = attn_metadata[metadata_key]
-                                            print(
-                                                f"[staticbuf] target-branch stash rows={seq_lens.shape[0]}"
-                                                f" stash_bt={tuple(_md0.block_tables_expanded.shape)}"
-                                                f" stash_bt_dev={_md0.block_tables_expanded.device}"
-                                                f" stash_cl_dev={_md0.seq_lens_expanded.device}"
-                                                f" cap_bt={tuple(param.params[6].shape) if param.params[6] is not None else None}"
-                                                f" identity={param.params[6] is _md0.block_tables_expanded}",
-                                                flush=True,
-                                            )
-                                        if (_STATIC_BUF_FASTPATH
-                                                and param.params[6] is attn_metadata[metadata_key].block_tables_expanded
-                                                and param.params[7] is attn_metadata[metadata_key].seq_lens_expanded):
-                                            # Same static-buffer fast path as the draft branch
-                                            # (falsified 2026-08-24, see the note there; kept
-                                            # behind VLLM_ASCEND_STATIC_BUF_FASTPATH).
-                                            event.record(update_stream)
-                                            continue
                                         block_table = attn_metadata[metadata_key].block_tables_expanded
                                         seq_lens = attn_metadata[metadata_key].seq_lens_expanded
                                     else:
@@ -1312,11 +1243,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     context_lens=context_lens,
                     out=output,
                 )
-                # Pin for the process lifetime: acl_graph.weak_ref_workspaces
-                # drops this dict's strong ref right after capture, and the
-                # static-buffer fast path (update_graph_params identity skip)
-                # never re-derives a fresh workspace to patch in its place.
-                update_graph_params_workspaces(num_tokens, pin_pa_workspace(workspace))
+                update_graph_params_workspaces(num_tokens, workspace)
 
             # Handle graph capturing mode
             stream = torch_npu.npu.current_stream()
