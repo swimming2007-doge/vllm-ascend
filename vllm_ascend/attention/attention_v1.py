@@ -17,6 +17,7 @@
 
 from dataclasses import dataclass
 from enum import Enum
+import os
 
 import torch
 import torch_npu
@@ -48,6 +49,12 @@ from vllm_ascend.attention.kvcomp_attn.attention_utils import (
     reshape_and_cache_kvcomp,
 )
 from vllm_ascend.attention import kv_sharing
+
+# Kill switch for the static-buffer update-skip fast path (see the notes at
+# the two guarded branches in update_graph_params). Default OFF: the ATB PA
+# task faulted on the first replay on every trial without its per-step
+# task-update relaunch (MPU-invalid, program 363, 2026-08-24).
+_STATIC_BUF_FASTPATH = os.environ.get("VLLM_ASCEND_STATIC_BUF_FASTPATH", "0") == "1"
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     PagedAttentionGraphParam,
@@ -788,7 +795,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                     if (_draft_md.block_tables_expanded is not None
                                             and _draft_md.block_tables_expanded_src is block_table
                                             and _draft_md.seq_lens_expanded_src is seq_lens):
-                                        if (param.params[6] is _draft_md.block_tables_expanded
+                                        if (_STATIC_BUF_FASTPATH
+                                                and param.params[6] is _draft_md.block_tables_expanded
                                                 and param.params[7] is _draft_md.seq_lens_expanded):
                                             # Static-buffer fast path: the stash IS the
                                             # captured binding (persistent buffers; contents
@@ -797,6 +805,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                             # rebind -- skip the relaunch, keep only the event
                                             # record so the captured graph's ExternalEvent wait
                                             # stays satisfied. Never add other ops here.
+                                            # NOTE: falsified 2026-08-24 -- even with NPU
+                                            # block_table / CPU context_lens buffers and a
+                                            # pinned workspace, every boot faulted on the
+                                            # FIRST replay (MPU-invalid, PA kernel). The ATB
+                                            # PA task appears to REQUIRE its per-step
+                                            # task-update relaunch; this branch is kept only
+                                            # behind VLLM_ASCEND_STATIC_BUF_FASTPATH=1 for
+                                            # future CANN-side retesting.
                                             event.record(update_stream)
                                             continue
                                         block_table = _draft_md.block_tables_expanded
@@ -824,12 +840,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                     if (attn_metadata[metadata_key].block_tables_expanded is not None
                                             and attn_metadata[metadata_key].block_tables_expanded_src is block_table
                                             and attn_metadata[metadata_key].seq_lens_expanded_src is seq_lens):
-                                        if (param.params[6] is attn_metadata[metadata_key].block_tables_expanded
+                                        if (_STATIC_BUF_FASTPATH
+                                                and param.params[6] is attn_metadata[metadata_key].block_tables_expanded
                                                 and param.params[7] is attn_metadata[metadata_key].seq_lens_expanded):
-                                            # Same static-buffer fast path as the draft branch:
-                                            # captured binding == stash, contents refreshed on
-                                            # the default stream; skip the relaunch, keep the
-                                            # event record only.
+                                            # Same static-buffer fast path as the draft branch
+                                            # (falsified 2026-08-24, see the note there; kept
+                                            # behind VLLM_ASCEND_STATIC_BUF_FASTPATH).
                                             event.record(update_stream)
                                             continue
                                         block_table = attn_metadata[metadata_key].block_tables_expanded
