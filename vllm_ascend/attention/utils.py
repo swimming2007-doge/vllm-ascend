@@ -133,12 +133,16 @@ def get_mtp_static_expansion_buffers(
     bufs = _MTP_VERIFY_STATIC_BUFFERS.get(num_rows)
     if bufs is None:
         bufs = (
-            torch.empty((num_rows, width), dtype=dtype, device=bt_device),
-            # ones, not empty: if the ATB PA launch BAKES host-tensor contents
-            # into its captured descriptor, garbage lens (e.g. ~2e9) fault the
-            # kernel with an out-of-pool read on the first replay, while len=1
-            # merely collapses acceptance -- a diagnosable signal, not a
-            # device crash.
+            # zeros, not empty: steps whose task-update patch does not apply
+            # replay the CAPTURE binding directly (proven 2026-08-24: the
+            # target PA is captured per-seq in Decoding state, and shape
+            # mismatches leave the captured task un-healed). Uninitialized
+            # contents faulted the PA kernel with MTE DDR OOB on those steps;
+            # block id 0 is a mapped pool address, so an un-healed replay
+            # merely reads stale-but-mapped data (the legacy fresh-tensor
+            # capture bindings were equally stale, just never garbage).
+            torch.zeros((num_rows, width), dtype=dtype, device=bt_device),
+            # ones: len=1 reads one block -- address-safe for the same reason.
             torch.ones((num_rows,), dtype=torch.int32, device=cl_device),
         )
         _MTP_VERIFY_STATIC_BUFFERS[num_rows] = bufs
