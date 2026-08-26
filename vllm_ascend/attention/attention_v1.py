@@ -1505,8 +1505,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
         if _B1_CAPTURE_LOG_COUNT < 10:
             _B1_CAPTURE_LOG_COUNT += 1
             logger.info(
-                "B1CAPTURE bucket=%d num_reqs=%d W=%d layer=%s",
+                "B1CAPTURE bucket=%d num_reqs=%d W=%d ws_mib=%.1f layer=%s",
                 num_tokens, num_reqs, verify_mask.shape[-1],
+                workspace.numel() * workspace.element_size() / 2**20,
                 self._graph_metadata_layer_name() if self._use_layer_aware_fia_graph_replay else None,
             )
         # [B, Hq, k+1, D] -> [num_tokens, Hq*D]; captured copy op, replays from
