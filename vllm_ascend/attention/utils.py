@@ -83,14 +83,12 @@ def build_paged_verify_mask(
     k = num_speculative_tokens
     qlen = k + 1
     B = seq_lens.shape[0]
-    # Width = exactly the blocks reachable by the longest sequence this step
-    # (probe-validated bound); NOT block_table.shape[1], which can be the
-    # full persistent width (2048 blocks at 262k ctx) and would make every
-    # mask a B x 4 x 262144 bool tensor.
-    max_seq = int(seq_lens.max().item()) if B > 0 else 0
-    W = min(block_table.shape[1], (max_seq + block_size - 1) // block_size) * block_size
-    if W <= 0:
-        W = block_size
+    # Width MUST track the block-table width passed to the op at update time
+    # (md.block_tables), not just the reachable blocks: boot 02 (66d553f42
+    # cap-to-max-seq) collapsed acceptance to ~1.2 / pos0 ~0.2, while boot 01
+    # (bca3a6bbb, full table width) was partially healthy. The op evidently
+    # cross-validates mask width against the block-table width.
+    W = block_table.shape[1] * block_size
     cache_key = (W, device)
     kpos = _VERIFY_MASK_KPOS_CACHE.get(cache_key)
     if kpos is None:
