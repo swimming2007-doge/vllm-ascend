@@ -59,6 +59,7 @@ class FIAPagedVerifyGraphParam:
 # instead of re-allocating ~2 MiB per verify step.
 _VERIFY_MASK_KPOS_CACHE: dict[tuple[int, torch.device], torch.Tensor] = {}
 _VERIFY_MASK_KPOS_CACHE_MAX = 8
+_VERIFY_MASK_LOG_COUNT = 0
 
 
 def build_paged_verify_mask(
@@ -83,11 +84,8 @@ def build_paged_verify_mask(
     k = num_speculative_tokens
     qlen = k + 1
     B = seq_lens.shape[0]
-    # Width MUST track the block-table width passed to the op at update time
-    # (md.block_tables), not just the reachable blocks: boot 02 (66d553f42
-    # cap-to-max-seq) collapsed acceptance to ~1.2 / pos0 ~0.2, while boot 01
-    # (bca3a6bbb, full table width) was partially healthy. The op evidently
-    # cross-validates mask width against the block-table width.
+    # Width tracks the block-table width bound at update time (md.block_tables)
+    # so the op's kernel-side width validation cannot mismatch.
     W = block_table.shape[1] * block_size
     cache_key = (W, device)
     kpos = _VERIFY_MASK_KPOS_CACHE.get(cache_key)
@@ -99,7 +97,10 @@ def build_paged_verify_mask(
     seqv = seq_lens.to(device=device, dtype=torch.int32).view(B, 1, 1, 1)
     qpos = torch.arange(qlen, device=device).view(1, 1, qlen, 1)
     mask = kpos > (seqv - qlen + qpos)
-    logger.info_once("paged_verify_mask built: B=%d W=%d (block_table width %d)", B, W, block_table.shape[1])
+    global _VERIFY_MASK_LOG_COUNT
+    if _VERIFY_MASK_LOG_COUNT < 3:
+        _VERIFY_MASK_LOG_COUNT += 1
+        logger.info("paged_verify_mask built: B=%d W=%d (block_table width %d)", B, W, block_table.shape[1])
     return mask
 
 

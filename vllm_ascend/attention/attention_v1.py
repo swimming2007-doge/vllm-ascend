@@ -39,6 +39,8 @@ from vllm.v1.attention.backends.registry import (  # type: ignore
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import AttentionSpec, CrossAttentionSpec
 
+from vllm.logger import init_logger
+
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.context_parallel.common_cp import AscendMetadataForDecode, AscendMetadataForPrefill
@@ -64,6 +66,12 @@ from vllm_ascend.attention.utils import (
     using_paged_attention,
     expand_paged_kv_to_per_query,
 )
+
+logger = init_logger(__name__)
+
+# B1 dispatch diagnostics: bounded log counters (capture-phase liveness proof)
+_B1_DISPATCH_LOG_COUNT = 0
+_B1_CAPTURE_LOG_COUNT = 0
 from vllm_ascend.compilation.acl_graph import (
     get_draft_graph_params,
     get_draft_graph_prefill_params,
@@ -1477,9 +1485,17 @@ class AscendAttentionBackendImpl(AttentionImpl):
         )
         handle = torch.npu.graph_task_group_end(stream)
         graph_params.handles[num_tokens].append(handle)
+        global _B1_CAPTURE_LOG_COUNT
+        if _B1_CAPTURE_LOG_COUNT < 10:
+            _B1_CAPTURE_LOG_COUNT += 1
+            logger.info(
+                "B1CAPTURE bucket=%d num_reqs=%d W=%d layer=%s",
+                num_tokens, num_reqs, verify_mask.shape[-1],
+                self._graph_metadata_layer_name() if self._use_layer_aware_fia_graph_replay else None,
+            )
         # [B, Hq, k+1, D] -> [num_tokens, Hq*D]; captured copy op, replays from
         # the attn_output buffer the updated FIA task refills every step.
-        output.view(num_reqs, k + 1, self.num_heads, self.head_size).copy_(
+        output.view(num_reqs, k + 1, self.num_heads * self.head_size).copy_(
             attn_output.permute(0, 2, 1, 3).reshape(num_reqs, k + 1, self.num_heads * self.head_size)
         )
         return output
@@ -1692,6 +1708,19 @@ class AscendAttentionBackendImpl(AttentionImpl):
             # BNSD paged op (no per-query block_table expansion -> no
             # RepeatInterleaveV2 OOB family). Draft layers and non-verify
             # shapes keep the PA capture.
+            global _B1_DISPATCH_LOG_COUNT
+            if _B1_DISPATCH_LOG_COUNT < 12:
+                _B1_DISPATCH_LOG_COUNT += 1
+                _spec = self.vllm_config.speculative_config
+                logger.info(
+                    "B1DISPATCH head=%s sliding=%s state=%s num_tokens=%d num_seqs=%d "
+                    "k=%s route512=%s b1=%s",
+                    self.head_size, self.sliding_window, attn_metadata.attn_state,
+                    query.shape[0], attn_metadata.seq_lens.shape[0],
+                    _spec.num_speculative_tokens if _spec else None,
+                    maybe_route_512_capture(self, attn_metadata),
+                    _maybe_b1_paged_verify(self, attn_metadata, query.shape[0]),
+                )
             if _maybe_b1_paged_verify(self, attn_metadata, query.shape[0]):
                 return self.full_graph_fia_v2_paged_verify(query, attn_metadata, output)
             return self.full_graph_pa(query, attn_metadata, output)
