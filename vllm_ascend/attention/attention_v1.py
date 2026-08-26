@@ -50,7 +50,10 @@ from vllm_ascend.attention.kvcomp_attn.attention_utils import (
 from vllm_ascend.attention import kv_sharing
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
+    FIAPagedVerifyGraphParam,
     PagedAttentionGraphParam,
+    _maybe_b1_paged_verify,
+    build_paged_verify_mask,
     cache_graph_workspace,
     enable_cp,
     maybe_route_512_capture,
@@ -209,6 +212,12 @@ class AscendMetadata:
     block_tables_expanded_src: torch.Tensor | None = None
     seq_lens_expanded: torch.Tensor | None = None
     seq_lens_expanded_src: torch.Tensor | None = None
+
+    # B1 paged verify (Gemma4 head_dim=512 MTP): [B, 1, k+1, W] bool mask,
+    # True = masked out, refreshed on the DEFAULT stream at build time for the
+    # FIA-v2 BNSD captured verify ops. Same ordering contract as
+    # block_tables_expanded above.
+    paged_verify_mask: torch.Tensor | None = None
 
     # The indices of the token slots that input tokens will be stored into.
     # E.g., if `slot_mapping` is [35, 2, 17] and the block size is 16, the
@@ -376,10 +385,22 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         # seq_lens.shape[0], so the expanded shapes line up 1:1. Computed after
         # the FIA padding above so the *_src identities match the stored fields.
         block_tables_expanded = seq_lens_expanded = None
+        paged_verify_mask = None
         if (attn_state == AscendAttentionState.SpecDecoding
                 and self.speculative_config is not None):
             block_tables_expanded, seq_lens_expanded = expand_paged_kv_to_per_query(
                 block_table, seq_lens, self.speculative_config.num_speculative_tokens)
+            # B1 paged verify mask for the captured FIA-v2 BNSD 512-dim verify
+            # ops. Cheap (width tied to this step's block-table width) and only
+            # built for verify steps; consumed by update_graph_params.
+            if block_table is not None:
+                paged_verify_mask = build_paged_verify_mask(
+                    seq_lens,
+                    block_table,
+                    self.speculative_config.num_speculative_tokens,
+                    AscendAttentionBackend.get_supported_kernel_block_sizes()[0],
+                    self.device,
+                )
 
         attn_metadata = AscendMetadata(
             num_actual_tokens=num_actual_tokens,
@@ -387,6 +408,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             block_tables_expanded_src=block_table if block_tables_expanded is not None else None,
             seq_lens_expanded=seq_lens_expanded,
             seq_lens_expanded_src=seq_lens if seq_lens_expanded is not None else None,
+            paged_verify_mask=paged_verify_mask,
             num_decode_tokens=num_decode_tokens,
             block_tables=block_table,
             query_start_loc=query_start_loc,
@@ -814,6 +836,53 @@ class AscendAttentionBackendImpl(AttentionImpl):
                             block_table,
                             seq_lens,
                         )
+                        continue
+                    if isinstance(param, FIAPagedVerifyGraphParam):
+                        # B1 paged verify: re-issue the captured FIA-v2 BNSD op
+                        # with this step's per-seq block_table, verify mask
+                        # (build-time, default stream) and plain per-request
+                        # seq lists. No per-query expansion anywhere.
+                        layer_name = param.layer_name
+                        metadata_key = layer_name if layer_name is not None and layer_name in attn_metadata else key
+                        md = attn_metadata[metadata_key]
+                        (
+                            q_bnsd,
+                            key_cache,
+                            value_cache,
+                            block_size,
+                            num_kv_heads,
+                            num_heads,
+                            scale,
+                            k,
+                            attn_output,
+                            softmax_lse,
+                        ) = param.params
+                        verify_mask = md.paged_verify_mask
+                        assert verify_mask is not None, (
+                            "B1 paged verify replay requires a build-time paged_verify_mask "
+                            f"(metadata key {metadata_key})"
+                        )
+                        seq_lens_list = md.seq_lens_list
+                        torch.npu.graph_task_update_begin(update_stream, handle)
+                        torch_npu.npu_fused_infer_attention_score_v2.out(
+                            query=q_bnsd,
+                            key=key_cache,
+                            value=value_cache,
+                            atten_mask=verify_mask,
+                            block_table=md.block_tables,
+                            input_layout="BNSD",
+                            block_size=block_size,
+                            actual_seq_qlen=[k + 1] * len(seq_lens_list),
+                            actual_seq_kvlen=seq_lens_list,
+                            num_key_value_heads=num_kv_heads,
+                            num_query_heads=num_heads,
+                            sparse_mode=0,
+                            softmax_scale=scale,
+                            workspace=workspace,
+                            out=[attn_output, softmax_lse],
+                        )
+                        torch.npu.graph_task_update_end(update_stream)
+                        event.record(update_stream)
                         continue
                     (
                         query,
@@ -1286,6 +1355,127 @@ class AscendAttentionBackendImpl(AttentionImpl):
             graph_params.handles[num_tokens].append(handle)
             return output
 
+    def full_graph_fia_v2_paged_verify(
+        self,
+        query: torch.Tensor,
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """B1: capture the 512-dim MTP verify step as FIA-v2 BNSD paged.
+
+        Recipe probe-validated on CANN 9.0.1 (maxdiff vs fp32 6.4e-4):
+        query [B, Hq, k+1, D] BNSD against the paged KV cache views
+        [num_blocks, Hkv, block_size, D], per-seq block_table (NO per-query
+        expansion), plain per-request actual_seq_qlen/kvlen lists, explicit
+        [B, 1, k+1, W] bool mask (True = masked out), sparse_mode=0. TND is
+        not an option at head_dim=512 (CheckFeatureLayout rejects it), which
+        is why the default FIA capture paths cannot serve this layer.
+
+        The permuted KV views stay zero-copy for Gemma4 TP4/TP8 (Hkv=1 per
+        rank makes the permutation stride-trivial); q_bnsd gets an explicit
+        captured copy so the op argument is a stable contiguous buffer and no
+        hidden temp can appear inside the task-update context.
+        """
+        spec_cfg = self.vllm_config.speculative_config
+        k = spec_cfg.num_speculative_tokens
+        num_tokens = query.shape[0]
+        num_reqs = num_tokens // (k + 1)
+        graph_params = get_graph_params()
+
+        num_block, block_size, _, _ = self.key_cache.shape  # type: ignore
+        key = self.key_cache.permute(0, 2, 1, 3)  # type: ignore # [num_block, Hkv, block_size, D]
+        value = self.value_cache.permute(0, 2, 1, 3)  # type: ignore
+        assert key.is_contiguous() and value.is_contiguous(), (
+            "B1 paged verify expects the KV cache permutation to stay zero-copy "
+            f"(num_kv_heads=1 per rank); got strides {key.stride()}"
+        )
+        # [B, k+1, Hq, D] -> [B, Hq, k+1, D]; contiguous() is a captured op that
+        # re-reads the static query buffer on every replay.
+        q_bnsd = query.view(num_reqs, k + 1, self.num_heads, self.head_size).permute(0, 2, 1, 3).contiguous()
+        block_table = attn_metadata.block_tables
+        verify_mask = attn_metadata.paged_verify_mask
+        assert verify_mask is not None, "B1 paged verify capture requires a build-time paged_verify_mask"
+        softmax_lse = torch.empty(1, dtype=query.dtype, device=query.device)
+        attn_output = torch.empty(
+            num_reqs, self.num_heads, k + 1, self.head_size, dtype=query.dtype, device=query.device
+        )
+
+        workspace = graph_params.workspaces.get(num_tokens)
+        should_update_workspace_cache = False
+        candidate_workspace = torch_npu._npu_fused_infer_attention_score_v2_get_max_workspace(
+            query=q_bnsd,
+            key=key,
+            value=value,
+            atten_mask=verify_mask,
+            block_table=block_table,
+            input_layout="BNSD",
+            block_size=block_size,
+            actual_seq_qlen=[k + 1] * num_reqs,
+            actual_seq_kvlen=attn_metadata.seq_lens_list,
+            num_key_value_heads=self.num_kv_heads,
+            softmax_scale=self.scale,
+            num_query_heads=self.num_heads,
+            sparse_mode=0,
+        )
+        workspace = cache_graph_workspace(
+            graph_params,
+            num_tokens,
+            candidate_workspace,
+            use_max_workspace=self._use_max_workspace_for_fia_graph,
+        )
+        should_update_workspace_cache = workspace is candidate_workspace
+        if should_update_workspace_cache:
+            update_graph_params_workspaces(num_tokens, workspace)
+
+        stream = torch_npu.npu.current_stream()
+        event = torch.npu.ExternalEvent()
+        event.wait(stream)
+        event.reset(stream)
+        graph_params.events[num_tokens].append(event)
+        graph_params.attn_params[num_tokens].append(
+            FIAPagedVerifyGraphParam(
+                (
+                    weak_ref_tensors(q_bnsd),
+                    weak_ref_tensors(key),
+                    weak_ref_tensors(value),
+                    block_size,
+                    self.num_kv_heads,
+                    self.num_heads,
+                    self.scale,
+                    k,
+                    weak_ref_tensors(attn_output),
+                    weak_ref_tensors(softmax_lse),
+                ),
+                self._graph_metadata_layer_name() if self._use_layer_aware_fia_graph_replay else None,
+            )
+        )
+        torch.npu.graph_task_group_begin(stream)
+        torch_npu.npu_fused_infer_attention_score_v2.out(
+            query=q_bnsd,
+            key=key,
+            value=value,
+            atten_mask=verify_mask,
+            block_table=block_table,
+            input_layout="BNSD",
+            block_size=block_size,
+            actual_seq_qlen=[k + 1] * num_reqs,
+            actual_seq_kvlen=attn_metadata.seq_lens_list,
+            num_key_value_heads=self.num_kv_heads,
+            num_query_heads=self.num_heads,
+            sparse_mode=0,
+            softmax_scale=self.scale,
+            workspace=workspace,
+            out=[attn_output, softmax_lse],
+        )
+        handle = torch.npu.graph_task_group_end(stream)
+        graph_params.handles[num_tokens].append(handle)
+        # [B, Hq, k+1, D] -> [num_tokens, Hq*D]; captured copy op, replays from
+        # the attn_output buffer the updated FIA task refills every step.
+        output.view(num_reqs, k + 1, self.num_heads, self.head_size).copy_(
+            attn_output.permute(0, 2, 1, 3).reshape(num_reqs, k + 1, self.num_heads * self.head_size)
+        )
+        return output
+
     def _get_fia_params(self, key: torch.Tensor, value: torch.Tensor, attn_metadata: AscendMetadata, kv_cache=None):
         # PrefillNoCache doesn't need key_cache, but other modes do
         # Only initialize/require cache for modes that actually use it
@@ -1490,6 +1680,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
         output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if _EXTRA_CTX.capturing:
+            # B1: target-model head_dim=512 MTP verify captures as a FIA-v2
+            # BNSD paged op (no per-query block_table expansion -> no
+            # RepeatInterleaveV2 OOB family). Draft layers and non-verify
+            # shapes keep the PA capture.
+            if _maybe_b1_paged_verify(self, attn_metadata, query.shape[0]):
+                return self.full_graph_fia_v2_paged_verify(query, attn_metadata, output)
             return self.full_graph_pa(query, attn_metadata, output)
         # MTP verify: expand per-seq block_table/seq_lens to per-query so token0
         # does not attend draft1's KV (future leak). See kv_sharing.
