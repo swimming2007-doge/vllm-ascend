@@ -20,6 +20,9 @@ from vllm_ascend.utils import (
     is_pd_decode_recompute_scheduler_enabled,
 )
 from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -80,7 +83,14 @@ def build_paged_verify_mask(
     k = num_speculative_tokens
     qlen = k + 1
     B = seq_lens.shape[0]
-    W = block_table.shape[1] * block_size
+    # Width = exactly the blocks reachable by the longest sequence this step
+    # (probe-validated bound); NOT block_table.shape[1], which can be the
+    # full persistent width (2048 blocks at 262k ctx) and would make every
+    # mask a B x 4 x 262144 bool tensor.
+    max_seq = int(seq_lens.max().item()) if B > 0 else 0
+    W = min(block_table.shape[1], (max_seq + block_size - 1) // block_size) * block_size
+    if W <= 0:
+        W = block_size
     cache_key = (W, device)
     kpos = _VERIFY_MASK_KPOS_CACHE.get(cache_key)
     if kpos is None:
@@ -90,7 +100,9 @@ def build_paged_verify_mask(
         _VERIFY_MASK_KPOS_CACHE[cache_key] = kpos
     seqv = seq_lens.to(device=device, dtype=torch.int32).view(B, 1, 1, 1)
     qpos = torch.arange(qlen, device=device).view(1, 1, qlen, 1)
-    return kpos > (seqv - qlen + qpos)
+    mask = kpos > (seqv - qlen + qpos)
+    logger.info_once("paged_verify_mask built: B=%d W=%d (block_table width %d)", B, W, block_table.shape[1])
+    return mask
 
 
 def expand_paged_kv_to_per_query(

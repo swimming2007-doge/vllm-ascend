@@ -1435,16 +1435,24 @@ class AscendAttentionBackendImpl(AttentionImpl):
         graph_params.attn_params[num_tokens].append(
             FIAPagedVerifyGraphParam(
                 (
-                    weak_ref_tensors(q_bnsd),
-                    weak_ref_tensors(key),
-                    weak_ref_tensors(value),
+                    # Strong refs (not weak_ref_tensors): q_bnsd and attn_output
+                    # are capture-allocated intermediates whose CONTENT the
+                    # replay/update dataflow depends on, and nothing else holds
+                    # them alive. Weak refs are only safe for tensors that are
+                    # either strongly held elsewhere (static buffers, KV cache)
+                    # or whose content is never consumed (softmax_lse in the
+                    # TND paths). Mirrors the strong block_table/context_lens
+                    # refs in PagedAttentionGraphParam.
+                    q_bnsd,
+                    key,
+                    value,
                     block_size,
                     self.num_kv_heads,
                     self.num_heads,
                     self.scale,
                     k,
-                    weak_ref_tensors(attn_output),
-                    weak_ref_tensors(softmax_lse),
+                    attn_output,
+                    softmax_lse,
                 ),
                 self._graph_metadata_layer_name() if self._use_layer_aware_fia_graph_replay else None,
             )
