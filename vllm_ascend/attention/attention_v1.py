@@ -1411,7 +1411,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 block_table,
                 k,
                 block_size,
-                self.device,
+                query.device,
             )
         softmax_lse = torch.empty(1, dtype=query.dtype, device=query.device)
         attn_output = torch.empty(
