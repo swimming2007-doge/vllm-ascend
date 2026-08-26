@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
-import os
 import time
 import weakref
 from collections.abc import Callable
@@ -26,11 +25,12 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 
 from ..utils import weak_ref_tensors
 
-# Env-gated per-step wall-clock probes for the FULL-graph decode step: replay
+# Per-step wall-clock probes for the FULL-graph decode step: replay
 # (pre-replay barrier + graph enqueue, acl_graph.py) and attention-param
-# update (model_runner_v1.py). Off by default; VLLM_ASCEND_B1_STEP_TIMING=1
-# logs per-bucket mean/median/p95 every 200 samples.
-_B1_STEP_TIMING = os.environ.get("VLLM_ASCEND_B1_STEP_TIMING", "0") == "1"
+# update (model_runner_v1.py). Always-on on this experiment branch (one log
+# line per 200 samples per bucket; env gating is useless here because the
+# worker processes get a sanitized environment).
+_B1_STEP_TIMING = True
 _step_timing_acc: dict[tuple[str, int], list[float]] = {}
 
 
