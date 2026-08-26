@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+import os
+import time
 import weakref
 from collections.abc import Callable
 from contextlib import ExitStack
@@ -23,6 +25,30 @@ from vllm.platforms import current_platform
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 
 from ..utils import weak_ref_tensors
+
+# Env-gated per-step wall-clock probes for the FULL-graph decode step: replay
+# (pre-replay barrier + graph enqueue, acl_graph.py) and attention-param
+# update (model_runner_v1.py). Off by default; VLLM_ASCEND_B1_STEP_TIMING=1
+# logs per-bucket mean/median/p95 every 200 samples.
+_B1_STEP_TIMING = os.environ.get("VLLM_ASCEND_B1_STEP_TIMING", "0") == "1"
+_step_timing_acc: dict[tuple[str, int], list[float]] = {}
+
+
+def record_step_phase(phase: str, num_tokens: int, seconds: float) -> None:
+    if not _B1_STEP_TIMING:
+        return
+    samples = _step_timing_acc.setdefault((phase, num_tokens), [])
+    samples.append(seconds)
+    if len(samples) >= 200:
+        s = sorted(samples)
+        n = len(s)
+        logger.info(
+            "B1STEP phase=%s num_tokens=%d n=%d ms mean/med/p95=%.2f/%.2f/%.2f",
+            phase, num_tokens, n,
+            sum(s) / n * 1e3, s[n // 2] * 1e3, s[int(n * 0.95)] * 1e3,
+        )
+        samples.clear()
+
 
 _acl_graph_wrappers: weakref.WeakSet[Any] = weakref.WeakSet()
 _STREAM_RESOURCE_ERROR_CODE = "207008"
@@ -261,9 +287,14 @@ class ACLGraphWrapper:
         # When FULL + EAGLE draft (merge path), replay does not need this barrier.
         is_draft_eagle = _EXTRA_CTX.is_draft_model and self.use_eagle
         need_sync = self.runtime_mode == CUDAGraphMode.FULL and not is_draft_eagle
+        _t0 = time.perf_counter() if _B1_STEP_TIMING else 0.0
         if not self.enable_enpu and need_sync:
             torch.npu.current_stream().synchronize()
         entry.aclgraph.replay()
+        if _B1_STEP_TIMING:
+            record_step_phase(
+                "replay", getattr(entry.batch_descriptor, "num_tokens", -1),
+                time.perf_counter() - _t0)
         return entry.output
 
 

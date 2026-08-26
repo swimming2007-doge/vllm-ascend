@@ -16,8 +16,6 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
-import os
-import time
 from collections.abc import Callable
 from typing import Any
 
@@ -38,29 +36,6 @@ from vllm.v1.worker.utils import AttentionGroup
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.compilation.acl_graph import set_graph_params, update_full_graph_params
 from vllm_ascend.worker.v2.utils import communicator_switch
-
-# Env-gated per-step wall-clock decomposition for the full-graph decode step
-# (replay vs attention-param update). Off by default; set
-# VLLM_ASCEND_B1_STEP_TIMING=1 to log mean/median/p95 every 200 steps.
-_B1_STEP_TIMING = os.environ.get("VLLM_ASCEND_B1_STEP_TIMING", "0") == "1"
-_step_timing_acc: dict[int, list[tuple[float, float]]] = {}
-
-
-def _record_step_timing(num_tokens: int, replay_s: float, update_s: float) -> None:
-    samples = _step_timing_acc.setdefault(num_tokens, [])
-    samples.append((replay_s, update_s))
-    if len(samples) >= 200:
-        reps = sorted(s for s, _ in samples)
-        upds = sorted(u for _, u in samples)
-        n = len(samples)
-        logger.info(
-            "B1STEP num_tokens=%d n=%d replay_ms=%.2f/%.2f/%.2f (mean/med/p95) "
-            "update_ms=%.2f/%.2f/%.2f",
-            num_tokens, n,
-            sum(reps) / n * 1e3, reps[n // 2] * 1e3, reps[int(n * 0.95)] * 1e3,
-            sum(upds) / n * 1e3, upds[n // 2] * 1e3, upds[int(n * 0.95)] * 1e3,
-        )
-        samples.clear()
 
 
 class ModelAclGraphManager(ModelCudaGraphManager):
@@ -97,10 +72,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         """Override run_fullgraph to update full graph params in run_fullgraph."""
         num_tokens = desc.num_tokens
         logger.info_once("run_fullgraph with num_tokens=%s", num_tokens)
-        _timing = _B1_STEP_TIMING
-        t0 = time.perf_counter() if _timing else 0.0
         ret = super().run_fullgraph(desc)
-        t1 = time.perf_counter() if _timing else 0.0
 
         positions = self.model_runner.input_buffers.positions[:num_tokens]
         # refer to vllm.v1.worker.gpu.dp_utils.sync_cudagraph_and_dp_padding to
@@ -126,9 +98,6 @@ class ModelAclGraphManager(ModelCudaGraphManager):
                 self.model_runner.speculative_config,
                 positions.shape[0],
             )
-        if _timing:
-            t2 = time.perf_counter()
-            _record_step_timing(num_tokens, t1 - t0, t2 - t1)
         return ret
 
     def capture(
