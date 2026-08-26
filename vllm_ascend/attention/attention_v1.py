@@ -1402,7 +1402,17 @@ class AscendAttentionBackendImpl(AttentionImpl):
         q_bnsd = query.view(num_reqs, k + 1, self.num_heads, self.head_size).permute(0, 2, 1, 3).contiguous()
         block_table = attn_metadata.block_tables
         verify_mask = attn_metadata.paged_verify_mask
-        assert verify_mask is not None, "B1 paged verify capture requires a build-time paged_verify_mask"
+        if verify_mask is None:
+            # Capture-time dummy metadata is not labeled SpecDecoding, so
+            # build() skipped the shared mask; build a local one here
+            # (default stream, capture context — never inside task-update).
+            verify_mask = build_paged_verify_mask(
+                attn_metadata.seq_lens,
+                block_table,
+                k,
+                block_size,
+                self.device,
+            )
         softmax_lse = torch.empty(1, dtype=query.dtype, device=query.device)
         attn_output = torch.empty(
             num_reqs, self.num_heads, k + 1, self.head_size, dtype=query.dtype, device=query.device
@@ -1580,6 +1590,21 @@ class AscendAttentionBackendImpl(AttentionImpl):
             # _EXTRA_CTX.vllm_config is the draft config, which has no
             # speculative_config, so the gate would misfire as False.
             if maybe_route_512_capture(self, attn_metadata):
+                # This is the REAL 512-dim capture dispatch site: MTP capture
+                # metadata is not labeled SpecDecoding, so forward_impl's
+                # _pa_gate never routes here and full_graph_pa was called
+                # directly. B1 hooks in here first.
+                global _B1_DISPATCH_LOG_COUNT
+                if _B1_DISPATCH_LOG_COUNT < 12:
+                    _B1_DISPATCH_LOG_COUNT += 1
+                    logger.info(
+                        "B1DISPATCH head=%s state=%s num_tokens=%d num_seqs=%d b1=%s",
+                        self.head_size, attn_metadata.attn_state, query.shape[0],
+                        attn_metadata.seq_lens.shape[0],
+                        _maybe_b1_paged_verify(self, attn_metadata, query.shape[0]),
+                    )
+                if _maybe_b1_paged_verify(self, attn_metadata, query.shape[0]):
+                    return self.full_graph_fia_v2_paged_verify(query, attn_metadata, output)
                 return self.full_graph_pa(query, attn_metadata, output)
             if self.sinks is not None:
                 attn_output, num_tokens = self.full_graph_fia_v2(query, key, value, attn_metadata, output)
@@ -1708,19 +1733,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
             # BNSD paged op (no per-query block_table expansion -> no
             # RepeatInterleaveV2 OOB family). Draft layers and non-verify
             # shapes keep the PA capture.
-            global _B1_DISPATCH_LOG_COUNT
-            if _B1_DISPATCH_LOG_COUNT < 12:
-                _B1_DISPATCH_LOG_COUNT += 1
-                _spec = self.vllm_config.speculative_config
-                logger.info(
-                    "B1DISPATCH head=%s sliding=%s state=%s num_tokens=%d num_seqs=%d "
-                    "k=%s route512=%s b1=%s",
-                    self.head_size, self.sliding_window, attn_metadata.attn_state,
-                    query.shape[0], attn_metadata.seq_lens.shape[0],
-                    _spec.num_speculative_tokens if _spec else None,
-                    maybe_route_512_capture(self, attn_metadata),
-                    _maybe_b1_paged_verify(self, attn_metadata, query.shape[0]),
-                )
             if _maybe_b1_paged_verify(self, attn_metadata, query.shape[0]):
                 return self.full_graph_fia_v2_paged_verify(query, attn_metadata, output)
             return self.full_graph_pa(query, attn_metadata, output)

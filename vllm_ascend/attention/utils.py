@@ -721,9 +721,15 @@ def _maybe_b1_paged_verify(impl, attn_metadata, num_tokens: int) -> bool:
     model, A2/A3) plus the multi-row verify shape check from
     kv_sharing.resolve_capture_kv: single-row captures and draft layers keep
     the PagedAttention graph path.
+
+    No attn_state requirement: capture-time dummy metadata is not labeled
+    SpecDecoding (observed ChunkedPrefill/DecodeOnly), which is exactly why
+    forward_impl's _pa_gate never routes MTP verify captures to
+    forward_paged_attention. Only ever called inside _EXTRA_CTX.capturing
+    branches, where the verify shape (num_tokens == num_seqs*(k+1) != num_seqs
+    under an active speculative_config) is the discriminator.
     """
     from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-    from vllm_ascend.attention.attention_v1 import AscendAttentionState
     from vllm_ascend.utils import is_950
 
     if not maybe_route_512_capture(impl, attn_metadata):
@@ -734,7 +740,6 @@ def _maybe_b1_paged_verify(impl, attn_metadata, num_tokens: int) -> bool:
     num_seqs = attn_metadata.seq_lens.shape[0]
     k = spec_cfg.num_speculative_tokens
     return (
-        attn_metadata.attn_state == AscendAttentionState.SpecDecoding
-        and num_tokens == num_seqs * (k + 1)
+        num_tokens == num_seqs * (k + 1)
         and num_tokens != num_seqs
     )
