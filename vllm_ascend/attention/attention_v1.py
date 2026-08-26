@@ -1404,14 +1404,22 @@ class AscendAttentionBackendImpl(AttentionImpl):
         verify_mask = attn_metadata.paged_verify_mask
         if verify_mask is None:
             # Capture-time dummy metadata is not labeled SpecDecoding, so
-            # build() skipped the shared mask; build a local one here
-            # (default stream, capture context — never inside task-update).
-            verify_mask = build_paged_verify_mask(
-                attn_metadata.seq_lens,
-                block_table,
-                k,
-                block_size,
-                query.device,
+            # build() skipped the shared mask. Content is irrelevant here —
+            # every replay rebinds the real mask via task update (probe
+            # /tmp/probe_b1_graph_update.py) — and building the real mask
+            # needs a synchronous seq_lens H2D, which is illegal inside the
+            # capture stream (aclrtMemcpy 107030 "capture mode does not
+            # support this operation"). Bind an all-visible placeholder of
+            # the correct shape instead.
+            verify_mask = torch.zeros(
+                (
+                    num_reqs,
+                    1,
+                    k + 1,
+                    block_table.shape[1] * block_size,
+                ),
+                dtype=torch.bool,
+                device=query.device,
             )
         softmax_lse = torch.empty(1, dtype=query.dtype, device=query.device)
         attn_output = torch.empty(
