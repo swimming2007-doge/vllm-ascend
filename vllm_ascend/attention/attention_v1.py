@@ -39,7 +39,7 @@ from vllm.v1.attention.backends.registry import (  # type: ignore
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import AttentionSpec, CrossAttentionSpec
 
-from vllm.logger import init_logger
+from vllm.logger import logger
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
@@ -66,8 +66,6 @@ from vllm_ascend.attention.utils import (
     using_paged_attention,
     expand_paged_kv_to_per_query,
 )
-
-logger = init_logger(__name__)
 
 # B1 dispatch diagnostics: bounded log counters (capture-phase liveness proof)
 _B1_DISPATCH_LOG_COUNT = 0
