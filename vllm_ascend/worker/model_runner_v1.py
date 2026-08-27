@@ -117,8 +117,6 @@ from vllm_ascend.attention.utils import (
 # yapf: disable
 from vllm_ascend.compilation.acl_graph import (
     ACLGraphWrapper,
-    _B1_STEP_TIMING,
-    record_step_phase,
     set_draft_graph_params,
     set_graph_params,
     update_full_graph_params,
@@ -2956,7 +2954,6 @@ class NPUModelRunner(GPUModelRunner):
                 torch.npu.current_stream().synchronize()
 
             assert positions is not None
-            _t0 = time.perf_counter() if _B1_STEP_TIMING else 0.0
             # Wait for the default-stream work that precedes this round's
             # replay (metadata builds: block tables, verify masks, per-query
             # expansions) before relaunching task-updates on the update
@@ -2974,8 +2971,6 @@ class NPUModelRunner(GPUModelRunner):
                 self.speculative_config,
                 positions.shape[0],
             )
-            if _B1_STEP_TIMING:
-                record_step_phase("update", num_tokens_padded, time.perf_counter() - _t0)
 
     def _model_forward(
         self,
