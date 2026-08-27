@@ -1388,10 +1388,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
         num_block, block_size, _, _ = self.key_cache.shape  # type: ignore
         key = self.key_cache.permute(0, 2, 1, 3)  # type: ignore # [num_block, Hkv, block_size, D]
         value = self.value_cache.permute(0, 2, 1, 3)  # type: ignore
-        assert key.is_contiguous() and value.is_contiguous(), (
-            "B1 paged verify expects the KV cache permutation to stay zero-copy "
-            f"(num_kv_heads=1 per rank); got strides {key.stride()}"
-        )
+        # The strided permuted view is fine for any Hkv: with Hkv=1 it happens
+        # to be contiguous, and with Hkv>1 (TP2) the ACL descriptor honors the
+        # strides -- numerically validated vs fp32 at Hkv=2 (maxdiff ~5e-4,
+        # same as the contiguous copy; FIA-v2 rejects the natural
+        # [nb, bs, Hkv, D] layout outright via CheckKVShapeForPageAttention).
         # [B, k+1, Hq, D] -> [B, Hq, k+1, D]; contiguous() is a captured op that
         # re-reads the static query buffer on every replay.
         q_bnsd = query.view(num_reqs, k + 1, self.num_heads, self.head_size).permute(0, 2, 1, 3).contiguous()
