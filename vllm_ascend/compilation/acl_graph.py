@@ -286,7 +286,16 @@ class ACLGraphWrapper:
         # When enable_enpu is on, model_runner orders update vs replay; skip here.
         # When FULL + EAGLE draft (merge path), replay does not need this barrier.
         is_draft_eagle = _EXTRA_CTX.is_draft_model and self.use_eagle
-        need_sync = self.runtime_mode == CUDAGraphMode.FULL and not is_draft_eagle
+        # DUAL-GRAPH MTP draft (Gemma4): the draft replays its OWN aclgraph and
+        # shares the model_runner update_stream, so graph_task_update for round r
+        # can mutate draft graph tasks while the round-r draft replay is still
+        # in flight. The is_draft_eagle skip above was written for the MERGED
+        # eagle path where the draft never replays separately. Without the
+        # barrier the draft intermittently reads garbage (per-engine pos0
+        # collapse to ~0-1%, the DP "lottery"). Keep the barrier for the
+        # dual-graph draft; merged-eagle deployments never replay here, so an
+        # unconditional FULL barrier is a no-op for them.
+        need_sync = self.runtime_mode == CUDAGraphMode.FULL
         _t0 = time.perf_counter() if _B1_STEP_TIMING else 0.0
         if not self.enable_enpu and need_sync:
             torch.npu.current_stream().synchronize()
