@@ -67,9 +67,6 @@ from vllm_ascend.attention.utils import (
     expand_paged_kv_to_per_query,
 )
 
-# B1 dispatch diagnostics: bounded log counters (capture-phase liveness proof)
-_B1_DISPATCH_LOG_COUNT = 0
-_B1_CAPTURE_LOG_COUNT = 0
 from vllm_ascend.compilation.acl_graph import (
     get_draft_graph_params,
     get_draft_graph_prefill_params,
@@ -1501,15 +1498,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
         )
         handle = torch.npu.graph_task_group_end(stream)
         graph_params.handles[num_tokens].append(handle)
-        global _B1_CAPTURE_LOG_COUNT
-        if _B1_CAPTURE_LOG_COUNT < 10:
-            _B1_CAPTURE_LOG_COUNT += 1
-            logger.info(
-                "B1CAPTURE bucket=%d num_reqs=%d W=%d ws_mib=%.1f layer=%s",
-                num_tokens, num_reqs, verify_mask.shape[-1],
-                workspace.numel() * workspace.element_size() / 2**20,
-                self._graph_metadata_layer_name() if self._use_layer_aware_fia_graph_replay else None,
-            )
         # [B, Hq, k+1, D] -> [num_tokens, Hq*D]; captured copy op, replays from
         # the attn_output buffer the updated FIA task refills every step.
         output.view(num_reqs, k + 1, self.num_heads * self.head_size).copy_(
@@ -1601,15 +1589,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 # metadata is not labeled SpecDecoding, so forward_impl's
                 # _pa_gate never routes here and full_graph_pa was called
                 # directly. B1 hooks in here first.
-                global _B1_DISPATCH_LOG_COUNT
-                if _B1_DISPATCH_LOG_COUNT < 12:
-                    _B1_DISPATCH_LOG_COUNT += 1
-                    logger.info(
-                        "B1DISPATCH head=%s state=%s num_tokens=%d num_seqs=%d b1=%s",
-                        self.head_size, attn_metadata.attn_state, query.shape[0],
-                        attn_metadata.seq_lens.shape[0],
-                        _maybe_b1_paged_verify(self, attn_metadata, query.shape[0]),
-                    )
                 if _maybe_b1_paged_verify(self, attn_metadata, query.shape[0]):
                     return self.full_graph_fia_v2_paged_verify(query, attn_metadata, output)
                 return self.full_graph_pa(query, attn_metadata, output)
