@@ -566,6 +566,14 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 self.enable_enpu,
             )
             self.update_stream = torch.npu.Stream()
+            # Cross-stream doorbell for the DRAFT FULL-graph update path
+            # (mirrors the target-side one in model_runner_v1): recorded on the
+            # default stream right BEFORE the draft runnable call (after all
+            # draft metadata builds), waited on the draft update_stream before
+            # the task-update relaunches. Orders the update's reads of
+            # draft metadata tensors (block tables, masks, seq lists) after
+            # the default-stream writes that produced them.
+            self._pre_replay_event: torch.npu.Event = torch.npu.Event()
             self._runnable = ACLGraphWrapper(
                 self._run_merged_draft,
                 self.vllm_config,
@@ -781,6 +789,16 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             if forward_context is not None:
                 forward_context.moe_layer_index = 0
 
+            # Doorbell record point (draft): everything the draft update will
+            # re-bind has been enqueued on the default stream by now (draft
+            # metadata builds); the draft replay enqueue comes next. See the
+            # _pre_replay_event init above.
+            if (
+                forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+                and not _EXTRA_CTX.capturing
+                and hasattr(self, "_pre_replay_event")
+            ):
+                self._pre_replay_event.record()
             self._runnable(
                 num_input_tokens=num_tokens,
                 batch_size=batch_size,
@@ -1190,6 +1208,16 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 "is_prefill": is_prefill_batch,
             }
             run_draft = partial(self._runnable, **model_inputs)
+
+            # Doorbell record point (draft, propose path): draft metadata is
+            # fully enqueued on the default stream; the replay enqueue comes
+            # next. See the _pre_replay_event init near the wrapper creation.
+            if (
+                forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+                and not _EXTRA_CTX.capturing
+                and hasattr(self, "_pre_replay_event")
+            ):
+                self._pre_replay_event.record()
 
             # [STEP_DBG] total draft runnable wall-clock (eager forward or graph
             # replay). Outside the compiled fn so the timer is not stripped.
@@ -2374,6 +2402,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
     def _update_full_graph_params(self, forward_context, num_tokens, draft_attn_metadatas=None):
         assert len(self.draft_attn_groups) > 0
         attn_backend = self.draft_attn_groups[0].backend
+        # Doorbell wait (draft): order the task-update relaunches after the
+        # default-stream metadata writes that precede this round's draft
+        # replay. Single direction (update waits default); host never blocks.
+        pre_replay_event = getattr(self, "_pre_replay_event", None)
+        if pre_replay_event is not None:
+            self.update_stream.wait_event(pre_replay_event)
         update_full_graph_params(
             attn_backend,
             self.update_stream,
