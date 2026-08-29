@@ -18,6 +18,8 @@
 from dataclasses import dataclass
 from enum import Enum
 
+import traceback
+
 import torch
 import torch_npu
 import vllm.envs as envs_vllm
@@ -82,6 +84,46 @@ from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
 # default max value of sliding window size
 SWA_INT_MAX = 2147483647
 _ATTN_KEYS_BUFFER = None
+# #27 fix: draft layer_name -> per-query PA context_lens (CPU int32) that caps
+# every draft step's global-attention window at [0, ctx+1] (accepted context
+# plus the root token). Built host-side per round by
+# build_spec_draft_context_lens (called from the proposer just before the
+# pre-replay doorbell record) and consumed by the draft PA param update.
+# Rationale: the draft PA reuses the verify per-query expansion, whose
+# windows grow as ctx+1+j, so draft step j reads j TARGET-pool slots past the
+# root that nothing writes this round. Their content is whatever verify
+# write-through or a previous owner of the block left there: after a rejected
+# round it is the previous attempt's KV (a useful retry prior -- zeroing it
+# costs pos1/pos2 acceptance), but on prefix-cache-reused blocks it is
+# foreign KV that poisons the draft (the #27 episodic per-engine collapse).
+# Never reading those slots removes both effects; per-step draft chaining is
+# served by the FIA local attention over the draft's own KV. context_lens is
+# a CPU tensor for the PA op, so this is pure host arithmetic -- no kernels,
+# no H2D copies, nothing on the update stream.
+_SPEC_DRAFT_PA_CL: dict = {}
+
+
+def build_spec_draft_context_lens(step0_metadata: dict, k_spec: int) -> None:
+    """#27: precompute per-query draft PA context_lens = ctx + 1 for every
+    layer in the draft step-0 metadata. sl = ctx + K + 1 counts the accepted
+    context including the root token plus K future slots, so the capped
+    window is sl - K for each of the K+1 queries of a request."""
+    try:
+        for layer_name, md in step0_metadata.items():
+            sl = getattr(md, "seq_lens", None)
+            if sl is None or k_spec <= 0:
+                continue
+            # Match expand_paged_kv_to_per_query's layout: request i owns
+            # queries [i*(K+1), (i+1)*(K+1)).
+            cl = (sl.to(torch.int32) - k_spec).clamp_(min=1)
+            _SPEC_DRAFT_PA_CL[layer_name] = cl.repeat_interleave(k_spec + 1)
+    except Exception:
+        if not globals().get("_SPEC_CL_WARNED", False):
+            globals()["_SPEC_CL_WARNED"] = True
+            logger.warning(
+                "build_spec_draft_context_lens failed (draft PA windows stay "
+                "optimistic; run once with debugging to inspect): %s",
+                traceback.format_exc())
 
 
 @register_backend(AttentionBackendEnum.CUSTOM, "ASCEND")
@@ -806,6 +848,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                     else:
                                         block_table, seq_lens = expand_paged_kv_to_per_query(
                                             block_table, seq_lens, _k)
+                            # #27: cap every draft step's global window at
+                            # [0, ctx+1] -- never read the target-pool slots
+                            # past the root (stale write-through / foreign KV).
+                            _cl = _SPEC_DRAFT_PA_CL.get(key)
+                            if _cl is not None and _cl.shape[0] == seq_lens.shape[0]:
+                                seq_lens = _cl
                         else:
                             layer_name = param.layer_name
                             metadata_key = layer_name if layer_name is not None and layer_name in attn_metadata else key
@@ -1302,7 +1350,15 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 self, attn_metadata, num_tokens
             )
             # Get workspace from cache or calculate it if not present.
-            workspace = graph_params.workspaces.get(num_tokens)
+            # Key by (num_tokens, heads, head_dim), not bare num_tokens:
+            # graph_params.workspaces is shared with the FIA capture paths
+            # (full_graph_fia* write int num_tokens keys), and an FIA-sized
+            # workspace is not sized for the PA op. TP2 DP2 boot death:
+            # draft-local FIA captures stored a 163.9M ws under 512, the
+            # draft-global PA call (16,2,512)@512 cache-hit it but needs
+            # 369.6M -> PagedAttentionOperation rc=1 -> capture_end 107033.
+            ws_key = (num_tokens, self.num_kv_heads, self.num_heads, query.shape[-1])
+            workspace = graph_params.workspaces.get(ws_key)
             if workspace is None:
                 workspace = torch_npu._npu_paged_attention_get_workspace(
                     query=query,
@@ -1315,7 +1371,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     context_lens=context_lens,
                     out=output,
                 )
-                update_graph_params_workspaces(num_tokens, workspace)
+                # Write to the same bucket we read from (the draft bucket when
+                # capturing draft layers); the old unconditional
+                # update_graph_params_workspaces leaked draft PA ws into the
+                # target bucket.
+                if _EXTRA_CTX.is_draft_model:
+                    update_draft_graph_params_workspaces(ws_key, workspace)
+                else:
+                    update_graph_params_workspaces(ws_key, workspace)
 
             # Handle graph capturing mode
             stream = torch_npu.npu.current_stream()
