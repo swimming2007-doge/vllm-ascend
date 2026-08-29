@@ -321,6 +321,31 @@ class AscendGemma4Proposer(_VllmGemma4Proposer, AscendSpecDecodeBaseProposer):
     def initialize_attn_backend(self, kv_cache_config, kernel_block_sizes=None):
         """Override to store per-layer gid on each draft attention backend."""
         super().initialize_attn_backend(kv_cache_config, kernel_block_sizes)
+        # Deterministic group/layer order. The upstream initializer iterates
+        # ``self._draft_attn_layer_names`` (a SET) unsorted, so the order of
+        # ``draft_attn_groups`` -- and with it the key order of every
+        # per-step draft attention-metadata dict -- varies per process (string
+        # hash seed). The FULL-graph task-update path pairs metadata with
+        # captured ACL ops POSITIONALLY (zip): when the full-attention group
+        # sorts first, its target-pool block table lands on a sliding layer's
+        # op (reads never-written draft-pool blocks = zeros) and vice versa
+        # (reads foreign KV) -- the per-boot/per-engine draft wrong-KV
+        # lottery. Sorting pins the same order the graph captured in
+        # (sliding layers before the head_dim=512 full-attention layer).
+        self.draft_attn_groups = sorted(
+            self.draft_attn_groups, key=lambda g: min(g.layer_names))
+        for _g in self.draft_attn_groups:
+            _g.layer_names = sorted(_g.layer_names)
+        # Re-derive the [0]-indexed attributes off the sorted list (the
+        # upstream initializer computed them from the unsorted head, which in
+        # an unlucky boot was the full-attention group).
+        if self.draft_attn_groups:
+            self.kv_cache_gid = self.draft_attn_groups[0].kv_cache_group_id
+            self.block_size = (
+                self.draft_attn_groups[0]
+                .get_metadata_builder()
+                .kv_cache_spec.block_size
+            )
         self._store_gids_on_impls()
 
     def load_model(self, target_model):
