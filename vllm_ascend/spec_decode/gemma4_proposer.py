@@ -334,18 +334,15 @@ class AscendGemma4Proposer(_VllmGemma4Proposer, AscendSpecDecodeBaseProposer):
     def initialize_attn_backend(self, kv_cache_config, kernel_block_sizes=None):
         """Override to store per-layer gid on each draft attention backend."""
         super().initialize_attn_backend(kv_cache_config, kernel_block_sizes)
-        # Deterministic group/layer order. The upstream initializer iterates
-        # ``self._draft_attn_layer_names`` (a SET) unsorted, so the order of
-        # ``draft_attn_groups`` -- and with it the key order of every
-        # per-step draft attention-metadata dict -- varies per process (string
-        # hash seed). The FULL-graph task-update path pairs metadata with
-        # captured ACL ops POSITIONALLY (zip): when the full-attention group
-        # sorts first, its target-pool block table lands on a sliding layer's
-        # op (reads never-written draft-pool blocks = zeros) and vice versa
-        # (reads foreign KV) -- the per-boot/per-engine draft wrong-KV
-        # lottery. Sorting by NUMERIC layer index pins the order the graph
-        # captured in (sliding layers before the head_dim=512 full-attention
-        # layer) for any layer count, not just single-digit indices.
+        # Deterministic group/layer order.
+        # Symptom: the upstream initializer iterates a SET unsorted, so
+        #   ``draft_attn_groups`` order (and the key order of every per-step
+        #   draft attention-metadata dict) varies per process. The FULL-graph
+        #   task-update pairs metadata with captured ops positionally (zip),
+        #   so a wrong order binds one group's target-model block table to
+        #   another group's op -- reads zeros or foreign KV.
+        # Fix: sort by NUMERIC layer index (lexicographic order breaks at
+        #   layers.10+), pinning the capture order for any layer count.
         self.draft_attn_groups = sorted(
             self.draft_attn_groups,
             key=lambda g: min(_draft_layer_sort_key(n) for n in g.layer_names),
@@ -362,9 +359,9 @@ class AscendGemma4Proposer(_VllmGemma4Proposer, AscendSpecDecodeBaseProposer):
         ]
         assert all(b == _block_sizes[0] for b in _block_sizes[1:]), (
             f"draft attention groups disagree on block_size: {_block_sizes}")
-        # Re-derive the [0]-indexed attributes off the sorted list (the
-        # upstream initializer computed them from the unsorted head, which in
-        # an unlucky boot was the full-attention group).
+        # Re-derive the [0]-indexed attributes off the sorted list: the
+        # upstream initializer computed them from the unsorted head, which
+        # may be any group.
         if self.draft_attn_groups:
             self.kv_cache_gid = self.draft_attn_groups[0].kv_cache_group_id
             self.block_size = (
@@ -375,9 +372,10 @@ class AscendGemma4Proposer(_VllmGemma4Proposer, AscendSpecDecodeBaseProposer):
         self._store_gids_on_impls()
 
     # ---- _pre_replay_draft_fixup ---------------------------------------------
-    # Cap every draft step's global window at [0, ctx+1] -- target-pool slots
-    # past the root hold stale/foreign KV. Assumes sl = ctx + k + 1; the
-    # consumer's per-query shape gate skips mismatched layouts.
+    # Cap every draft step's global window at [0, ctx+1]: target-model KV
+    # pool slots past the root token are not written this round (stale or
+    # foreign KV). Assumes seq_lens = ctx + k + 1; the consumer's per-query
+    # shape gate skips mismatched layouts.
 
     def _pre_replay_draft_fixup(self, multi_steps_attn_metadata) -> None:
         try:
@@ -387,9 +385,9 @@ class AscendGemma4Proposer(_VllmGemma4Proposer, AscendSpecDecodeBaseProposer):
             build_spec_draft_context_lens(
                 multi_steps_attn_metadata[0], self.num_speculative_tokens)
         except Exception:
-            # Never block decoding on this; but a persistent failure silently
-            # re-enables the optimistic-window draft reads (#27), so surface
-            # it periodically instead of swallowing it forever.
+            # Never block decoding on this; but a persistent failure leaves
+            # the draft windows uncapped (reads past the root token return),
+            # so surface it periodically instead of swallowing it forever.
             self._spec_cl_fails = getattr(self, "_spec_cl_fails", 0) + 1
             if self._spec_cl_fails == 1 or self._spec_cl_fails % 1024 == 0:
                 from vllm.logger import logger

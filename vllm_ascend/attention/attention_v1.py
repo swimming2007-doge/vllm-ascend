@@ -83,30 +83,25 @@ from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
 # default max value of sliding window size
 SWA_INT_MAX = 2147483647
 _ATTN_KEYS_BUFFER = None
-# #27 fix: draft layer_name -> per-query PA context_lens (CPU int32) that caps
-# every draft step's global-attention window at [0, ctx+1] (accepted context
-# plus the root token). Built host-side per round by
-# build_spec_draft_context_lens (called from the proposer just before the
-# pre-replay doorbell record) and consumed by the draft PA param update.
-# Rationale: the draft PA reuses the verify per-query expansion, whose
-# windows grow as ctx+1+j, so draft step j reads j TARGET-pool slots past the
-# root that nothing writes this round. Their content is whatever verify
-# write-through or a previous owner of the block left there: after a rejected
-# round it is the previous attempt's KV (a useful retry prior -- zeroing it
-# costs pos1/pos2 acceptance), but on prefix-cache-reused blocks it is
-# foreign KV that poisons the draft (the #27 episodic per-engine collapse).
-# Never reading those slots removes both effects; per-step draft chaining is
-# served by the FIA local attention over the draft's own KV. context_lens is
-# a CPU tensor for the PA op, so this is pure host arithmetic -- no kernels,
-# no H2D copies, nothing on the update stream.
+# Draft PA global-window cap.
+# Symptom: draft PA reuses the verify per-query expansion, whose windows grow
+#   as ctx+1+j, so draft step j reads j target-model KV pool slots past the
+#   root token that nothing writes this round -- stale verify write-through,
+#   or another request's KV when the block was reused.
+# Fix: build_spec_draft_context_lens() fills this dict with a ctx+1 cap per
+#   query (host-side int32 CPU tensor, refreshed each decode round by the
+#   proposer before the pre-replay event record); the draft PA param update
+#   applies it. No kernels, no H2D copies.
+# Result: draft steps read only slots written this round; chaining across
+#   steps is served by the FIA local attention over the draft's own KV.
 _SPEC_DRAFT_PA_CL: dict = {}
 
 
 def build_spec_draft_context_lens(step0_metadata: dict, k_spec: int) -> None:
-    """#27: precompute per-query draft PA context_lens = ctx + 1 for every
-    layer in the draft step-0 metadata. sl = ctx + K + 1 counts the accepted
-    context including the root token plus K future slots, so the capped
-    window is sl - K for each of the K+1 queries of a request."""
+    """Precompute per-query draft PA context_lens = ctx + 1 for every layer
+    in the draft step-0 metadata. sl = ctx + K + 1 counts the accepted
+    context (incl. the root token) plus K future slots, so the capped window
+    is sl - K for each of the K+1 queries of a request."""
     try:
         for layer_name, md in step0_metadata.items():
             sl = getattr(md, "seq_lens", None)
@@ -258,9 +253,8 @@ class AscendMetadata:
     seq_lens_expanded_src: torch.Tensor | None = None
 
     # B1 paged verify (Gemma4 head_dim=512 MTP): [B, 1, k+1, W] bool mask,
-    # True = masked out, refreshed on the DEFAULT stream at build time for the
-    # FIA-v2 BNSD captured verify ops. Same ordering contract as
-    # block_tables_expanded above.
+    # True = masked out; refreshed on the default stream at build time.
+    # Same ordering contract as block_tables_expanded above.
     paged_verify_mask: torch.Tensor | None = None
 
     # The indices of the token slots that input tokens will be stored into.
@@ -852,13 +846,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                     else:
                                         block_table, seq_lens = expand_paged_kv_to_per_query(
                                             block_table, seq_lens, _k)
-                            # #27: cap every draft step's global window at
-                            # [0, ctx+1] -- never read the target-pool slots
-                            # past the root (stale write-through / foreign KV).
-                            # The shape gate is load-bearing: _SPEC_DRAFT_PA_CL
-                            # is only filled for per-query-expanded draft PA
-                            # (num_tokens == num_seqs * (k+1)); any other
-                            # layout must skip the stored lens, not mis-size.
+                            # Draft window cap (see _SPEC_DRAFT_PA_CL at
+                            # module top): [0, ctx+1] per query. The shape
+                            # gate is load-bearing -- the stored lens exist
+                            # only for per-query-expanded draft PA; any other
+                            # layout must skip them, not mis-size.
                             draft_pa_context_lens = _SPEC_DRAFT_PA_CL.get(key)
                             if (draft_pa_context_lens is not None
                                     and draft_pa_context_lens.shape[0] == seq_lens.shape[0]):
@@ -1359,13 +1351,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 self, attn_metadata, num_tokens
             )
             # Get workspace from cache or calculate it if not present.
-            # Key by (num_tokens, heads, head_dim), not bare num_tokens:
-            # graph_params.workspaces is shared with the FIA capture paths
-            # (full_graph_fia* write int num_tokens keys), and an FIA-sized
-            # workspace is not sized for the PA op. TP2 DP2 boot death:
-            # draft-local FIA captures stored a 163.9M ws under 512, the
-            # draft-global PA call (16,2,512)@512 cache-hit it but needs
-            # 369.6M -> PagedAttentionOperation rc=1 -> capture_end 107033.
+            # Key by (num_tokens, heads, head_dim), never bare num_tokens:
+            # Symptom: the FIA capture paths write int-keyed entries into
+            #   the same cache; an FIA-sized workspace is undersized for the
+            #   PA op and the captured replay dies (rc=1 / capture_end
+            #   107033).
+            # Fix: the shape tuple keeps PA and FIA entries apart.
             ws_key = (num_tokens, self.num_kv_heads, self.num_heads, query.shape[-1])
             workspace = graph_params.workspaces.get(ws_key)
             if workspace is None:
@@ -1380,10 +1371,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     context_lens=context_lens,
                     out=output,
                 )
-                # Write to the same bucket we read from (the draft bucket when
-                # capturing draft layers); the old unconditional
-                # update_graph_params_workspaces leaked draft PA ws into the
-                # target bucket.
+                # Write to the same bucket we read from (the draft bucket
+                # when capturing draft layers); updating the target bucket
+                # here would leak a draft workspace into it.
                 if _EXTRA_CTX.is_draft_model:
                     update_draft_graph_params_workspaces(ws_key, workspace)
                 else:
@@ -1438,13 +1428,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
     ) -> torch.Tensor:
         """B1: capture the 512-dim MTP verify step as FIA-v2 BNSD paged.
 
-        Recipe probe-validated on CANN 9.0.1 (maxdiff vs fp32 6.4e-4):
-        query [B, Hq, k+1, D] BNSD against the paged KV cache views
-        [num_blocks, Hkv, block_size, D], per-seq block_table (NO per-query
-        expansion), plain per-request actual_seq_qlen/kvlen lists, explicit
-        [B, 1, k+1, W] bool mask (True = masked out), sparse_mode=0. TND is
-        not an option at head_dim=512 (CheckFeatureLayout rejects it), which
-        is why the default FIA capture paths cannot serve this layer.
+        Op contract: query [B, Hq, k+1, D] BNSD against the paged KV cache
+        views [num_blocks, Hkv, block_size, D], per-seq block_table (NO
+        per-query expansion), plain per-request actual_seq_qlen/kvlen lists,
+        explicit [B, 1, k+1, W] bool mask (True = masked out),
+        sparse_mode=0. TND is not an option at head_dim=512
+        (CheckFeatureLayout rejects it), which is why the default FIA capture
+        paths cannot serve this layer.
 
         The permuted KV views stay zero-copy for Gemma4 TP4/TP8 (Hkv=1 per
         rank makes the permutation stride-trivial); q_bnsd gets an explicit
@@ -1460,11 +1450,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
         num_block, block_size, _, _ = self.key_cache.shape  # type: ignore
         key = self.key_cache.permute(0, 2, 1, 3)  # type: ignore # [num_block, Hkv, block_size, D]
         value = self.value_cache.permute(0, 2, 1, 3)  # type: ignore
-        # The strided permuted view is fine for any Hkv: with Hkv=1 it happens
-        # to be contiguous, and with Hkv>1 (TP2) the ACL descriptor honors the
-        # strides -- numerically validated vs fp32 at Hkv=2 (maxdiff ~5e-4,
-        # same as the contiguous copy; FIA-v2 rejects the natural
-        # [nb, bs, Hkv, D] layout outright via CheckKVShapeForPageAttention).
+        # The strided permuted view works for any Hkv: the ACL descriptor
+        # honors the strides, so no contiguous copy is needed (Hkv=1 is
+        # stride-trivial anyway). FIA-v2 rejects the natural [nb, bs, Hkv, D]
+        # layout outright via CheckKVShapeForPageAttention.
         # [B, k+1, Hq, D] -> [B, Hq, k+1, D]; contiguous() is a captured op that
         # re-reads the static query buffer on every replay.
         q_bnsd = query.view(num_reqs, k + 1, self.num_heads, self.head_size).permute(0, 2, 1, 3).contiguous()
@@ -1472,13 +1461,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
         verify_mask = attn_metadata.paged_verify_mask
         if verify_mask is None:
             # Capture-time dummy metadata is not labeled SpecDecoding, so
-            # build() skipped the shared mask. Content is irrelevant here —
-            # every replay rebinds the real mask via task update (probe
-            # /tmp/probe_b1_graph_update.py) — and building the real mask
-            # needs a synchronous seq_lens H2D, which is illegal inside the
-            # capture stream (aclrtMemcpy 107030 "capture mode does not
-            # support this operation"). Bind an all-visible placeholder of
-            # the correct shape instead.
+            # build() skipped the shared mask. The real mask needs a
+            # synchronous seq_lens H2D, illegal on the capture stream
+            # (aclrtMemcpy 107030): bind an all-visible placeholder of the
+            # right shape -- every replay rebinds the real mask via the task
+            # update, so its content never matters.
             verify_mask = torch.zeros(
                 (
                     num_reqs,
@@ -1528,14 +1515,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
         graph_params.attn_params[num_tokens].append(
             FIAPagedVerifyGraphParam(
                 (
-                    # Strong refs (not weak_ref_tensors): q_bnsd and attn_output
-                    # are capture-allocated intermediates whose CONTENT the
-                    # replay/update dataflow depends on, and nothing else holds
-                    # them alive. Weak refs are only safe for tensors that are
-                    # either strongly held elsewhere (static buffers, KV cache)
-                    # or whose content is never consumed (softmax_lse in the
-                    # TND paths). Mirrors the strong block_table/context_lens
-                    # refs in PagedAttentionGraphParam.
+                    # Strong refs (not weak_ref_tensors): q_bnsd and
+                    # attn_output are capture-allocated intermediates whose
+                    # content the replay/update dataflow consumes, and
+                    # nothing else holds them alive. Weak refs are only safe
+                    # for tensors strongly held elsewhere (static buffers, KV
+                    # cache) or never consumed (softmax_lse in TND paths).
                     q_bnsd,
                     key,
                     value,
@@ -1657,10 +1642,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
             # _EXTRA_CTX.vllm_config is the draft config, which has no
             # speculative_config, so the gate would misfire as False.
             if maybe_route_512_capture(self, attn_metadata):
-                # This is the REAL 512-dim capture dispatch site: MTP capture
-                # metadata is not labeled SpecDecoding, so forward_impl's
-                # _pa_gate never routes here and full_graph_pa was called
-                # directly. B1 hooks in here first.
+                # Dispatch note: MTP capture metadata is not labeled
+                # SpecDecoding, so forward_impl's _pa_gate never routes
+                # here; full_graph_pa is called directly and B1 hooks in
+                # first.
                 if _maybe_b1_paged_verify(self, attn_metadata, query.shape[0]):
                     return self.full_graph_fia_v2_paged_verify(query, attn_metadata, output)
                 return self.full_graph_pa(query, attn_metadata, output)
@@ -1788,9 +1773,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
     ) -> torch.Tensor:
         if _EXTRA_CTX.capturing:
             # B1: target-model head_dim=512 MTP verify captures as a FIA-v2
-            # BNSD paged op (no per-query block_table expansion -> no
-            # RepeatInterleaveV2 OOB family). Draft layers and non-verify
-            # shapes keep the PA capture.
+            # BNSD paged op (per-seq block_table, no per-query expansion).
+            # Draft layers and non-verify shapes keep the PA capture.
             if _maybe_b1_paged_verify(self, attn_metadata, query.shape[0]):
                 return self.full_graph_fia_v2_paged_verify(query, attn_metadata, output)
             return self.full_graph_pa(query, attn_metadata, output)
