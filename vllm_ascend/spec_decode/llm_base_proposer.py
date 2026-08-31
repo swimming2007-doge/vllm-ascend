@@ -838,6 +838,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         """
         return
 
+    def _pre_replay_draft_fixup(self, multi_steps_attn_metadata) -> None:
+        """Model-specific draft metadata fixup, decode rounds only, host-side
+        only, before the doorbell record. No-op here; model subclasses
+        override (e.g. Gemma4 caps draft windows at ctx+1)."""
+        return
+
     def _propose(
         self,
         # [num_tokens]
@@ -1217,24 +1223,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 and not _EXTRA_CTX.capturing
                 and hasattr(self, "_pre_replay_event")
             ):
-                # #27: build the per-query draft PA context_lens that caps
-                # every draft step's global-attention window at [0, ctx+1]
-                # (accepted context + root token), so the draft never reads
-                # the target-pool slots past the root -- those hold stale
-                # verify write-through or foreign KV from prefix-cache block
-                # reuse (the #27 episodic per-engine collapse). Pure host-side
-                # arithmetic; must run before the doorbell record so the
-                # update stream picks the tensors up for this round. Decode
-                # rounds only: prefill seq_lens are exact.
+                # Model-specific draft metadata fixup (decode rounds only --
+                # prefill seq_lens are exact). Must run before the doorbell
+                # record so the update stream picks the tensors up for this
+                # round. See _pre_replay_draft_fixup.
                 if not is_prefill_batch:
-                    try:
-                        from vllm_ascend.attention.attention_v1 import (
-                            build_spec_draft_context_lens,
-                        )
-                        build_spec_draft_context_lens(
-                            multi_steps_attn_metadata[0], self.num_speculative_tokens)
-                    except Exception:
-                        pass
+                    self._pre_replay_draft_fixup(multi_steps_attn_metadata)
                 self._pre_replay_event.record()
 
             # [STEP_DBG] total draft runnable wall-clock (eager forward or graph

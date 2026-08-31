@@ -7,6 +7,8 @@ Uses multiple inheritance to combine the upstream vLLM Gemma4Proposer
 """
 
 from dataclasses import replace
+import re
+import traceback
 
 import torch
 from vllm.config import get_layers_from_vllm_config
@@ -20,6 +22,17 @@ from vllm_ascend.spec_decode.llm_base_proposer import (
     AscendSpecDecodeBaseProposer,
     build_per_group_layer_attn_metadata,
 )
+
+
+def _draft_layer_sort_key(layer_name: str):
+    """Numeric layer order for '...layers.N...' names.
+
+    Lexicographic order breaks at N >= 10 ('layers.10' < 'layers.2'), which
+    would silently turn the group-order pin below into a guaranteed mispair.
+    Unparseable names sort last, lexicographically.
+    """
+    m = re.search(r"layers\.(\d+)", layer_name)
+    return (0, int(m.group(1)), layer_name) if m else (1, 0, layer_name)
 
 
 class AscendGemma4Proposer(_VllmGemma4Proposer, AscendSpecDecodeBaseProposer):
@@ -330,12 +343,25 @@ class AscendGemma4Proposer(_VllmGemma4Proposer, AscendSpecDecodeBaseProposer):
         # sorts first, its target-pool block table lands on a sliding layer's
         # op (reads never-written draft-pool blocks = zeros) and vice versa
         # (reads foreign KV) -- the per-boot/per-engine draft wrong-KV
-        # lottery. Sorting pins the same order the graph captured in
-        # (sliding layers before the head_dim=512 full-attention layer).
+        # lottery. Sorting by NUMERIC layer index pins the order the graph
+        # captured in (sliding layers before the head_dim=512 full-attention
+        # layer) for any layer count, not just single-digit indices.
         self.draft_attn_groups = sorted(
-            self.draft_attn_groups, key=lambda g: min(g.layer_names))
+            self.draft_attn_groups,
+            key=lambda g: min(_draft_layer_sort_key(n) for n in g.layer_names),
+        )
         for _g in self.draft_attn_groups:
-            _g.layer_names = sorted(_g.layer_names)
+            _g.layer_names = sorted(_g.layer_names, key=_draft_layer_sort_key)
+        # The [0]-indexed attributes below assume every group agrees on
+        # block_size (which may be an int or a list); fail loudly at boot
+        # instead of silently switching groups if an upstream change ever
+        # breaks that.
+        _block_sizes = [
+            g.get_metadata_builder().kv_cache_spec.block_size
+            for g in self.draft_attn_groups
+        ]
+        assert all(b == _block_sizes[0] for b in _block_sizes[1:]), (
+            f"draft attention groups disagree on block_size: {_block_sizes}")
         # Re-derive the [0]-indexed attributes off the sorted list (the
         # upstream initializer computed them from the unsorted head, which in
         # an unlucky boot was the full-attention group).
@@ -347,6 +373,31 @@ class AscendGemma4Proposer(_VllmGemma4Proposer, AscendSpecDecodeBaseProposer):
                 .kv_cache_spec.block_size
             )
         self._store_gids_on_impls()
+
+    # ---- _pre_replay_draft_fixup ---------------------------------------------
+    # Cap every draft step's global window at [0, ctx+1] -- target-pool slots
+    # past the root hold stale/foreign KV. Assumes sl = ctx + k + 1; the
+    # consumer's per-query shape gate skips mismatched layouts.
+
+    def _pre_replay_draft_fixup(self, multi_steps_attn_metadata) -> None:
+        try:
+            from vllm_ascend.attention.attention_v1 import (
+                build_spec_draft_context_lens,
+            )
+            build_spec_draft_context_lens(
+                multi_steps_attn_metadata[0], self.num_speculative_tokens)
+        except Exception:
+            # Never block decoding on this; but a persistent failure silently
+            # re-enables the optimistic-window draft reads (#27), so surface
+            # it periodically instead of swallowing it forever.
+            self._spec_cl_fails = getattr(self, "_spec_cl_fails", 0) + 1
+            if self._spec_cl_fails == 1 or self._spec_cl_fails % 1024 == 0:
+                from vllm.logger import logger
+                logger.warning(
+                    "Gemma4 MTP: draft PA context_lens build failed %d "
+                    "times (draft falls back to optimistic windows); "
+                    "last error:\n%s",
+                    self._spec_cl_fails, traceback.format_exc())
 
     def load_model(self, target_model):
         target_attn_layer_names = set(

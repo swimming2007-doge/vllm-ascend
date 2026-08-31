@@ -17,13 +17,12 @@
 
 from dataclasses import dataclass
 from enum import Enum
-
 import traceback
 
 import torch
 import torch_npu
 import vllm.envs as envs_vllm
-from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import (  # type: ignore
@@ -435,10 +434,15 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
                 and self.speculative_config is not None):
             block_tables_expanded, seq_lens_expanded = expand_paged_kv_to_per_query(
                 block_table, seq_lens, self.speculative_config.num_speculative_tokens)
-            # B1 paged verify mask for the captured FIA-v2 BNSD 512-dim verify
-            # ops. Cheap (width tied to this step's block-table width) and only
-            # built for verify steps; consumed by update_graph_params.
-            if block_table is not None:
+            # B1 verify mask (consumed by the FULL-graph task update): gate
+            # on static config only -- build() also runs with no forward
+            # context (draft build / dummy warmup) where probes raise.
+            if (
+                block_table is not None
+                and needs_layer_aware_fia_graph_replay()
+                and self.compilation_config.cudagraph_mode in (
+                    CUDAGraphMode.FULL, CUDAGraphMode.FULL_DECODE_ONLY)
+            ):
                 paged_verify_mask = build_paged_verify_mask(
                     seq_lens,
                     block_table,
@@ -851,9 +855,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
                             # #27: cap every draft step's global window at
                             # [0, ctx+1] -- never read the target-pool slots
                             # past the root (stale write-through / foreign KV).
-                            _cl = _SPEC_DRAFT_PA_CL.get(key)
-                            if _cl is not None and _cl.shape[0] == seq_lens.shape[0]:
-                                seq_lens = _cl
+                            # The shape gate is load-bearing: _SPEC_DRAFT_PA_CL
+                            # is only filled for per-query-expanded draft PA
+                            # (num_tokens == num_seqs * (k+1)); any other
+                            # layout must skip the stored lens, not mis-size.
+                            draft_pa_context_lens = _SPEC_DRAFT_PA_CL.get(key)
+                            if (draft_pa_context_lens is not None
+                                    and draft_pa_context_lens.shape[0] == seq_lens.shape[0]):
+                                seq_lens = draft_pa_context_lens
                         else:
                             layer_name = param.layer_name
                             metadata_key = layer_name if layer_name is not None and layer_name in attn_metadata else key
@@ -1485,8 +1494,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
             num_reqs, self.num_heads, k + 1, self.head_size, dtype=query.dtype, device=query.device
         )
 
-        workspace = graph_params.workspaces.get(num_tokens)
-        should_update_workspace_cache = False
+        # Shared int ws key: B1 must always compete for byte-max; plain-FIA
+        # first-capture would undersize it (rc=1 / capture_end 107033).
         candidate_workspace = torch_npu._npu_fused_infer_attention_score_v2_get_max_workspace(
             query=q_bnsd,
             key=key,
@@ -1506,10 +1515,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
             graph_params,
             num_tokens,
             candidate_workspace,
-            use_max_workspace=self._use_max_workspace_for_fia_graph,
+            use_max_workspace=True,
         )
-        should_update_workspace_cache = workspace is candidate_workspace
-        if should_update_workspace_cache:
+        if workspace is candidate_workspace:
             update_graph_params_workspaces(num_tokens, workspace)
 
         stream = torch_npu.npu.current_stream()

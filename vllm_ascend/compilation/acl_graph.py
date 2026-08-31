@@ -301,7 +301,10 @@ def update_full_graph_params(
 @dataclass
 class GraphParams:
     events: dict[int, list[torch.npu.ExternalEvent]]
-    workspaces: dict[int, torch.Tensor]
+    # int keys are capture sizes; the PA path keys by
+    # (num_tokens, num_kv_heads, num_heads, head_dim) to avoid sharing with
+    # the FIA layers in the same bucket.
+    workspaces: dict[int | tuple, torch.Tensor]
     handles: dict[int, list[torch_npu._C._NPUTaskGroupHandle]]
     attn_params: dict[int, list[tuple]]
 
