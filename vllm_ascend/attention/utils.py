@@ -20,6 +20,7 @@ from vllm_ascend.utils import (
     is_pd_decode_recompute_scheduler_enabled,
 )
 from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
+from vllm.logger import logger
 
 
 @dataclass
@@ -31,6 +32,74 @@ class PagedAttentionGraphParam:
 
     def __iter__(self):
         return iter(self.params)
+
+
+@dataclass
+class FIAPagedVerifyGraphParam:
+    """Mark B1 FIA-v2 BNSD paged-verify params (Gemma4 head_dim=512 MTP verify).
+
+    Replaces the PA capture for the TARGET model's 512-dim verify step: the op
+    takes the per-seq block_table directly (no per-query expansion) plus a
+    [B, 1, k+1, W] explicit verify mask, so the RepeatInterleaveV2 expansion
+    and its MTE DDR OOB crash family disappear from the verify path. Draft
+    layers keep the PA path.
+    """
+
+    params: tuple
+    layer_name: str | None
+
+    def __iter__(self):
+        return iter(self.params)
+
+
+# kpos arange cache for build_paged_verify_mask: the [W] int64 range tensor is
+# identical every step for a given width; keep the last few widths alive
+# instead of re-allocating ~2 MiB per verify step.
+_VERIFY_MASK_KPOS_CACHE: dict[tuple[int, torch.device], torch.Tensor] = {}
+_VERIFY_MASK_KPOS_CACHE_MAX = 8
+_VERIFY_MASK_LOG_COUNT = 0
+
+
+def build_paged_verify_mask(
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    num_speculative_tokens: int,
+    block_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build the [B, 1, k+1, W] bool mask for the B1 FIA-v2 BNSD paged verify.
+
+    MTP verify semantics: query row j (j = 0..k) of request b may attend kv
+    positions 0..seq_lens[b] - (k+1) + j. True = masked out. W is tied to the
+    per-step block-table width so long contexts only pay for the blocks that
+    are actually reachable this step.
+
+    Runs on the DEFAULT stream at metadata-build time (same ordering argument
+    as block_tables_expanded: ACLGraphWrapper.replay synchronizes the default
+    stream before the graph-param update stream consumes the result). Must
+    never be called inside the graph-task-update stream region.
+    """
+    k = num_speculative_tokens
+    qlen = k + 1
+    B = seq_lens.shape[0]
+    # Width tracks the block-table width bound at update time (md.block_tables)
+    # so the op's kernel-side width validation cannot mismatch.
+    W = block_table.shape[1] * block_size
+    cache_key = (W, device)
+    kpos = _VERIFY_MASK_KPOS_CACHE.get(cache_key)
+    if kpos is None:
+        if len(_VERIFY_MASK_KPOS_CACHE) >= _VERIFY_MASK_KPOS_CACHE_MAX:
+            _VERIFY_MASK_KPOS_CACHE.clear()
+        kpos = torch.arange(W, device=device).view(1, 1, 1, W)
+        _VERIFY_MASK_KPOS_CACHE[cache_key] = kpos
+    seqv = seq_lens.to(device=device, dtype=torch.int32).view(B, 1, 1, 1)
+    qpos = torch.arange(qlen, device=device).view(1, 1, qlen, 1)
+    mask = kpos > (seqv - qlen + qpos)
+    global _VERIFY_MASK_LOG_COUNT
+    if _VERIFY_MASK_LOG_COUNT < 3:
+        _VERIFY_MASK_LOG_COUNT += 1
+        logger.info("paged_verify_mask built: B=%d W=%d (block_table width %d)", B, W, block_table.shape[1])
+    return mask
 
 
 def expand_paged_kv_to_per_query(
@@ -639,4 +708,36 @@ def maybe_route_512_capture(impl, attn_metadata) -> bool:
         and getattr(impl, "sliding_window", None) is None
         and not getattr(_EXTRA_CTX, "is_draft_model", False)
         and not is_950()
+    )
+
+
+def _maybe_b1_paged_verify(impl, attn_metadata, num_tokens: int) -> bool:
+    """True when this captured PA step is a target-model 512-dim MTP verify
+    that B1 should capture as a FIA-v2 BNSD paged op instead.
+
+    Mirrors the maybe_route_512_capture gates (512-dim, non-sliding, target
+    model, A2/A3) plus the multi-row verify shape check from
+    kv_sharing.resolve_capture_kv: single-row captures and draft layers keep
+    the PagedAttention graph path.
+
+    No attn_state requirement: capture-time dummy metadata is not labeled
+    SpecDecoding (observed ChunkedPrefill/DecodeOnly), which is exactly why
+    forward_impl's _pa_gate never routes MTP verify captures to
+    forward_paged_attention. Only ever called inside _EXTRA_CTX.capturing
+    branches, where the verify shape (num_tokens == num_seqs*(k+1) != num_seqs
+    under an active speculative_config) is the discriminator.
+    """
+    from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+    from vllm_ascend.utils import is_950
+
+    if not maybe_route_512_capture(impl, attn_metadata):
+        return False
+    spec_cfg = getattr(impl.vllm_config, "speculative_config", None)
+    if spec_cfg is None:
+        return False
+    num_seqs = attn_metadata.seq_lens.shape[0]
+    k = spec_cfg.num_speculative_tokens
+    return (
+        num_tokens == num_seqs * (k + 1)
+        and num_tokens != num_seqs
     )

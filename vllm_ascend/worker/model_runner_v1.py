@@ -2954,6 +2954,13 @@ class NPUModelRunner(GPUModelRunner):
                 torch.npu.current_stream().synchronize()
 
             assert positions is not None
+            # Order the task-update relaunches after the default-stream
+            # metadata builds (block tables, masks, expansions) that precede
+            # this round's replay: update waits default, host never blocks,
+            # and the replay itself is excluded so update still overlaps it.
+            pre_replay_event = getattr(self, "_pre_replay_event", None)
+            if pre_replay_event is not None:
+                self.update_stream.wait_event(pre_replay_event)
             update_full_graph_params(
                 self.attn_backend,
                 self.update_stream,
@@ -2976,6 +2983,17 @@ class NPUModelRunner(GPUModelRunner):
         assert self.model is not None
         forward_context = get_forward_context()
         assert forward_context is not None
+
+        # Record point: all metadata tensors the update stream re-binds are
+        # enqueued by now; the replay enqueue (and its task-update
+        # dependency) comes after. See the _pre_replay_event init.
+        if (
+            not self.enable_enpu
+            and forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+            and not forward_context.capturing
+            and hasattr(self, "_pre_replay_event")
+        ):
+            self._pre_replay_event.record()
 
         model_inputs: dict[str, Any] = {
             "input_ids": input_ids,
@@ -3945,6 +3963,14 @@ class NPUModelRunner(GPUModelRunner):
         # wrap the model with full graph wrapper if needed.
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             self.update_stream: torch.npu.Stream = torch.npu.Stream()
+            # Cross-stream ordering event for the FULL-graph update path:
+            # recorded on the default stream at the top of _model_forward
+            # (after the attention-metadata builds, before the replay
+            # enqueue), waited on the update stream before the task-update
+            # relaunches. Orders the relaunches after the default-stream
+            # writes of the tensors they re-bind (block tables, masks,
+            # expansions) without serializing update against the replay.
+            self._pre_replay_event: torch.npu.Event = torch.npu.Event()
             self.model = ACLGraphWrapper(
                 self.model,
                 self.vllm_config,

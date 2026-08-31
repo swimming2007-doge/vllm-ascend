@@ -566,6 +566,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 self.enable_enpu,
             )
             self.update_stream = torch.npu.Stream()
+            # Cross-stream ordering event for the draft FULL-graph update
+            # path (mirrors the target-side one in model_runner_v1):
+            # recorded on the default stream after all draft metadata builds
+            # and before the replay enqueue; waited on the update stream
+            # before the task-update relaunches, so the update reads this
+            # round's metadata tensors, not a previous round's.
+            self._pre_replay_event: torch.npu.Event = torch.npu.Event()
             self._runnable = ACLGraphWrapper(
                 self._run_merged_draft,
                 self.vllm_config,
@@ -781,6 +788,15 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             if forward_context is not None:
                 forward_context.moe_layer_index = 0
 
+            # Record point: all metadata the draft update re-binds is
+            # enqueued on the default stream by now; the replay enqueue
+            # comes next. See the _pre_replay_event init above.
+            if (
+                forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+                and not _EXTRA_CTX.capturing
+                and hasattr(self, "_pre_replay_event")
+            ):
+                self._pre_replay_event.record()
             self._runnable(
                 num_input_tokens=num_tokens,
                 batch_size=batch_size,
@@ -818,6 +834,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         AscendGemma4Proposer overrides this; single-group proposers fall
         through here.
         """
+        return
+
+    def _pre_replay_draft_fixup(self, multi_steps_attn_metadata) -> None:
+        """Model-specific draft metadata fixup, decode rounds only,
+        host-side only, before the _pre_replay_event record. No-op here;
+        model subclasses override (e.g. Gemma4 caps draft windows at
+        ctx+1)."""
         return
 
     def _propose(
@@ -1190,6 +1213,22 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 "is_prefill": is_prefill_batch,
             }
             run_draft = partial(self._runnable, **model_inputs)
+
+            # Record point (propose path): draft metadata is fully enqueued
+            # on the default stream; the replay enqueue comes next. See the
+            # _pre_replay_event init near the wrapper creation.
+            if (
+                forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+                and not _EXTRA_CTX.capturing
+                and hasattr(self, "_pre_replay_event")
+            ):
+                # Model-specific draft metadata fixup (decode rounds only:
+                # prefill seq_lens are exact). Must run before the
+                # _pre_replay_event record so the update stream sees this
+                # round's tensors. See _pre_replay_draft_fixup.
+                if not is_prefill_batch:
+                    self._pre_replay_draft_fixup(multi_steps_attn_metadata)
+                self._pre_replay_event.record()
 
             # [STEP_DBG] total draft runnable wall-clock (eager forward or graph
             # replay). Outside the compiled fn so the timer is not stripped.
@@ -2374,6 +2413,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
     def _update_full_graph_params(self, forward_context, num_tokens, draft_attn_metadatas=None):
         assert len(self.draft_attn_groups) > 0
         attn_backend = self.draft_attn_groups[0].backend
+        # Order the task-update relaunches after the default-stream metadata
+        # writes that precede this round's draft replay (update waits
+        # default; host never blocks).
+        pre_replay_event = getattr(self, "_pre_replay_event", None)
+        if pre_replay_event is not None:
+            self.update_stream.wait_event(pre_replay_event)
         update_full_graph_params(
             attn_backend,
             self.update_stream,
