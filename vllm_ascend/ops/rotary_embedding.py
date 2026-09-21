@@ -21,6 +21,7 @@ import os
 import torch
 import torch_npu
 from vllm.config import get_current_vllm_config
+from vllm.forward_context import is_forward_context_available
 from vllm.model_executor.layers.rotary_embedding import (
     DeepseekScalingRotaryEmbedding,
     MRotaryEmbedding,
@@ -160,10 +161,26 @@ def rope_forward_oot(
     is_neox_style: bool,
     offsets: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # NOTE: key is None (Gemma4 MTP Q-only) is handled by the caller
+    # (AscendRotaryEmbedding.forward_oot) via gemma4_q_only_rope; this shared
+    # op only handles the normal key-is-not-None path.
     query_shape, key_shape = query.shape, key.shape
     if offsets is not None:
         raise NotImplementedError("Batched rotary embedding is currently not supported on NPU.")
-    if HAS_TRITON:
+    # The triton RoPE kernel (vllm_ascend/ops/triton/rope.py) tiles a basic
+    # block sized BLOCK_SIZE_HEAD * pad_rope_dim.  For Gemma4 global head
+    # (rope_dim >= 512) the tile exceeds the Ascend A2 uniform-buffer budget
+    # (1572864 bits) and BiShengHIR compilation fails with "ub overflow".
+    # The triton RoPE kernel tiles a basic block of BLOCK_SIZE_HEAD *
+    # pad_rope_dim.  For rope_dim >= 512 the tile exceeds the Ascend A2
+    # uniform-buffer budget (1572864 bits) and BiShengHIR compilation fails
+    # with "ub overflow".  Fall back to the CANN native op for large
+    # rope_dim; smaller dims keep the triton path.  This is a generic
+    # kernel limitation, NOT Gemma4-specific — gate on rotary_dim alone so
+    # it applies to target AND draft (a config-based gate would miss the
+    # draft forward, whose current config has no speculative_config).
+    _use_triton = HAS_TRITON and rotary_dim < 512
+    if _use_triton:
         num_tokens = query.shape[0]
         query, key = rope_forward_triton(
             query.view(num_tokens, -1, head_size),
@@ -241,8 +258,21 @@ class AscendRotaryEmbedding(RotaryEmbedding):
         is_neox_style = self.is_neox_style
         if is_neox_style_override is not None:
             is_neox_style = is_neox_style_override
-        is_draft_model = _EXTRA_CTX.is_draft_model
-        flash_comm_v1_enabled = _EXTRA_CTX.flash_comm_v1_enabled
+        # Gemma4 MTP Q-only attention passes key=None (K/V come from the
+        # target's KV cache).  key is None is the sole signal: only Gemma4
+        # MTP ever calls RoPE without a key, so this gate is implicitly
+        # Gemma4-only.  Do NOT add a get_current_vllm_config() gate here —
+        # during draft forward the current config is the draft model's config,
+        # which has no speculative_config, so a config-based gate would
+        # wrongly fall through and skip Q-only RoPE (regresses pos1/pos2).
+        # See ops.rope_q_only.gemma4_q_only_rope.
+        if key is None:
+            from vllm_ascend.ops.rope_q_only import gemma4_q_only_rope
+
+            q = gemma4_q_only_rope(positions, query, self.cos_sin_cache, self.head_size, self.rotary_dim, is_neox_style)
+            return q, None
+        is_draft_model = _EXTRA_CTX.is_draft_model if is_forward_context_available() else False
+        flash_comm_v1_enabled = _EXTRA_CTX.flash_comm_v1_enabled if is_forward_context_available() else False
         if is_draft_model and self.use_mtp and flash_comm_v1_enabled:
             positions = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(positions.contiguous(), True)
         return torch.ops.vllm.npu_rotary_embedding(

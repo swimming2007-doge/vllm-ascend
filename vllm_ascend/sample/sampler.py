@@ -1,4 +1,5 @@
 import torch
+import torch_npu
 import vllm.envs as envs
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.logger import logger
@@ -265,6 +266,30 @@ def _apply_top_k_top_p_pytorch(
         return logits
 
 
+def _npu_apply_top_k_top_p(
+    logits: torch.Tensor,
+    k: torch.Tensor | None,
+    p: torch.Tensor | None,
+) -> torch.Tensor:
+    """Apply top-k/top-p filtering with whatever NPU op the stack provides.
+
+    torch.ops._C_ascend.npu_apply_top_k_top_p (custom Ascend op) was pulled
+    from recent torch_npu/CANN releases, so on current stacks any sampling
+    step with top_k/top_p crashes with "npu_apply_top_k_top_p does not
+    exist". The CANN builtin torch_npu.npu_top_k_top_p is the replacement,
+    with two calling-convention differences the adapter papers over:
+      - p must share the logits dtype (callers pass float32),
+      - k must be int32.
+    Stacks that still ship the legacy custom op keep working via the
+    fallback branch.
+    """
+    if getattr(torch_npu, "npu_top_k_top_p", None) is not None:
+        p_in = p.to(logits.dtype) if p is not None else None
+        k_in = k.to(torch.int32) if k is not None else None
+        return torch_npu.npu_top_k_top_p(logits, p_in, k_in)
+    return torch.ops._C_ascend.npu_apply_top_k_top_p(logits, k=k, p=p)
+
+
 def _apply_top_k_top_p_ascendc(
     logits: torch.Tensor,
     k: torch.Tensor,
@@ -287,12 +312,12 @@ def _apply_top_k_top_p_ascendc(
         gathered_idx = tp_group.all_gather(local_global_idx, dim=-1)
 
         if not (p is None and k is None):
-            gathered_vals = torch.ops._C_ascend.npu_apply_top_k_top_p(gathered_vals, k=k, p=p)
+            gathered_vals = _npu_apply_top_k_top_p(gathered_vals, k, p)
         return gathered_vals, gathered_idx
 
     if p is None and k is None:
         return logits
-    return torch.ops._C_ascend.npu_apply_top_k_top_p(logits, k=k, p=p)
+    return _npu_apply_top_k_top_p(logits, k, p)
 
 
 apply_top_k_top_p = (

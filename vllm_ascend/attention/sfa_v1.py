@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
 import scipy  # type: ignore
 import torch
@@ -18,6 +18,7 @@ from vllm.v1.attention.backend import (
     MLAAttentionImpl,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.worker.utils import select_common_block_size
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
@@ -54,6 +55,7 @@ from vllm_ascend.utils import (
     enable_dsa_cp,
     enable_dsa_cp_with_layer_shard,
     enable_dsa_cp_with_o_proj_tp,
+    enable_sfa_dcp_replicated_indexer,
     enable_sp,
     get_ascend_device_type,
     get_weight_prefetch_method,
@@ -72,7 +74,20 @@ O_PROJ_ACLNN_INPUT_PARAMS = (
     "aclnn_input_scale_reciprocal",
     "aclnn_input_offset",
 )
-O_PROJ_INPUT_SHARDED_QUANT_PARAMS = ("weight_scale_second", "weight_scale")
+
+
+class DCPQueryGatherContext(NamedTuple):
+    """State needed to finish the async fused DCP query all-gather."""
+
+    # The gathered fused query tensor: cat([ql_nope, q_pe], dim=-1).
+    gathered: torch.Tensor
+    # Async all-gather work handle. None means the gather completed synchronously.
+    handle: torch.distributed.Work | None
+    # Permutation that restores the original dimension order after dim>0 gather.
+    restore_perm: tuple[int, ...] | None
+    # Last-dimension sizes used to split the fused query back into ql_nope/q_pe.
+    ql_nope_dim: int
+    q_pe_dim: int
 
 
 def _get_indexer_types(configs: tuple[Any, ...]) -> Any | None:
@@ -111,6 +126,10 @@ class AscendSFABackend(AttentionBackend):
 
     @staticmethod
     def get_builder_cls():
+        if enable_sfa_dcp_replicated_indexer():
+            from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFADCPMetadataBuilder
+
+            return AscendSFADCPMetadataBuilder
         if enable_cp():
             from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFACPMetadataBuilder
 
@@ -129,6 +148,10 @@ class AscendSFABackend(AttentionBackend):
 
     @staticmethod
     def get_impl_cls() -> type["AscendSFAImpl"]:
+        if enable_sfa_dcp_replicated_indexer():
+            from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFADCPImpl
+
+            return AscendSFADCPImpl
         if enable_cp():
             from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFACPImpl
 
@@ -138,6 +161,14 @@ class AscendSFABackend(AttentionBackend):
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int]:
         return [128]
+
+
+@dataclass
+class DCPContext:
+    slot_mapping: torch.Tensor
+    block_table: torch.Tensor
+    seq_lens: torch.Tensor
+    query_gather_context: DCPQueryGatherContext | None = None
 
 
 @dataclass
@@ -183,6 +214,7 @@ class AscendSFAMetadata:
     attn_mask: torch.Tensor = None
     # chunked prefill by default if no attn_states passed
     attn_state: AscendAttentionState = AscendAttentionState.ChunkedPrefill
+    dcp_context: DCPContext | None = None
     dsa_cp_context: DSACPContext | None = None
     reshape_cache_event: torch.npu.Event = None
     sfa_cp_metadata: AscendPCPMetadata | None = None
@@ -223,6 +255,8 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         )
 
         self.block_size = vllm_config.cache_config.block_size
+        # Match the logical block size selected for BlockTable.
+        self.kernel_block_size = select_common_block_size(kv_cache_spec.block_size, [AscendSFABackend])
         self.max_blocks = (vllm_config.model_config.max_model_len + self.block_size - 1) // self.block_size
 
         self.speculative_config = vllm_config.speculative_config
@@ -277,6 +311,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         common_prefix_len: int,
         common_attn_metadata: AscendCommonAttentionMetadata,
         fast_build: bool = False,
+        **kwargs,
     ) -> AscendSFAMetadata:
         # common_prefix_len / fast_build are unused; kept for API compatibility.
         return self._build(common_attn_metadata, draft_index=None)
@@ -302,7 +337,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         slot_mapping = common_attn_metadata.slot_mapping[:num_input_tokens]
         input_positions = common_attn_metadata.positions[:num_input_tokens].long()
 
-        block_size = 128
+        block_size = self.kernel_block_size
         if get_ascend_config().c8_enable_reshape_optim:
             slot_mapping_cpu = common_attn_metadata.slot_mapping_cpu[:num_input_tokens]
 
@@ -581,8 +616,12 @@ class AscendSFAImpl(MLAAttentionImpl):
         # Enable layer sharding via DSA-CP on the P node in the PD-disaggregated setup.
         self.enable_dsa_cp_with_layer_shard = enable_dsa_cp_with_layer_shard()
 
-        # use original TP o_proj weight in PD mix stage, and full gather
-        # for o_proj weight for prefill stage.
+        # SFA DSA-CP mixed deployments keep o_proj in the existing TP layout.
+        # Decode can use the TP-sharded o_proj directly after an activation
+        # all-to-all, while prefill/mixed batches temporarily gather the TP
+        # shards into a full-weight buffer because their SFA output is not
+        # TP-sharded. This is part of the DSA-CP mixed-mode data path rather
+        # than an independent user-facing feature switch.
         self.enable_dsa_cp_with_o_proj_tp = enable_dsa_cp_with_o_proj_tp()
 
         if self.enable_dsa_cp:
@@ -657,7 +696,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 for layer in self.layer_sharding_kwargs or []:
                     if is_hidden_layer(layer):
                         post_process_after_loading_for_shard_weight_series(layer)
-            else:
+            elif self.enable_dsa_cp_with_o_proj_tp:
                 self._init_o_proj_tp_full_params()
 
         if self.enable_mlapo:
@@ -861,12 +900,20 @@ class AscendSFAImpl(MLAAttentionImpl):
 
     def _init_o_proj_tp_full_params(self):
         """
-        Initialize TP-mode and Full-mode parameters for o_proj weight,
-        preparing for weight switching in PD mix stage.
+        Initialize TP-mode aliases and Full-mode buffers for DSA-CP o_proj.
 
-        For PD mix stage:
-        - Use original TP o_proj weight for decode phase
-        - Need full-gather o_proj weight from all TP ranks for prefill phase
+        In SFA DSA-CP mixed execution, the same model instance can run both
+        decode-only and prefill/mixed batches:
+        - Decode-only batches all-to-all the SFA output in the TP group, then
+          run the original TP-sharded o_proj.
+        - Prefill/mixed batches produce SFA output that is not directly
+          compatible with TP-sharded o_proj, so each rank all-gathers the TP
+          o_proj shards and input-sharded quant params before running o_proj.
+
+        The original TP parameter storage remains the persistent source of
+        truth. The o_proj_tp_* tensors below alias that storage, while the
+        o_proj_full_* tensors are temporary gather destinations reused across
+        forwards. They are not a second persistent copy of the TP weight.
         """
         sample = self.o_proj.weight
         self.o_proj_full_weight_gather_dim = 1 if self._is_o_proj_unquantized() else 0
@@ -895,11 +942,15 @@ class AscendSFAImpl(MLAAttentionImpl):
         else:
             self.o_proj_full_pool = self.o_proj_full_gather_pool.transpose(0, 1)
 
-        # Save TP-mode parameters (original sharded weights)
-        self.o_proj_tp_weight = self.o_proj.weight.clone().detach()
+        # TP tensors alias the original parameter storage. The TP shard remains
+        # the single source of truth; full-weight tensors below are temporary
+        # gather destinations only.
+        self.o_proj_tp_weight = self.o_proj.weight.detach()
         if self.o_proj_full_weight_gather_dim == 0:
             self.o_proj_tp_weight_gather_input = self.o_proj_tp_weight
         else:
+            # Communication scratch only: all_gather_into_tensor concatenates on
+            # dim0, while unquantized row-parallel o_proj is sharded on dim1.
             self.o_proj_tp_weight_gather_input = self.o_proj_tp_weight.transpose(0, 1).contiguous()
         self.o_proj_tp_aclnn_input_params = {}
         self.o_proj_full_aclnn_input_params = {}
@@ -907,24 +958,25 @@ class AscendSFAImpl(MLAAttentionImpl):
             param = getattr(self.o_proj, param_name, None)
             if param is None:
                 continue
-            self.o_proj_tp_aclnn_input_params[param_name] = param.clone().detach()
+            self.o_proj_tp_aclnn_input_params[param_name] = param.detach()
             self.o_proj_full_aclnn_input_params[param_name] = param.repeat(self.tp_size)
 
         self.o_proj_tp_input_sharded_quant_params = {}
         self.o_proj_full_input_sharded_quant_params = {}
-        for param_name in O_PROJ_INPUT_SHARDED_QUANT_PARAMS:
-            param = getattr(self.o_proj, param_name, None)
-            if param is None or getattr(param, "input_dim", None) != 1:
-                continue
-            self.o_proj_tp_input_sharded_quant_params[param_name] = param.clone().detach()
+        for param_name, param in self._iter_o_proj_input_sharded_quant_params():
+            self.o_proj_tp_input_sharded_quant_params[param_name] = param.detach()
             self.o_proj_full_input_sharded_quant_params[param_name] = torch.empty(
                 (param.shape[0] * self.tp_size, *param.shape[1:]), dtype=param.dtype, device=param.device
             )
 
-        # Initially switch to TP mode for graph capture
-        self.o_proj.weight.set_(self.o_proj_tp_weight)
-        self._switch_o_proj_params(self.o_proj_tp_aclnn_input_params)
-        self._switch_o_proj_params(self.o_proj_tp_input_sharded_quant_params)
+    def _iter_o_proj_input_sharded_quant_params(self):
+        if not isinstance(self.o_proj, nn.Module):
+            return
+        for param_name, param in self.o_proj.named_parameters(recurse=False):
+            if param_name == "weight" or param_name in O_PROJ_ACLNN_INPUT_PARAMS:
+                continue
+            if getattr(param, "input_dim", None) == 1:
+                yield param_name, param
 
     def _switch_o_proj_params(self, params: dict[str, torch.Tensor]):
         for param_name, param in params.items():
@@ -960,15 +1012,13 @@ class AscendSFAImpl(MLAAttentionImpl):
                 if handle is not None:
                     handle.wait()
 
-            # Switch o_proj to Full-mode (gathered weight from all TP ranks)
+            # Temporarily switch o_proj to the gathered full-weight view for
+            # prefill/mixed DSA-CP, whose attention output is not TP-sharded.
             self.o_proj.weight.set_(self.o_proj_full_pool)
             self._switch_o_proj_params(self.o_proj_full_aclnn_input_params)
             self._switch_o_proj_params(self.o_proj_full_input_sharded_quant_params)
-
-            # Apply quantization method and execute forward computation
             output[...] = self._apply_o_proj_full_weight(attn_output)
-
-            # Switch o_proj back to TP-mode for subsequent decode operations
+            # Restore TP aliases so later decode batches keep using TP storage.
             self.o_proj.weight.set_(self.o_proj_tp_weight)
             self._switch_o_proj_params(self.o_proj_tp_aclnn_input_params)
             self._switch_o_proj_params(self.o_proj_tp_input_sharded_quant_params)
@@ -1274,6 +1324,14 @@ class AscendSFAImpl(MLAAttentionImpl):
             actual_seq_lengths_key,
         )
 
+    def _record_dcp_query_gather_context(
+        self,
+        ql_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        attn_metadata: M,
+    ) -> None:
+        return
+
     def forward(
         self,
         layer_name,
@@ -1304,6 +1362,13 @@ class AscendSFAImpl(MLAAttentionImpl):
         else:
             actual_seq_lengths_query = attn_metadata.cum_query_lens
             actual_seq_lengths_key = attn_metadata.seq_lens
+        # DCP replicated indexer stores LI cache with the full/no-CP metadata, while
+        # SFA KV remains stored with the DCP-sharded slot mapping.
+        slot_mapping_sfa = (
+            attn_metadata.dcp_context.slot_mapping
+            if attn_metadata.dcp_context is not None
+            else attn_metadata.slot_mapping
+        )
 
         # Inputs and outputs may be padded for CUDA graphs
         num_input_tokens = attn_metadata.num_input_tokens
@@ -1312,8 +1377,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         # all-gather o_proj weight for prefill stage of PD mix node
         o_proj_full_handle = None
         o_proj_full_param_handles = None
-        # if is PD mix stage, using original TP o_proj weight, and also need to full gather for o_proj
-        # weight for prefill stage.
+        # Prefill/mixed DSA-CP computes o_proj with a temporary full weight.
+        # Decode keeps the original TP path and only exchanges activations.
         full_gather_o_proj_enabled = self.enable_dsa_cp_with_o_proj_tp and attn_metadata.attn_state not in {
             AscendAttentionState.DecodeOnly,
             AscendAttentionState.SpecDecoding,
@@ -1379,7 +1444,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     kv_no_split, cos, sin, kv_cache, slot_mapping_cp, attn_metadata
                 )
             else:
-                k_pe, k_nope = self.exec_kv(kv_no_split, cos, sin, kv_cache, slot_mapping, attn_metadata)
+                k_pe, k_nope = self.exec_kv(kv_no_split, cos, sin, kv_cache, slot_mapping_sfa, attn_metadata)
 
             if self.enable_dsa_cp:
                 assert k_pe is not None
@@ -1467,6 +1532,7 @@ class AscendSFAImpl(MLAAttentionImpl):
 
             ql_nope, q_pe = self._q_proj_and_k_up_proj(q_c)
             q_pe = self.rope_single(q_pe, cos, sin)
+            self._record_dcp_query_gather_context(ql_nope, q_pe, attn_metadata)
 
             if self.enable_dsa_cp:
                 if kv_ag_handle is not None:
@@ -1506,7 +1572,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     elif self.use_a5_sparse_c8_indexer:
                         torch_npu.npu_scatter_nd_update_(
                             kv_cache[0].view(-1, fused_kv_no_split.shape[-1]),
-                            slot_mapping[: attn_metadata.num_actual_tokens].view(-1, 1),
+                            slot_mapping_sfa[: attn_metadata.num_actual_tokens].view(-1, 1),
                             fused_kv_no_split[: attn_metadata.num_actual_tokens],
                         )
                         k_pe = None
@@ -1526,7 +1592,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                             value=k_pe[: attn_metadata.num_actual_tokens],
                             key_cache=kv_cache[0],
                             value_cache=kv_cache[1],
-                            slot_mapping=slot_mapping[: attn_metadata.num_actual_tokens],
+                            slot_mapping=slot_mapping_sfa[: attn_metadata.num_actual_tokens],
                         )
 
             if self.has_indexer:
@@ -1608,7 +1674,13 @@ class AscendSFAImpl(MLAAttentionImpl):
                 self._update_indexcache_topk_indices(topk_indices)
 
         attn_output = self._execute_sparse_flash_attention_process(
-            ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key
+            ql_nope,
+            q_pe,
+            kv_cache,
+            topk_indices,
+            attn_metadata,
+            actual_seq_lengths_query,
+            actual_seq_lengths_key,
         )
 
         attn_output = self._v_up_proj(attn_output)
@@ -1621,9 +1693,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
 
         if self.enable_dsa_cp_with_o_proj_tp:
-            # When using SFA-CP with pd mixed, o_proj has two cases:
-            # 1. prefill: o_proj is a TP weight, we need to all-gather o_proj weight to switch TP=1.
-            # 2. decode: all-to-all the hidden_state before the o_proj forward.
+            # SFA DSA-CP mixed mode keeps o_proj weight sharded in the TP domain:
+            # 1. prefill/mixed: gather TP shards into a temporary full weight.
+            # 2. decode-only: all-to-all hidden states, then run TP o_proj.
             result, require_o_proj_forward = self._handle_o_proj_weight_switch_and_forward(
                 attn_output=attn_output,
                 output=output,

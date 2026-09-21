@@ -43,12 +43,15 @@ from vllm.v1.spec_decode.utils import (
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend import envs
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, set_ascend_forward_context
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFADCPMetadataBuilder
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.compilation.acl_graph import ACLGraphWrapper, update_full_graph_params
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.parallel_state import get_lmhead_tp_group
 from vllm_ascend.models.llama_eagle3_vwn import Eagle3VwnLlamaForCausalLM
 from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel
@@ -127,6 +130,69 @@ def greedy_sample(logits: torch.Tensor) -> torch.Tensor:
     return target_argmax
 
 
+# TODO(lilinsiman): Remove this code segment after future versions of the GLM
+# series models support graph input for speculative inference.
+def _is_glm_model(model_config) -> bool:
+    """Return True if the target model belongs to the GLM series.
+
+    Detection is based on the model_type string (covers glm, chatglm, glm4,
+    glm4_moe, glm4_moe_lite, glm4_1v, glm_ocr, glm_moe_dsa, etc).
+    """
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    model_type = getattr(hf_text_config, "model_type", "") or ""
+    return "glm" in str(model_type).lower()
+
+
+def build_per_group_layer_attn_metadata(
+    draft_attn_groups,
+    common_attn_metadata,
+    per_group_block_tables,
+    num_reqs,
+    build_attn_metadata,
+):
+    """Build per-layer attention metadata, swapping each group's block_table.
+
+    Mirrors the target model-runner pattern (see ``_prepare_inputs``): for each
+    KV cache group, shallow-copy the common metadata and install that group's
+    block_table, so layers address the correct KV cache.
+
+    Required for drafters spanning multiple KV cache groups -- e.g. Gemma4 MTP,
+    whose sliding-attention draft layers (head_dim=256) share one block_table
+    (gid 0) while the full-attention draft layer (head_dim=512) uses another
+    (gid 1). Without this swap every draft layer reads gid 0's block_table, and
+    the full-attention layer addresses the sliding group's KV cache -- the root
+    cause of the head_dim=512 numerical divergence on A2/A3.
+
+    Args:
+        draft_attn_groups: attention groups, each exposing
+            ``kv_cache_group_id``, ``layer_names`` and ``get_metadata_builder()``.
+        common_attn_metadata: base common metadata whose block_table belongs to
+            one group (typically gid 0).
+        per_group_block_tables: ``{gid: block_table_tensor}`` captured by the
+            target via ``set_per_group_block_table``; ``None`` for single-group
+            drafters (EAGLE/MLP), which then reuse the common block_table.
+        num_reqs: number of requests to slice each block_table to.
+        build_attn_metadata: ``callable(cm_group, attn_group) -> attn_metadata``.
+
+    Returns:
+        ``{layer_name: attn_metadata}`` covering all layers across all groups.
+    """
+    per_layer_attn_metadata: dict[str, Any] = {}
+    for attn_group in draft_attn_groups:
+        gid = attn_group.kv_cache_group_id
+        if per_group_block_tables is not None and gid in per_group_block_tables:
+            cm_group = copy.copy(common_attn_metadata)
+            cm_group.block_table_tensor = per_group_block_tables[gid][:num_reqs]
+        else:
+            cm_group = common_attn_metadata
+        attn_metadata = build_attn_metadata(cm_group, attn_group)
+        for layer_name in attn_group.layer_names:
+            per_layer_attn_metadata[layer_name] = attn_metadata
+    return per_layer_attn_metadata
+
+
+
+
 class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
     _runnable: ACLGraphWrapper | Callable
 
@@ -199,6 +265,25 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             self.tp_group_context = nullcontext()
 
         self.use_cuda_graph = self.runner._use_aclgraph() and not self.speculative_config.enforce_eager
+        self._raise_if_padded_drafter_batch_disabled_and_full_graph_enabled()
+
+        # GLM series models: speculative decoding does not yet support running
+        # the draft model in graph mode. Force the draft model to always use
+        # eager mode. This is equivalent to the user adding
+        # `"enforce_eager": true` to the `--speculative-config`, and keeps
+        # the target model's graph-mode setting untouched.
+        # TODO(lilinsiman): Remove this code segment after future versions of the GLM
+        # series models support graph input for speculative inference.
+        if _is_glm_model(self.vllm_config.model_config):
+            if self.use_cuda_graph:
+                logger.warning(
+                    "GLM series models with speculative decoding currently do "
+                    "not support graph mode. The draft model has been "
+                    "automatically switched to eager mode "
+                    "(enforce_eager=true). Graph mode support for GLM "
+                    "speculative decoding will be added in a future release. "
+                )
+            self.use_cuda_graph = False
 
         # TODO: Remove it when the bug of fx-graph is solved
         self.maybe_eager_context: AbstractContextManager[Any] = nullcontext()
@@ -245,6 +330,18 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         self.token_arange_np = np.arange(self.max_num_tokens + 1, dtype=np.int32)
         self.enable_enpu = self.runner.enable_enpu
         self.use_eagle = self.runner.use_eagle
+
+    def _raise_if_padded_drafter_batch_disabled_and_full_graph_enabled(self):
+        if (
+            self.speculative_config.disable_padded_drafter_batch
+            and self.use_cuda_graph
+            and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+        ):
+            raise NotImplementedError(
+                "Speculative Decoding with cudagraph mode containing full cudagraphs only "
+                "supports padded drafter batch. Please unset "
+                "disable_padded_drafter_batch in the speculative_config."
+            )
 
     def _get_model(self) -> nn.Module:
         """
@@ -308,12 +405,18 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 "Qwen3VLMoeForConditionalGeneration",
                 "Qwen3_5ForConditionalGeneration",
                 "Qwen3_5MoeForConditionalGeneration",
+                "Step3p7ForConditionalGeneration",
             ]:
                 self.model.config.image_token_index = model.config.image_token_id
             elif self.get_model_name(model) == "PixtralForConditionalGeneration":
                 self.model.config.image_token_index = model.config.vision_config.image_token_id
             elif self.get_model_name(model) == "KimiK25ForConditionalGeneration":
                 self.model.config.image_token_index = model.config.media_placeholder_token_id
+            elif self.get_model_name(model) == "Gemma4ForConditionalGeneration":
+                # Gemma4 target has image_token_id but no image_token_index;
+                # the draft (Gemma4MTP) receives hidden states from the target
+                # and does not handle multimodal inputs directly, so skip.
+                pass
             else:
                 self.model.config.image_token_index = model.config.image_token_index
             target_language_model = model.get_language_model()
@@ -450,7 +553,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 if torch.equal(layer_module.shared_head.head.weight, model.lm_head.weight):
                     layer_module.shared_head.head = model.lm_head
 
-        if self.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs() and self.use_cuda_graph:
+        _has_full = self.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs()
+        # Gemma4 MTP draft: draft follows the target's graph mode. When target
+        # uses FULL cudagraph, draft is also wrapped in ACLGraphWrapper(FULL)
+        # (dual-graph). Draft attention routes to PA (head_dim=512) / FIA
+        # (head_dim=256) under graph instead of SDPA.
+        if _has_full and self.use_cuda_graph:
             logger.info(
                 "[spec_decode/base] Wrapping draft model with ACLGraphWrapper:"
                 " runtime_mode=FULL, use_eagle=%s, enable_enpu=%s",
@@ -458,6 +566,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 self.enable_enpu,
             )
             self.update_stream = torch.npu.Stream()
+            # Cross-stream ordering event for the draft FULL-graph update
+            # path (mirrors the target-side one in model_runner_v1):
+            # recorded on the default stream after all draft metadata builds
+            # and before the replay enqueue; waited on the update stream
+            # before the task-update relaunches, so the update reads this
+            # round's metadata tensors, not a previous round's.
+            self._pre_replay_event: torch.npu.Event = torch.npu.Event()
             self._runnable = ACLGraphWrapper(
                 self._run_merged_draft,
                 self.vllm_config,
@@ -551,6 +666,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 query_start_loc=self.query_start_loc.gpu[: num_reqs + 1],
                 query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs + 1],
                 seq_lens_cpu=self.runner.optimistic_seq_lens_cpu,
+                _seq_lens_cpu=self.runner.optimistic_seq_lens_cpu,
                 seq_lens_cpu_upper_bound=self.runner.optimistic_seq_lens_cpu,
                 seq_lens=self.runner.seq_lens[:num_reqs],
                 num_reqs=num_reqs,
@@ -559,11 +675,14 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 max_query_len=self.num_speculative_tokens + 1,
                 num_computed_tokens_cpu=num_computed_tokens_cpu,
                 actual_seq_lengths_q=self.runner.actual_seq_lengths_q,
-                block_table_tensor=self.runner.input_batch.block_table[0].get_device_tensor()[:num_reqs],
+                block_table_tensor=self.runner.input_batch.block_table[self.kv_cache_gid].get_device_tensor()[
+                    :num_reqs
+                ],
                 # This is used to hold a position.
-                slot_mapping=self.runner.input_batch.block_table[0].slot_mapping.gpu,
-                slot_mapping_cpu=self.runner.input_batch.block_table[0].slot_mapping.cpu,
+                slot_mapping=self.runner.input_batch.block_table[self.kv_cache_gid].slot_mapping.gpu,
+                slot_mapping_cpu=self.runner.input_batch.block_table[self.kv_cache_gid].slot_mapping.cpu,
                 positions=self.runner.positions,
+                positions_cpu=self.runner._dsa_positions_cpu_buf if self.use_compress else None,
                 attn_state=self.runner.attn_state,
                 decode_token_per_req=self.runner.decode_token_per_req,
                 is_prefilling=torch.zeros(num_reqs, dtype=torch.bool),
@@ -574,24 +693,63 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 common_attn_metadata.prefill_context_parallel_metadata = self.runner.pcp_manager.long_seq_metadata
 
             assert len(self.draft_attn_groups) > 0
-            builder = self.draft_attn_groups[0].get_metadata_builder()
+            kv_cache_spec = self.draft_attn_groups[0].kv_cache_spec
             # update the tensor's address for each step.
             for draft_index in range(self.num_speculative_tokens):
                 common_attn_metadata = self.shallow_copy_metadata(common_attn_metadata)
+                extra_attn_metadata_args: dict = {}
+                if self.use_compress:
+                    extra_attn_metadata_args.update(
+                        prefill_ratio_to_sas_metadata=dict(),
+                        decode_ratio_to_sas_metadata=dict(),
+                        common_ratio_to_sas_metadata=dict(),
+                        block_size=kv_cache_spec.block_size,
+                    )
                 # Set the real slot_mapping.
+                slot_mapping_lens = common_attn_metadata.slot_mapping.shape[0]
+                self.slot_mapping_group[draft_index][:slot_mapping_lens].copy_(common_attn_metadata.slot_mapping)
+                self.slot_mapping_group[draft_index][slot_mapping_lens:].fill_(PADDING_SLOT_ID)
                 common_attn_metadata.slot_mapping = self.slot_mapping_group[draft_index]
+                self.seq_lens_group[draft_index][:num_reqs].copy_(common_attn_metadata.seq_lens)
+                self.seq_lens_group[draft_index][num_reqs:].fill_(0)
                 common_attn_metadata.seq_lens = self.seq_lens_group[draft_index][:num_reqs]
+                self.query_start_loc_group[draft_index][: num_reqs + 1].copy_(common_attn_metadata.query_start_loc)
+                self.query_start_loc_group[draft_index][num_reqs + 1 :].fill_(0)
                 common_attn_metadata.query_start_loc = self.query_start_loc_group[draft_index][: num_reqs + 1]
                 if self.pcp_size * self.dcp_size > 1 and draft_index > 0:
                     assert self.block_table_tensor_clone is not None, "block_table_tensor_clone is not init"
                     common_attn_metadata.block_table_tensor = self.block_table_tensor_clone[:num_reqs]
-                attn_metadata_eagle = builder.build_for_graph_capture(
-                    common_attn_metadata,
-                    AscendAttentionState.SpecDecoding if self.method == "mtp" else AscendAttentionState.ChunkedPrefill,
+                # Build per-group metadata, swapping in the correct block_table
+                # per KV cache group. Gemma4 MTP has multiple groups (sliding vs
+                # full attention) with separate block tables; the original code
+                # reused draft_attn_groups[0]'s builder and block_table for ALL
+                # layers, so the full-attention layer (head_dim=512) read the
+                # sliding group's block_table and addressed the wrong KV cache.
+                # The build_for_graph_capture/build_for_drafting branch, the
+                # attn_state and the SAS extra args are preserved verbatim.
+                attn_state = (
+                    AscendAttentionState.SpecDecoding if self.method == "mtp" else AscendAttentionState.ChunkedPrefill
                 )
-                per_layer_attn_metadata = dict()
-                for layer_name in self.attn_layer_names:
-                    per_layer_attn_metadata[layer_name] = attn_metadata_eagle
+                # Only Gemma4/step3.5 drafters maintain per-group block tables
+                # (multi KV-cache-group models); other drafters (EAGLE/MLP) do
+                # not set this attribute and use the single common block table.
+                per_group_bts = getattr(self, "_per_group_block_tables", None)
+
+                def _build_group_md(
+                    cm_group, attn_group, *, _di=draft_index, _s=attn_state, _e=extra_attn_metadata_args
+                ):
+                    group_builder = attn_group.get_metadata_builder()
+                    if not self.use_compress or _di == 0:
+                        return group_builder.build_for_graph_capture(cm_group, _s, **_e)
+                    return group_builder.build_for_drafting(cm_group, _di, **_e)
+
+                per_layer_attn_metadata = build_per_group_layer_attn_metadata(
+                    self.draft_attn_groups,
+                    common_attn_metadata,
+                    per_group_bts,
+                    num_reqs,
+                    _build_group_md,
+                )
                 multi_steps_attn_metadata.append(per_layer_attn_metadata)
 
         model_positions = self._get_positions(num_tokens)
@@ -630,6 +788,15 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             if forward_context is not None:
                 forward_context.moe_layer_index = 0
 
+            # Record point: all metadata the draft update re-binds is
+            # enqueued on the default stream by now; the replay enqueue
+            # comes next. See the _pre_replay_event init above.
+            if (
+                forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+                and not _EXTRA_CTX.capturing
+                and hasattr(self, "_pre_replay_event")
+            ):
+                self._pre_replay_event.record()
             self._runnable(
                 num_input_tokens=num_tokens,
                 batch_size=batch_size,
@@ -652,6 +819,29 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
     ) -> None:
         if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL:
             self._update_full_graph_params(forward_context, num_input_tokens, multi_steps_attn_metadata)
+
+    def set_per_group_block_table(
+        self,
+        gid: int,
+        block_table: torch.Tensor,
+    ) -> None:
+        """Capture a per-KV-cache-group block table.
+
+        Called by the runner once per KV cache group while building attention
+        metadata.  No-op in the shared base: only multi-group proposers that
+        read the target's KV across groups (e.g. Gemma4 MTP) need each
+        group's block table to locate the correct shared cache at runtime.
+        AscendGemma4Proposer overrides this; single-group proposers fall
+        through here.
+        """
+        return
+
+    def _pre_replay_draft_fixup(self, multi_steps_attn_metadata) -> None:
+        """Model-specific draft metadata fixup, decode rounds only,
+        host-side only, before the _pre_replay_event record. No-op here;
+        model subclasses override (e.g. Gemma4 caps draft windows at
+        ctx+1)."""
+        return
 
     def _propose(
         self,
@@ -744,7 +934,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # is run in eager mode currently, which means `_pad_query_start_loc_for_fia` is not called,
             # while draft model is run in graph model, which means we should pad the `query_start_loc`.
             # Need to be fixed in the future.
+            num_reqs = common_attn_metadata.query_start_loc.shape[0]
+            self.query_start_loc.gpu[:num_reqs].copy_(common_attn_metadata.query_start_loc)
+            self.query_start_loc.cpu[:num_reqs].copy_(common_attn_metadata.query_start_loc_cpu)
             num_reqs_padded = self.runner._pad_query_start_loc_for_fia(
+                self.query_start_loc,
                 num_input_tokens,
                 batch_descriptor.num_reqs if batch_descriptor.num_reqs is not None else common_attn_metadata.num_reqs,
                 common_attn_metadata.num_reqs,
@@ -752,8 +946,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 batch_descriptor.num_reqs,
             )
             common_attn_metadata.num_reqs = num_reqs_padded
-            common_attn_metadata.query_start_loc = self.runner.query_start_loc.gpu[: num_reqs_padded + 1]
-            common_attn_metadata.query_start_loc_cpu = self.runner.query_start_loc.cpu[: num_reqs_padded + 1]
+            common_attn_metadata.query_start_loc = self.query_start_loc.gpu[: num_reqs_padded + 1]
+            common_attn_metadata.query_start_loc_cpu = self.query_start_loc.cpu[: num_reqs_padded + 1]
             slicing_length = (
                 num_reqs_padded * self.decode_threshold if self.pcp_size * self.dcp_size > 1 else num_reqs_padded
             )
@@ -831,7 +1025,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         common_attn_metadata.num_input_tokens = num_input_tokens
         # FIXME(woosuk): The below two ops cause synchronization. Optimize.
         assert len(self.draft_attn_groups) > 0
-        builder = self.draft_attn_groups[0].get_metadata_builder()
         extra_attn_metadata_args: dict = {}
         if self.use_compress:
             extra_attn_metadata_args = dict(
@@ -840,20 +1033,46 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 common_ratio_to_sas_metadata=dict(),
                 block_size=self.draft_attn_groups[0].kv_cache_spec.block_size,
             )
-        attn_metadata = builder.build(0, common_attn_metadata, self.runner.get_model(), **extra_attn_metadata_args)
 
-        if hasattr(attn_metadata, "causal") and not attn_metadata.causal:
-            attn_metadata.attn_mask = None
+        # Build per-group attention metadata, swapping in the correct
+        # block_table per KV cache group. Gemma4 MTP has multiple groups
+        # (sliding vs full attention) with separate block tables; using
+        # draft_attn_groups[0]'s block_table for ALL layers made the
+        # full-attention (head_dim=512) layer read the sliding group's KV
+        # cache -- the root cause of the A2/L20 numerical divergence.
+        per_group_bts = getattr(self, "_per_group_block_tables", None)
+        num_reqs_md = common_attn_metadata.batch_size()
+
+        def _build_group_md(cm_group, attn_group, _e=extra_attn_metadata_args):
+            md = attn_group.get_metadata_builder().build(0, cm_group, self.runner.get_model(), **_e)
+            # MTP draft always runs in decode-like mode (1 token per request)
+            # regardless of the target model's attention state. During chunked
+            # prefill the common_attn_metadata inherits ChunkedPrefill from the
+            # target, which makes the PA gate in forward_impl fail for 512-dim
+            # global attention heads (Gemma4), routing them through the dense-KV-
+            # gather prefill fallback (_gather_paged_kv_to_dense) that OOMs on
+            # long sequences. Override to SpecDecoding so all draft attention
+            # heads route through PA/FIA correctly. Subsequent draft steps are
+            # already handled by attn_update_stack_num_spec_norm.
+            if self.method == "mtp":
+                md.attn_state = AscendAttentionState.SpecDecoding
+            if hasattr(md, "causal") and not md.causal:
+                md.attn_mask = None
+            return md
+
+        per_layer_attn_metadata = build_per_group_layer_attn_metadata(
+            self.draft_attn_groups,
+            common_attn_metadata,
+            per_group_bts,
+            num_reqs_md,
+            _build_group_md,
+        )
+        multi_steps_attn_metadata = [per_layer_attn_metadata]
 
         if self.uses_mrope:
             used_update_positions = self.mrope_positions[:, token_indices_to_sample]
         else:
             used_update_positions = self.positions[token_indices_to_sample]
-        per_layer_attn_metadata = dict()
-        # The first step of speculative.
-        for layer_name in self.attn_layer_names:
-            per_layer_attn_metadata[layer_name] = attn_metadata
-        multi_steps_attn_metadata = [per_layer_attn_metadata]
 
         # Copy the old attn_metadata and update
         attn_metadata_i = per_layer_attn_metadata[self.attn_layer_names[0]]
@@ -872,8 +1091,16 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         else:
             common_attn_metadata.block_table_tensor = common_attn_metadata.block_table_tensor.clone()
 
+        metadata_has_prefill = bool(getattr(attn_metadata_i, "num_prefills", 0))
+        is_prefill_batch = num_prefill_reqs > 0 or metadata_has_prefill
+        # Seed step-0 metadata for the multi-step update loop below.
+        # attn_update_stack_num_spec_norm ignores its old_attn_metadata arg and
+        # rebuilds a fresh per-group metadata on every call (see line ~1970), so
+        # this value is only the initial placeholder threaded through the loop.
+        attn_metadata = attn_metadata_i
         if self.pcp_size * self.dcp_size > 1:
-            if self.num_speculative_tokens > 1 and not attn_metadata_i.num_prefills:
+            is_decode_only_batch = num_decode_reqs > 0 and not is_prefill_batch
+            if self.num_speculative_tokens > 1 and is_decode_only_batch:
                 # For pcp/dcp, tokens are split across different cp ranks,
                 # so we can not simply update slot_mapping by += 1.
                 # Instead, we pre-allocate mtp slot_mapping in model_runner
@@ -929,7 +1156,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                                 mtp_slot_mapping,
                                 attn_group=attn_group,
                             )
-                            for layer_name in self.attn_layer_names:
+                            for layer_name in attn_group.layer_names:
                                 per_layer_attn_metadata[layer_name] = attn_metadata
                         multi_steps_attn_metadata.append(per_layer_attn_metadata)
         else:
@@ -948,7 +1175,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                             aclgraph_runtime_mode,
                             attn_group=attn_group,
                         )
-                        for layer_name in self.attn_layer_names:
+                        for layer_name in attn_group.layer_names:
                             per_layer_attn_metadata[layer_name] = attn_metadata
                     multi_steps_attn_metadata.append(per_layer_attn_metadata)
 
@@ -966,6 +1193,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             aclgraph_runtime_mode=aclgraph_runtime_mode,
             is_draft_model=True,
             draft_attn_metadatas=multi_steps_attn_metadata,
+            eplb_heat_collection_status=(
+                self.runner.eplb_heat_collection_status if self.runner.dynamic_eplb else False
+            ),
         ):
             # Reset MOE layer index for forward pass
             forward_context = get_forward_context()
@@ -980,16 +1210,50 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 "inputs_embeds": inputs_embeds,
                 "multi_steps_attn_metadata": multi_steps_attn_metadata,
                 "num_tokens": num_tokens,
-                "is_prefill": attn_metadata_i.num_prefills,
+                "is_prefill": is_prefill_batch,
             }
             run_draft = partial(self._runnable, **model_inputs)
 
+            # Record point (propose path): draft metadata is fully enqueued
+            # on the default stream; the replay enqueue comes next. See the
+            # _pre_replay_event init near the wrapper creation.
+            if (
+                forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+                and not _EXTRA_CTX.capturing
+                and hasattr(self, "_pre_replay_event")
+            ):
+                # Model-specific draft metadata fixup (decode rounds only:
+                # prefill seq_lens are exact). Must run before the
+                # _pre_replay_event record so the update stream sees this
+                # round's tensors. See _pre_replay_draft_fixup.
+                if not is_prefill_batch:
+                    self._pre_replay_draft_fixup(multi_steps_attn_metadata)
+                self._pre_replay_event.record()
+
+            # [STEP_DBG] total draft runnable wall-clock (eager forward or graph
+            # replay). Outside the compiled fn so the timer is not stripped.
+            # Rate-limited to _STEP_DBG_COUNT prints to avoid log flooding.
+            if not hasattr(self, "_step_dbg_count"):
+                self._step_dbg_count = 0
+            _step_dbg = envs.VLLM_STEP_DBG and self._step_dbg_count < 30
+            if envs.VLLM_STEP_DBG:
+                self._step_dbg_count += 1
+            if _step_dbg:
+                import time as _time
+                torch.npu.current_stream().synchronize()
+                _sd_t0 = _time.perf_counter()
             if self.enable_enpu:
                 self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
                 draft_token_ids = run_draft()
             else:
                 draft_token_ids = run_draft()
                 self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
+            if _step_dbg:
+                torch.npu.current_stream().synchronize()
+                _sd_ms = (_time.perf_counter() - _sd_t0) * 1000.0
+                print(f"[STEP_DBG] draft_runnable total={_sd_ms:.2f}ms "
+                      f"graph={int(isinstance(self._runnable, ACLGraphWrapper))} "
+                      f"enpu={int(self.enable_enpu)}", flush=True)
         return draft_token_ids
 
     def compute_draft_token_ids(self, hidden_states: torch.Tensor):
@@ -1193,8 +1457,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # cast to int32 is crucial when eagle model is compiled.
             # tensor.argmax() returns int64 by default.
             input_ids = draft_token_ids_tensor[draft_index]
-            positions += 1
-
+            # Advance positions for the next draft step. Skipped for
+            # constant-position drafters (MTP/Gemma4, constant_draft_positions=
+            # True): all draft steps run from the same position. Mirrors
+            # upstream's `if not self.constant_draft_positions` gate.
+            if not self.constant_draft_positions:
+                positions += 1
             # NOTE(woosuk): We should handle the case where the draft model
             # generates tokens beyond the max model length. Since it is complex
             # to remove such requests from the batch, we keep them in the batch
@@ -1519,6 +1787,14 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             return total_num_output_tokens, token_indices_to_sample, new_cad, None
 
     def model_returns_tuple(self) -> bool:
+        if self.method == "mtp":
+            # DeepSeek-family MTP (deepseek_mtp.py) recycles the post-final-
+            # norm hidden, so its forward returns (logit_hidden,
+            # recycle_hidden). Other MTP families return a single tensor.
+            draft_model_config = getattr(self, "draft_model_config", None)
+            hf_config = getattr(draft_model_config, "hf_config", None)
+            architectures = getattr(hf_config, "architectures", []) or []
+            return "DeepSeekMTPModel" in architectures
         return self.method not in ("mtp", "draft_model", "dflash")
 
     def attn_update_stack_num_spec_norm(
@@ -1539,7 +1815,19 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         assert draft_index > 0
         assert attn_group is not None, "vllm-ascend v0.17.0rc1 requires attn_group"
         common_attn_metadata = self.shallow_copy_metadata(old_common_metadata)
-
+        # Per-group block_table swap -- the multi-step-loop twin of
+        # build_per_group_layer_attn_metadata (called at _propose entry,
+        # ~line 1114, for the pos0 / initial metadata). The common
+        # block_table belongs to the sliding group (gid 4); without this
+        # swap it is reused for ALL draft groups, so full_attention layers
+        # (gid 5, head_dim=512) read sliding-group KV (head_dim=256 layout)
+        # and address it via slot_mapping too. pos0 is unaffected (its
+        # metadata is swapped at entry); pos1/pos2 hit this path and get
+        # corrupted -- the A2 pos1/pos2 acceptance gap vs L20.
+        per_group_bts = getattr(self, "_per_group_block_tables", None)
+        _upd_gid = attn_group.kv_cache_group_id
+        if per_group_bts is not None and _upd_gid in per_group_bts:
+            common_attn_metadata.block_table_tensor = per_group_bts[_upd_gid][:batch_size]
         if draft_index == 1:
             if aclgraph_runtime_mode == CUDAGraphMode.FULL:
                 common_attn_metadata.num_reqs = input_batch_size
@@ -1577,9 +1865,14 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             common_attn_metadata.graph_pad_size = -1
             common_attn_metadata.num_input_tokens = input_batch_size
 
-        # The loop part
-        used_update_positions += 1
-
+        # The loop part -- advance one draft step. Skipped entirely for
+        # constant-position drafters (MTP/Gemma4, constant_draft_positions=True):
+        # all draft steps predict from the same position, so positions/seq_lens
+        # must NOT advance between steps (see upstream gemma4.py). Mirrors
+        # upstream's `if not self.constant_draft_positions` gate around
+        # _update_positions_dependent_metadata.
+        if not self.constant_draft_positions:
+            used_update_positions += 1
         # Clone the data so that when calculating the data at position 2 and position 3
         # in the merged graph, it does not affect position 1
         # FIXME(lilinsiman)
@@ -1612,22 +1905,24 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # For data integrity when async scheduling, we shouldn't use in place
         # operations in case they are modified in next step's `prepare_input`
         # of main model.
-        # Increment the sequence lengths.
-        common_attn_metadata.seq_lens[:batch_size] += 1
-        # For the requests that exceed the max model length, we set the
-        # sequence length to 1 to minimize their overheads in attention.
-        exceeds_mask = common_attn_metadata.seq_lens[:batch_size] > self.max_model_len
-        common_attn_metadata.seq_lens[:batch_size].masked_fill_(exceeds_mask, 1)
-        if common_attn_metadata.seq_lens_cpu is not None:
-            common_attn_metadata.seq_lens_cpu[:batch_size] = common_attn_metadata.seq_lens_cpu[:batch_size] + 1
-            exceeds_mask_cpu = common_attn_metadata.seq_lens_cpu[:batch_size] > self.max_model_len
-            common_attn_metadata.seq_lens_cpu[:batch_size].masked_fill_(exceeds_mask_cpu, 1)
-        if common_attn_metadata._seq_lens_cpu is not None:
-            common_attn_metadata._seq_lens_cpu[:batch_size] = common_attn_metadata._seq_lens_cpu[:batch_size] + 1
-            exceeds_mask_internal_cpu = common_attn_metadata._seq_lens_cpu[:batch_size] > self.max_model_len
-            common_attn_metadata._seq_lens_cpu[:batch_size].masked_fill_(exceeds_mask_internal_cpu, 1)
-        if common_attn_metadata.num_computed_tokens_cpu is not None:
-            common_attn_metadata.num_computed_tokens_cpu[:batch_size] += 1
+        # Increment the sequence lengths. Skipped for constant-position
+        # drafters (see note above).
+        if not self.constant_draft_positions:
+            common_attn_metadata.seq_lens[:batch_size] += 1
+            # For the requests that exceed the max model length, we set the
+            # sequence length to 1 to minimize their overheads in attention.
+            exceeds_mask = common_attn_metadata.seq_lens[:batch_size] > self.max_model_len
+            common_attn_metadata.seq_lens[:batch_size].masked_fill_(exceeds_mask, 1)
+            if common_attn_metadata.seq_lens_cpu is not None:
+                common_attn_metadata.seq_lens_cpu[:batch_size] = common_attn_metadata.seq_lens_cpu[:batch_size] + 1
+                exceeds_mask_cpu = common_attn_metadata.seq_lens_cpu[:batch_size] > self.max_model_len
+                common_attn_metadata.seq_lens_cpu[:batch_size].masked_fill_(exceeds_mask_cpu, 1)
+            if common_attn_metadata._seq_lens_cpu is not None:
+                common_attn_metadata._seq_lens_cpu[:batch_size] = common_attn_metadata._seq_lens_cpu[:batch_size] + 1
+                exceeds_mask_internal_cpu = common_attn_metadata._seq_lens_cpu[:batch_size] > self.max_model_len
+                common_attn_metadata._seq_lens_cpu[:batch_size].masked_fill_(exceeds_mask_internal_cpu, 1)
+            if common_attn_metadata.num_computed_tokens_cpu is not None:
+                common_attn_metadata.num_computed_tokens_cpu[:batch_size] += 1
         if self.uses_mrope:
             common_attn_metadata.positions[:batch_size].copy_(clamped_positions[0])
         else:
@@ -1645,6 +1940,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             slot_indices += self.pcp_size
             slot_mapping = mtp_slot_mapping[slot_indices]
             self.slot_mapping_group[draft_index][: batch_size * self.pcp_size] = slot_mapping
+            self.slot_mapping_group[draft_index][batch_size * self.pcp_size :].fill_(PADDING_SLOT_ID)
             common_attn_metadata.slot_mapping = self.slot_mapping_group[draft_index]
         else:
             # NOTE: In vllm, `block_size = attn_metadata_builder.kv_cache_spec.block_size`.
@@ -1659,7 +1955,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 block_numbers = clamped_positions[0] // block_size
             else:
                 block_numbers = clamped_positions // block_size
-            block_ids = old_common_metadata.block_table_tensor.gather(dim=1, index=block_numbers.view(-1, 1))
+            # Use the per-group-swapped block_table (see swap above), not the
+            # pre-swap old_common one -- otherwise multi-group drafters write
+            # KV slots into the wrong group's physical blocks.
+            block_ids = common_attn_metadata.block_table_tensor.gather(dim=1, index=block_numbers.view(-1, 1))
             block_ids = block_ids.view(-1)
             if self.uses_mrope:
                 slot_mapping = block_ids * block_size + clamped_positions[0] % block_size
@@ -1704,11 +2003,22 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         )
 
         if self.pcp_size * self.dcp_size > 1:
-            kv_cache_spec = self.draft_attn_groups[0].kv_cache_spec
-            if isinstance(kv_cache_spec, AscendMLAAttentionSpec):
-                attn_metadata.decode.cp_seq_len = cp_seq_len
+            if isinstance(attn_metadata_builder, AscendSFADCPMetadataBuilder):
+                assert attn_metadata.dcp_context is not None
+                dcp_seq_lens = attn_metadata.dcp_context.seq_lens
+                sfa_cp_seq_len = cp_seq_len.to(
+                    device=dcp_seq_lens.device,
+                    dtype=dcp_seq_lens.dtype,
+                    non_blocking=True,
+                )
+                dcp_seq_lens[: sfa_cp_seq_len.shape[0]].copy_(sfa_cp_seq_len, non_blocking=True)
+                dcp_seq_lens[sfa_cp_seq_len.shape[0] :].fill_(0)
             else:
-                attn_metadata.decode_meta.num_computed_tokens_of_pcp_dcp = num_computed_tokens_of_pcp_dcp.numpy()
+                kv_cache_spec = self.draft_attn_groups[0].kv_cache_spec
+                if isinstance(kv_cache_spec, AscendMLAAttentionSpec):
+                    attn_metadata.decode.cp_seq_len = cp_seq_len
+                else:
+                    attn_metadata.decode_meta.num_computed_tokens_of_pcp_dcp = num_computed_tokens_of_pcp_dcp.numpy()
 
         return common_attn_metadata, attn_metadata
 
@@ -1743,7 +2053,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         discard_sampled_tokens_req_indices = discard_request_indices[:num_discarded_requests]
 
         valid_sampled_token_ids_gpu = sampled_token_ids.clone()
-        valid_sampled_token_ids_gpu.index_fill_(0, discard_sampled_tokens_req_indices, -1)
+        valid_sampled_token_ids_gpu = DeviceOperator.index_fill(
+            valid_sampled_token_ids_gpu,
+            0,
+            discard_sampled_tokens_req_indices,
+            -1,
+        )
 
         # Generate a mask for all valid tokens within those requests
         valid_mask = (valid_sampled_token_ids_gpu != -1) & (valid_sampled_token_ids_gpu < gpu_input_batch.vocab_size)
@@ -2098,6 +2413,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
     def _update_full_graph_params(self, forward_context, num_tokens, draft_attn_metadatas=None):
         assert len(self.draft_attn_groups) > 0
         attn_backend = self.draft_attn_groups[0].backend
+        # Order the task-update relaunches after the default-stream metadata
+        # writes that precede this round's draft replay (update waits
+        # default; host never blocks).
+        pre_replay_event = getattr(self, "_pre_replay_event", None)
+        if pre_replay_event is not None:
+            self.update_stream.wait_event(pre_replay_event)
         update_full_graph_params(
             attn_backend,
             self.update_stream,

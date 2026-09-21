@@ -4,11 +4,15 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+import torch_npu
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group, is_v1_kv_transfer_group
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 
+from vllm_ascend.device.utils import (
+    FIA_TND_LARGE_HEAD_FALLBACK_HEAD_SIZE,
+)
 from vllm_ascend.utils import (
     AscendDeviceType,
     get_ascend_config,
@@ -16,6 +20,180 @@ from vllm_ascend.utils import (
     is_pd_decode_recompute_scheduler_enabled,
 )
 from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
+from vllm.logger import logger
+
+
+@dataclass
+class PagedAttentionGraphParam:
+    """Mark PA params when PA and FIA share one graph replay list."""
+
+    params: tuple
+    layer_name: str | None
+
+    def __iter__(self):
+        return iter(self.params)
+
+
+@dataclass
+class FIAPagedVerifyGraphParam:
+    """Mark B1 FIA-v2 BNSD paged-verify params (Gemma4 head_dim=512 MTP verify).
+
+    Replaces the PA capture for the TARGET model's 512-dim verify step: the op
+    takes the per-seq block_table directly (no per-query expansion) plus a
+    [B, 1, k+1, W] explicit verify mask, so the RepeatInterleaveV2 expansion
+    and its MTE DDR OOB crash family disappear from the verify path. Draft
+    layers keep the PA path.
+    """
+
+    params: tuple
+    layer_name: str | None
+
+    def __iter__(self):
+        return iter(self.params)
+
+
+# kpos arange cache for build_paged_verify_mask: the [W] int64 range tensor is
+# identical every step for a given width; keep the last few widths alive
+# instead of re-allocating ~2 MiB per verify step.
+_VERIFY_MASK_KPOS_CACHE: dict[tuple[int, torch.device], torch.Tensor] = {}
+_VERIFY_MASK_KPOS_CACHE_MAX = 8
+_VERIFY_MASK_LOG_COUNT = 0
+
+
+def build_paged_verify_mask(
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    num_speculative_tokens: int,
+    block_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build the [B, 1, k+1, W] bool mask for the B1 FIA-v2 BNSD paged verify.
+
+    MTP verify semantics: query row j (j = 0..k) of request b may attend kv
+    positions 0..seq_lens[b] - (k+1) + j. True = masked out. W is tied to the
+    per-step block-table width so long contexts only pay for the blocks that
+    are actually reachable this step.
+
+    Runs on the DEFAULT stream at metadata-build time (same ordering argument
+    as block_tables_expanded: ACLGraphWrapper.replay synchronizes the default
+    stream before the graph-param update stream consumes the result). Must
+    never be called inside the graph-task-update stream region.
+    """
+    k = num_speculative_tokens
+    qlen = k + 1
+    B = seq_lens.shape[0]
+    # Width tracks the block-table width bound at update time (md.block_tables)
+    # so the op's kernel-side width validation cannot mismatch.
+    W = block_table.shape[1] * block_size
+    cache_key = (W, device)
+    kpos = _VERIFY_MASK_KPOS_CACHE.get(cache_key)
+    if kpos is None:
+        if len(_VERIFY_MASK_KPOS_CACHE) >= _VERIFY_MASK_KPOS_CACHE_MAX:
+            _VERIFY_MASK_KPOS_CACHE.clear()
+        kpos = torch.arange(W, device=device).view(1, 1, 1, W)
+        _VERIFY_MASK_KPOS_CACHE[cache_key] = kpos
+    seqv = seq_lens.to(device=device, dtype=torch.int32).view(B, 1, 1, 1)
+    qpos = torch.arange(qlen, device=device).view(1, 1, qlen, 1)
+    mask = kpos > (seqv - qlen + qpos)
+    global _VERIFY_MASK_LOG_COUNT
+    if _VERIFY_MASK_LOG_COUNT < 3:
+        _VERIFY_MASK_LOG_COUNT += 1
+        logger.info("paged_verify_mask built: B=%d W=%d (block_table width %d)", B, W, block_table.shape[1])
+    return mask
+
+
+def expand_paged_kv_to_per_query(
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    num_speculative_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Expand per-seq block_table/seq_lens to per-query for MTP verify.
+
+    MTP verify: target processes K+1 query tokens per seq (positions c..c+K).
+    seq_lens[i] = c + K + 1 (KV already written for all K+1 tokens). The PA
+    kernel is per-query-row: a single context_len makes all K+1 query rows
+    attend the full KV, so token0 sees draft1's KV (future leak) -> logits[0]
+    polluted. Expand so token j (j=0..K) attends positions 0..c+j:
+        context_len = seq_lens - K + j   (i.e. [s-K, s-K+1, ..., s])
+        block_table row repeated K+1 times (same blocks, context_len truncates).
+    No-op when shapes already match (num_tokens == num_seqs) or K == 0.
+    """
+    k = num_speculative_tokens
+    num_seqs = seq_lens.shape[0]
+    num_tokens = num_seqs * (k + 1)
+    if k <= 0 or block_table.shape[0] == num_tokens:
+        return block_table, seq_lens
+    base = seq_lens.to(torch.int32) - k
+    offsets = torch.arange(k + 1, dtype=torch.int32, device=seq_lens.device)
+    context_lens = (base.unsqueeze(1) + offsets.unsqueeze(0)).reshape(-1)
+    # NOTE (2026-08-19): two replacement strategies were tried and BOTH are
+    # broken in the ACL graph-task-update stream context where this runs:
+    # - expand+reshape -> aclnnInplaceCopy_BroadcastToAiCore: launch rejected
+    #   at batch transitions ("kernel type error" 507000, engine death).
+    # - arange//(k+1) + index_select: launches fine but silently does not
+    #   take effect -> draft reads wrong KV -> acceptance collapses to ~0.2%
+    #   (server-side mean acceptance length 1.0).
+    # repeat_interleave is the only variant with proven-correct drafts here;
+    # its known issue is the RepeatInterleaveV2 MTE DDR OOB under >=80-req
+    # batches at graph-bucket transitions (engine death, plog 2026-08-19
+    # 09:58:33 + 07-25 / 07-28 / 08-19 02:17 dumps). That crash is the open
+    # problem; do not "fix" it by swapping the op here again without
+    # verifying acceptance, not just survival.
+    # UPDATE (2026-08-20): resolved on the graph path by moving the WHERE, not
+    # the op: AscendAttentionMetadataBuilder.build() now pre-expands on the
+    # default stream (AscendMetadata.*_expanded), and update_graph_params only
+    # consumes those ready tensors (inline fallback below only when the stash
+    # is missing/stale). Do not move this call back into the
+    # `with torch.npu.stream(update_stream)` region. (fix(attention): precompute MTP verify per-query expansion at metadata build time)
+    block_table = block_table.repeat_interleave(k + 1, dim=0)
+    return block_table, context_lens
+
+
+def update_paged_attention_graph_param(
+    update_stream,
+    handle,
+    event,
+    param: PagedAttentionGraphParam,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+) -> None:
+    (
+        query,
+        key_cache,
+        value_cache,
+        num_kv_heads,
+        num_heads,
+        scale,
+        _captured_block_table,
+        _captured_seq_lens,
+        output,
+    ) = param.params
+    workspace = torch_npu._npu_paged_attention_get_workspace(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        num_kv_heads=num_kv_heads,
+        num_heads=num_heads,
+        scale_value=scale,
+        block_table=block_table,
+        context_lens=seq_lens,
+        out=output,
+    )
+    torch.npu.graph_task_update_begin(update_stream, handle)
+    torch_npu._npu_paged_attention(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        num_kv_heads=num_kv_heads,
+        num_heads=num_heads,
+        scale_value=scale,
+        block_table=block_table,
+        context_lens=seq_lens,
+        out=output,
+        workspace=workspace,
+    )
+    torch.npu.graph_task_update_end(update_stream)
+    event.record(update_stream)
 
 
 def cache_graph_workspace(
@@ -83,10 +261,19 @@ def ascend_chunked_prefill_workspace_size(vllm_config: VllmConfig) -> int:
     return chunked_prefill_workspace_size
 
 
-def using_paged_attention(runtime_shape: int, vllm_config: VllmConfig) -> bool:
-    if vllm_config.speculative_config is not None:
-        return False
+def using_paged_attention(runtime_shape: int, vllm_config: VllmConfig, head_size: int | None = None) -> bool:
     if get_ascend_device_type() == AscendDeviceType.A5:
+        return False
+    # A2/A3 FIA (TND) does not support head_dim=512 (Gemma4 global attention):
+    # 512-dim decode must go through PagedAttention even with MTP enabled,
+    # because FIA TND is semantically/numerically wrong for 512 and drops
+    # MTP pos0 acceptance from ~80% to ~60%.
+    # TODO: Remove this fallback when A2/A3 FIA TND supports Gemma4's
+    # 512-dim global attention heads. Prefill is handled by the device adaptor.
+    if head_size == FIA_TND_LARGE_HEAD_FALLBACK_HEAD_SIZE:
+        return True
+    # Non-512 heads: keep PA disabled under MTP (original behavior).
+    if vllm_config.speculative_config is not None:
         return False
     from vllm.config.compilation import CUDAGraphMode
 
@@ -477,3 +664,80 @@ def enabling_mlapo(vllm_config: VllmConfig) -> bool:
         and not vllm_config.kv_transfer_config.is_kv_producer
     )
     return bool(config_val and is_decode_instance)
+
+
+def notify_kv_cache_written(layer_name: str = ""):
+    """Notify the KV-transfer connector that KV cache has been written.
+
+    No-op when there is no v1 KV-transfer group (the common case for
+    Gemma4 MTP, which uses in-process KV-sharing via kv_sharing_target_layer_name
+    rather than a distributed connector).  Restored from the revert of PR #11021
+    (commit 44312516) — only the no-op stub is needed here, not the rest of
+    the Layerwise KV Pooling machinery.
+    """
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return
+    connector = get_kv_transfer_group()
+    on_kv_cache_written = getattr(connector, "on_kv_cache_written", None)
+    if on_kv_cache_written is not None:
+        on_kv_cache_written(layer_name)
+
+
+def maybe_route_512_capture(impl, attn_metadata) -> bool:
+    """True if a head_dim=512 non-sliding layer should route to PagedAttention
+    during graph capture.
+
+    FIA TND does not support head_dim=512 (Gemma4 global attention).  During
+    graph capture the eager device-adaptor fallback
+    (npu_large_head_prefill_attention) is bypassed, and forward_impl's PA
+    routing requires attn_state==DecodeOnly which excludes MTP's SpecDecoding
+    capture step.  Route 512-dim non-sliding layers to the paged-attention
+    graph path here, mirroring using_paged_attention(head_size=512) in
+    forward_impl.  KV-sharing draft 512 layers are excluded by the
+    ``is_draft_model`` gate below (draft routes to FIA) and never reach here.
+
+    A5 gate: on A5 (950) full_graph_pa segfaults in atb::_npu_paged_attention
+    during capture for this layer; A5's original path (full_graph_fia) works.
+    This fix targets A2/A3 (910B4) where FIA TND raises error 561002.
+    """
+    from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+    from vllm_ascend.utils import is_950
+
+    return (
+        getattr(impl, "head_size", None) == FIA_TND_LARGE_HEAD_FALLBACK_HEAD_SIZE
+        and getattr(impl, "sliding_window", None) is None
+        and not getattr(_EXTRA_CTX, "is_draft_model", False)
+        and not is_950()
+    )
+
+
+def _maybe_b1_paged_verify(impl, attn_metadata, num_tokens: int) -> bool:
+    """True when this captured PA step is a target-model 512-dim MTP verify
+    that B1 should capture as a FIA-v2 BNSD paged op instead.
+
+    Mirrors the maybe_route_512_capture gates (512-dim, non-sliding, target
+    model, A2/A3) plus the multi-row verify shape check from
+    kv_sharing.resolve_capture_kv: single-row captures and draft layers keep
+    the PagedAttention graph path.
+
+    No attn_state requirement: capture-time dummy metadata is not labeled
+    SpecDecoding (observed ChunkedPrefill/DecodeOnly), which is exactly why
+    forward_impl's _pa_gate never routes MTP verify captures to
+    forward_paged_attention. Only ever called inside _EXTRA_CTX.capturing
+    branches, where the verify shape (num_tokens == num_seqs*(k+1) != num_seqs
+    under an active speculative_config) is the discriminator.
+    """
+    from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+    from vllm_ascend.utils import is_950
+
+    if not maybe_route_512_capture(impl, attn_metadata):
+        return False
+    spec_cfg = getattr(impl.vllm_config, "speculative_config", None)
+    if spec_cfg is None:
+        return False
+    num_seqs = attn_metadata.seq_lens.shape[0]
+    k = spec_cfg.num_speculative_tokens
+    return (
+        num_tokens == num_seqs * (k + 1)
+        and num_tokens != num_seqs
+    )
